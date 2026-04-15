@@ -82,7 +82,7 @@ impl Options {
 
   /// Sets the scene change threshold. Higher values are more sensitive.
   #[cfg_attr(not(tarpaulin), inline(always))]
-  pub const fn set_threshold(&mut self, threshold: f64)  -> &mut Self {
+  pub const fn set_threshold(&mut self, threshold: f64) -> &mut Self {
     self.threshold = threshold;
     self
   }
@@ -174,26 +174,28 @@ impl Options {
   }
 }
 
-
 /// Error returned by [`Detector::try_new`] when the provided [`Options`] are
 /// inconsistent.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, thiserror::Error)]
 #[non_exhaustive]
 pub enum Error {
   /// `options.size() < 2`. The algorithm needs at least a `2 × 2` hash block
   /// to have a meaningful median threshold.
+  #[error("phash size ({size}) must be >= 2")]
   SizeTooSmall {
     /// The provided size.
     size: u32,
   },
   /// `options.lowpass() < 1`. The resize multiplier must be at least 1 so
   /// that `imsize = size * lowpass >= size`.
+  #[error("phash lowpass ({lowpass}) must be >= 1")]
   LowpassTooSmall {
     /// The provided lowpass multiplier.
     lowpass: u32,
   },
   /// `size * lowpass` or its square would exceed `usize`. Only reachable
   /// with pathological values on 32-bit targets.
+  #[error("phash dimensions overflow usize: size ({size}) * lowpass ({lowpass}) squared")]
   DimensionsOverflow {
     /// The provided size.
     size: u32,
@@ -201,26 +203,6 @@ pub enum Error {
     lowpass: u32,
   },
 }
-
-impl core::fmt::Display for Error {
-  fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-    match self {
-      Self::SizeTooSmall { size } => {
-        write!(f, "phash size ({size}) must be >= 2")
-      }
-      Self::LowpassTooSmall { lowpass } => {
-        write!(f, "phash lowpass ({lowpass}) must be >= 1")
-      }
-      Self::DimensionsOverflow { size, lowpass } => write!(
-        f,
-        "phash dimensions overflow usize: size ({size}) * lowpass ({lowpass}) squared",
-      ),
-    }
-  }
-}
-
-impl core::error::Error for Error {}
-
 
 /// Perceptual-hash scene detector. See the
 /// [module-level documentation](crate::phash) for the algorithm.
@@ -421,11 +403,9 @@ impl Detector {
     // 1. Ensure resize table matches the frame dimensions. This rebuilds on
     //    the first frame and on any subsequent dimension change. For a CFR
     //    stream this cost is paid once.
-    self.resize_table.ensure(
-      frame.width(),
-      frame.height(),
-      self.imsize,
-    );
+    self
+      .resize_table
+      .ensure(frame.width(), frame.height(), self.imsize);
 
     // 2. Area-weighted downsample, returning `max` in the same pass so we
     //    fold the normalization pre-scan into the resize loop.
@@ -472,7 +452,6 @@ impl Detector {
   }
 }
 
-
 /// Builds the orthonormal DCT-II basis: `C[k, n] = α(k) · cos(π(2n+1)k / 2N)`,
 /// where `α(0) = 1/√N` and `α(k≠0) = √(2/N)`. This matches `cv2.dct`.
 fn build_dct_cos(n: usize) -> Vec<f32> {
@@ -491,13 +470,7 @@ fn build_dct_cos(n: usize) -> Vec<f32> {
 
 /// Separable 2D DCT-II: `result = C · input · Cᵀ`.
 /// `tmp` is a scratch buffer of size `n*n`.
-fn dct2(
-  c: &[f32],
-  input: &[f32],
-  tmp: &mut [f32],
-  result: &mut [f32],
-  n: usize,
-) {
+fn dct2(c: &[f32], input: &[f32], tmp: &mut [f32], result: &mut [f32], n: usize) {
   debug_assert_eq!(c.len(), n * n);
   debug_assert_eq!(input.len(), n * n);
   debug_assert_eq!(tmp.len(), n * n);
@@ -618,13 +591,7 @@ impl ResizeTable {
   /// Applies the table to an 8-bit source plane, writing f32 values into
   /// `dst` and returning the max value seen — so the normalization pre-scan
   /// is folded into this single pass.
-  fn apply(
-    &self,
-    dst: &mut [f32],
-    src: &[u8],
-    src_stride: usize,
-    dst_size: usize,
-  ) -> f32 {
+  fn apply(&self, dst: &mut [f32], src: &[u8], src_stride: usize, dst_size: usize) -> f32 {
     debug_assert_eq!(dst.len(), dst_size * dst_size);
     debug_assert_eq!(self.x_range_starts.len(), dst_size + 1);
     debug_assert_eq!(self.y_range_starts.len(), dst_size + 1);
@@ -706,8 +673,7 @@ fn median_f32(buf: &mut [f32]) -> f32 {
     return buf[0];
   }
   let mid = n / 2;
-  let (left, pivot, _right) =
-    buf.select_nth_unstable_by(mid, |a, b| a.total_cmp(b));
+  let (left, pivot, _right) = buf.select_nth_unstable_by(mid, |a, b| a.total_cmp(b));
   let m2 = *pivot;
   if n % 2 == 1 {
     m2
@@ -723,9 +689,11 @@ fn median_f32(buf: &mut [f32]) -> f32 {
 #[cfg_attr(not(tarpaulin), inline(always))]
 fn hamming_distance(a: &[u64], b: &[u64]) -> u32 {
   debug_assert_eq!(a.len(), b.len());
-  a.iter().zip(b.iter()).map(|(x, y)| (x ^ y).count_ones()).sum()
+  a.iter()
+    .zip(b.iter())
+    .map(|(x, y)| (x ^ y).count_ones())
+    .sum()
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -758,6 +726,45 @@ mod tests {
     let fps = Timebase::new(30_000, nz32(1001));
     let opts = Options::default().with_min_frames(15, fps);
     assert_eq!(opts.min_duration(), Duration::from_nanos(500_500_000));
+  }
+
+  #[test]
+  fn try_new_success() {
+    let det = Detector::try_new(Options::default()).expect("defaults are valid");
+    assert_eq!(det.options().size(), 16);
+    assert_eq!(det.options().lowpass(), 2);
+  }
+
+  #[test]
+  fn try_new_rejects_size_too_small() {
+    let opts = Options::default().with_size(1);
+    let err = Detector::try_new(opts).expect_err("should fail");
+    assert_eq!(err, Error::SizeTooSmall { size: 1 });
+
+    let opts = Options::default().with_size(0);
+    let err = Detector::try_new(opts).expect_err("should fail");
+    assert_eq!(err, Error::SizeTooSmall { size: 0 });
+  }
+
+  #[test]
+  fn try_new_rejects_lowpass_zero() {
+    let opts = Options::default().with_lowpass(0);
+    let err = Detector::try_new(opts).expect_err("should fail");
+    assert_eq!(err, Error::LowpassTooSmall { lowpass: 0 });
+  }
+
+  #[test]
+  #[should_panic(expected = "invalid phash Options")]
+  fn new_panics_on_invalid() {
+    let _ = Detector::new(Options::default().with_size(1));
+  }
+
+  #[test]
+  fn error_display() {
+    let e = Error::SizeTooSmall { size: 1 };
+    assert_eq!(format!("{e}"), "phash size (1) must be >= 2");
+    let e = Error::LowpassTooSmall { lowpass: 0 };
+    assert_eq!(format!("{e}"), "phash lowpass (0) must be >= 1");
   }
 
   #[test]
@@ -803,7 +810,7 @@ mod tests {
     // and summing n values gives n/√n = √n per dim, then 2D = n).
     assert!((result[0] - n as f32).abs() < 1e-4, "DC = {}", result[0]);
     // All other coefficients ≈ 0.
-    (1..n*n).for_each(|k| {
+    (1..n * n).for_each(|k| {
       assert!(result[k].abs() < 1e-4, "AC [{k}] = {}", result[k]);
     });
   }
@@ -811,7 +818,9 @@ mod tests {
   #[test]
   fn resize_area_identity() {
     // 4x4 → 4x4 is a no-op.
-    let src = [10u8, 20, 30, 40, 50, 60, 70, 80, 90, 100, 110, 120, 130, 140, 150, 160];
+    let src = [
+      10u8, 20, 30, 40, 50, 60, 70, 80, 90, 100, 110, 120, 130, 140, 150, 160,
+    ];
     let mut dst = vec![0.0f32; 16];
     let mut table = ResizeTable::new();
     table.ensure(4, 4, 4);
@@ -826,10 +835,7 @@ mod tests {
   fn resize_area_halve() {
     // 4x4 → 2x2 with a known input — each dest pixel is the average of a 2x2 source block.
     let src = [
-      10u8, 20, 30, 40,
-      50, 60, 70, 80,
-      90, 100, 110, 120,
-      130, 140, 150, 160,
+      10u8, 20, 30, 40, 50, 60, 70, 80, 90, 100, 110, 120, 130, 140, 150, 160,
     ];
     let mut dst = vec![0.0f32; 4];
     let mut table = ResizeTable::new();
@@ -912,7 +918,10 @@ mod tests {
 
     assert!(det.process(make_frame(&a, 128, 96, 0)).is_none());
     let cut = det.process(make_frame(&b, 128, 96, 33));
-    assert!(cut.is_some(), "expected cut between top/bottom and left/right halves");
+    assert!(
+      cut.is_some(),
+      "expected cut between top/bottom and left/right halves"
+    );
     assert!(
       det.last_distance().unwrap() >= Options::default().threshold(),
       "distance {} should meet default threshold 0.395",
@@ -955,7 +964,10 @@ mod tests {
 
     // First frame of video 2: no cut, state re-seeded.
     assert!(det.process(make_frame(&a, 128, 96, 1_000_000)).is_none());
-    assert!(det.last_distance().is_none(), "last_distance should be cleared");
+    assert!(
+      det.last_distance().is_none(),
+      "last_distance should be cleared"
+    );
 
     // Second frame of video 2: normal cut detection resumes.
     let cut2 = det.process(make_frame(&b, 128, 96, 1_000_033));
@@ -1007,4 +1019,3 @@ mod tests {
     assert_eq!(set as usize, size * size / 2);
   }
 }
-

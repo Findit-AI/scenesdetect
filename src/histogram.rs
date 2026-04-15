@@ -558,7 +558,10 @@ mod tests {
     // emit a cut, even though it's very different from the last frame of
     // video 1 — there's no previous histogram to compare against.
     assert!(det.process(make_frame(&black, 64, 48, 1_000_000)).is_none());
-    assert!(det.last_hist_diff().is_none(), "last_hist_diff should be cleared");
+    assert!(
+      det.last_hist_diff().is_none(),
+      "last_hist_diff should be cleared"
+    );
 
     // Second frame after clear: normal comparison resumes against the
     // just-processed frame.
@@ -599,7 +602,10 @@ mod tests {
     det.compute_histogram(&frame);
 
     for v in 0u8..21 {
-      assert_eq!(det.current[v as usize], 1, "pixel value {v} should have count 1");
+      assert_eq!(
+        det.current[v as usize], 1,
+        "pixel value {v} should have count 1"
+      );
     }
     assert_eq!(det.current.iter().sum::<u32>(), 21);
   }
