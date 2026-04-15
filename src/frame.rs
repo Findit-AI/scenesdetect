@@ -419,6 +419,167 @@ impl<'a> LumaFrame<'a> {
   }
 }
 
+/// A frame containing packed 24-bit RGB (or BGR) data, three interleaved
+/// bytes per pixel, along with its dimensions and presentation timestamp.
+///
+/// This type is byte-order-agnostic: detectors that only care about overall
+/// brightness (like [`crate::threshold::Detector`]) treat RGB and BGR
+/// equivalently. For detectors that care about channel meaning (future
+/// color-based detectors), the caller is responsible for ensuring the bytes
+/// are in the expected order.
+///
+/// Rows may be padded: row `y` starts at byte offset `y * stride`, and only
+/// the first `width * 3` bytes of each row carry pixel data. `stride` is
+/// always `>= width * 3`.
+#[derive(Debug, Clone, Copy)]
+pub struct RgbFrame<'a> {
+  data: &'a [u8],
+  width: u32,
+  height: u32,
+  stride: u32,
+  timestamp: Timestamp,
+}
+
+impl<'a> RgbFrame<'a> {
+  /// Bytes per pixel for the packed RGB / BGR layout.
+  pub const BYTES_PER_PIXEL: u32 = 3;
+
+  /// Creates a new `RgbFrame`, validating dimensions.
+  ///
+  /// Prefer [`Self::try_new`] at runtime call sites where invalid data is
+  /// possible; this constructor is meant for call sites where validity is
+  /// statically known.
+  ///
+  /// # Panics
+  ///
+  /// Panics if the frame is invalid. See [`RgbFrameError`] for conditions.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn new(
+    data: &'a [u8],
+    width: u32,
+    height: u32,
+    stride: u32,
+    timestamp: Timestamp,
+  ) -> Self {
+    match Self::try_new(data, width, height, stride, timestamp) {
+      Ok(f) => f,
+      Err(_) => panic!("invalid RgbFrame dimensions or data length"),
+    }
+  }
+
+  /// Creates a new `RgbFrame`, returning an error if dimensions are inconsistent.
+  ///
+  /// Validates:
+  /// - `stride >= width * 3` (padding is allowed; underflow is not)
+  /// - `stride * height` fits in `usize`
+  /// - `data.len() >= stride * height`
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn try_new(
+    data: &'a [u8],
+    width: u32,
+    height: u32,
+    stride: u32,
+    timestamp: Timestamp,
+  ) -> Result<Self, RgbFrameError> {
+    let min_stride = match width.checked_mul(Self::BYTES_PER_PIXEL) {
+      Some(v) => v,
+      None => return Err(RgbFrameError::DimensionsOverflow { stride, height }),
+    };
+    if stride < min_stride {
+      return Err(RgbFrameError::StrideTooSmall {
+        width,
+        stride,
+        min_stride,
+      });
+    }
+    let expected = match (stride as usize).checked_mul(height as usize) {
+      Some(v) => v,
+      None => return Err(RgbFrameError::DimensionsOverflow { stride, height }),
+    };
+    if data.len() < expected {
+      return Err(RgbFrameError::DataTooShort {
+        expected,
+        actual: data.len(),
+      });
+    }
+    Ok(Self {
+      data,
+      width,
+      height,
+      stride,
+      timestamp,
+    })
+  }
+
+  /// Returns the packed RGB bytes. Row `y` starts at byte offset `y * stride`;
+  /// within each row, pixel `x` occupies bytes `x*3 .. x*3 + 3`.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn data(&self) -> &'a [u8] {
+    self.data
+  }
+
+  /// Returns the width of the frame in pixels.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn width(&self) -> u32 {
+    self.width
+  }
+
+  /// Returns the height of the frame in pixels.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn height(&self) -> u32 {
+    self.height
+  }
+
+  /// Returns the stride of the frame in bytes per row. May exceed
+  /// `width * 3` due to alignment padding.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn stride(&self) -> u32 {
+    self.stride
+  }
+
+  /// Returns the presentation timestamp of the frame.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn timestamp(&self) -> Timestamp {
+    self.timestamp
+  }
+}
+
+/// Error returned by [`RgbFrame::try_new`] when the provided dimensions or
+/// data length are inconsistent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, thiserror::Error)]
+#[non_exhaustive]
+pub enum RgbFrameError {
+  /// `stride` was smaller than `width * 3`. Stride is the number of bytes
+  /// per row including any padding, and must cover the pixel row (3 bytes
+  /// per pixel).
+  #[error("stride ({stride}) is smaller than width*3 ({min_stride})")]
+  StrideTooSmall {
+    /// The frame width in pixels.
+    width: u32,
+    /// The provided stride in bytes.
+    stride: u32,
+    /// The minimum acceptable stride (`width * 3`).
+    min_stride: u32,
+  },
+  /// The provided byte slice was too short to hold `stride * height` bytes.
+  #[error("data length {actual} is less than required {expected} bytes")]
+  DataTooShort {
+    /// Minimum required byte length.
+    expected: usize,
+    /// Actual byte length of `data`.
+    actual: usize,
+  },
+  /// `width * 3` or `stride * height` overflowed `usize` (can only happen
+  /// on 32-bit targets with very large frames).
+  #[error("frame dimensions overflow usize: stride ({stride}) * height ({height})")]
+  DimensionsOverflow {
+    /// The stride in bytes.
+    stride: u32,
+    /// The frame height in pixels.
+    height: u32,
+  },
+}
+
 /// Error returned by [`LumaFrame::try_new`] when the provided dimensions or
 /// data length are inconsistent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, thiserror::Error)]
@@ -728,5 +889,63 @@ mod tests {
       stride: 32,
     };
     assert_eq!(format!("{e}"), "stride (32) is smaller than width (64)");
+  }
+
+  #[test]
+  fn rgb_frame_basic() {
+    let buf = [0u8; 4 * 3 * 2];
+    let tb = Timebase::new(1, nz(1000));
+    let f = RgbFrame::new(&buf, 4, 2, 12, Timestamp::new(0, tb));
+    assert_eq!(f.width(), 4);
+    assert_eq!(f.height(), 2);
+    assert_eq!(f.stride(), 12);
+    assert_eq!(f.data().len(), 24);
+  }
+
+  #[test]
+  fn rgb_frame_with_padding() {
+    // 4-pixel row = 12 bytes of pixel data + 4 bytes of alignment padding.
+    let buf = [0u8; 16 * 2];
+    let tb = Timebase::new(1, nz(1000));
+    let f = RgbFrame::new(&buf, 4, 2, 16, Timestamp::new(0, tb));
+    assert_eq!(f.stride(), 16);
+  }
+
+  #[test]
+  fn try_new_rgb_rejects_stride_less_than_width_times_3() {
+    let buf = [0u8; 12 * 2];
+    let tb = Timebase::new(1, nz(1000));
+    let err =
+      RgbFrame::try_new(&buf, 4, 2, 8, Timestamp::new(0, tb)).expect_err("stride 8 < 4*3 = 12");
+    assert_eq!(
+      err,
+      RgbFrameError::StrideTooSmall {
+        width: 4,
+        stride: 8,
+        min_stride: 12,
+      },
+    );
+  }
+
+  #[test]
+  fn try_new_rgb_rejects_short_data() {
+    let buf = [0u8; 10];
+    let tb = Timebase::new(1, nz(1000));
+    let err = RgbFrame::try_new(&buf, 4, 2, 12, Timestamp::new(0, tb)).expect_err("should fail");
+    assert_eq!(
+      err,
+      RgbFrameError::DataTooShort {
+        expected: 24,
+        actual: 10,
+      },
+    );
+  }
+
+  #[test]
+  #[should_panic(expected = "invalid RgbFrame")]
+  fn rgb_frame_new_panics_on_invalid() {
+    let buf = [0u8; 10];
+    let tb = Timebase::new(1, nz(1000));
+    let _ = RgbFrame::new(&buf, 4, 2, 12, Timestamp::new(0, tb));
   }
 }

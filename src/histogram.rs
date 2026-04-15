@@ -86,6 +86,7 @@ use crate::frame::{LumaFrame, Timebase, Timestamp};
 pub struct Options {
   threshold: f64,
   bins: NonZeroUsize,
+  #[cfg_attr(feature = "serde", serde(with = "humantime_serde"))]
   min_duration: Duration,
 }
 

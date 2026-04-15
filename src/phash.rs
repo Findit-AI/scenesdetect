@@ -39,12 +39,17 @@ use core::{f32::consts::PI, time::Duration};
 
 use crate::frame::{LumaFrame, Timebase, Timestamp};
 
+#[cfg(feature = "serde")]
+use serde::{Deserialize, Serialize};
+
 /// Configuration for [`Detector`].
 #[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct Options {
   threshold: f64,
   size: u32,
   lowpass: u32,
+  #[cfg_attr(feature = "serde", serde(with = "humantime_serde"))]
   min_duration: Duration,
 }
 
@@ -176,7 +181,7 @@ impl Options {
 
 /// Error returned by [`Detector::try_new`] when the provided [`Options`] are
 /// inconsistent.
-#[derive(Debug, Clone, thiserror::Error)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub enum Error {
   /// `options.size() < 2`. The algorithm needs at least a `2 × 2` hash block
