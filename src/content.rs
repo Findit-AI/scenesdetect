@@ -439,6 +439,11 @@ pub struct Detector {
   sobel_dir: Vec<u8>,
   nms_out: Vec<u8>,
   dilate_tmp: Vec<u8>,
+  /// Forward prefix-max scratch for the 1D van-Herk dilate pass. Sized to
+  /// `max(width, height)` so it serves both row and column passes.
+  vh_r: Vec<u8>,
+  /// Backward prefix-max scratch for the 1D van-Herk dilate pass.
+  vh_s: Vec<u8>,
 }
 
 impl Detector {
@@ -491,6 +496,8 @@ impl Detector {
       sobel_dir: Vec::new(),
       nms_out: Vec::new(),
       dilate_tmp: Vec::new(),
+      vh_r: Vec::new(),
+      vh_s: Vec::new(),
     })
   }
 
@@ -659,6 +666,8 @@ impl Detector {
     let nms_out = &mut self.nms_out;
     let tmp = &mut self.dilate_tmp;
     let out = &mut self.cur_edges;
+    let vh_r = &mut self.vh_r;
+    let vh_s = &mut self.vh_s;
     let width = self.width;
     let height = self.height;
     let kernel = self.kernel;
@@ -671,7 +680,7 @@ impl Detector {
     sobel(input, sobel_mag, sobel_dir, width, height);
     non_max_suppress(sobel_mag, sobel_dir, nms_out, width, height);
     hysteresis(nms_out, sobel_mag, low, high, width, height);
-    dilate(nms_out, out, tmp, width, height, kernel);
+    dilate(nms_out, out, tmp, vh_r, vh_s, width, height, kernel);
   }
 
   /// Apply MERGE or SUPPRESS gating.
@@ -785,6 +794,11 @@ impl Detector {
       self.sobel_mag.resize(n, 0);
       self.sobel_dir.clear();
       self.sobel_dir.resize(n, 0);
+      let vh_len = (width as usize).max(height as usize);
+      self.vh_r.clear();
+      self.vh_r.resize(vh_len, 0);
+      self.vh_s.clear();
+      self.vh_s.resize(vh_len, 0);
     }
     // Re-seed the flash filter on dimension change (new stream semantics).
     self.last_above = None;
@@ -1074,45 +1088,207 @@ fn hysteresis(buf: &mut [u8], mag_raw: &[i32], low: u8, high: u8, width: u32, he
   }
 }
 
-/// Separable morphological dilation with a `k × k` square kernel.
-/// Horizontal pass → `tmp`, vertical pass → `out`.
-fn dilate(input: &[u8], out: &mut [u8], tmp: &mut [u8], width: u32, height: u32, kernel: u32) {
+/// Separable morphological dilation with a `k × k` square kernel via the
+/// van-Herk / Gil-Werman O(n) algorithm.
+///
+/// Classical naive dilation is O(n·k) per pass; for typical kernel sizes
+/// (9–13 for HD content) this is a ~10× speedup over the scalar sliding-max
+/// loop. The trick: partition each 1D signal into blocks of size `k`,
+/// compute a forward prefix-max (`R`) and backward prefix-max (`S`) within
+/// each block, then each output position `p` with window `[p-half, p+half]`
+/// is simply `max(S[p-half], R[p+half])` — the two half-window reads
+/// together cover exactly two adjacent blocks of size `k`.
+///
+/// Horizontal row pass writes into `tmp`; vertical column pass reads from
+/// `tmp` (strided) and writes into `out`. `vh_r` and `vh_s` are reusable
+/// scratch of size `max(width, height)`.
+///
+/// Kernel must be an odd integer ≥ 3 (validated by [`Detector::try_new`]).
+fn dilate(
+  input: &[u8],
+  out: &mut [u8],
+  tmp: &mut [u8],
+  vh_r: &mut [u8],
+  vh_s: &mut [u8],
+  width: u32,
+  height: u32,
+  kernel: u32,
+) {
   let w = width as usize;
   let h = height as usize;
-  let half = (kernel / 2) as usize;
+  let k = kernel as usize;
+  debug_assert!(k >= 3 && k % 2 == 1);
+  debug_assert!(vh_r.len() >= w.max(h) && vh_s.len() >= w.max(h));
 
-  // Horizontal pass: tmp[y, x] = max over x' in [x-half, x+half] of input[y, x'].
+  // Horizontal pass: contiguous per-row, trivially cache-friendly.
   for y in 0..h {
     let row_in = &input[y * w..y * w + w];
     let row_out = &mut tmp[y * w..y * w + w];
-    for x in 0..w {
-      let lo = x.saturating_sub(half);
-      let hi = (x + half + 1).min(w);
-      let mut m = 0u8;
-      for xx in lo..hi {
-        if row_in[xx] > m {
-          m = row_in[xx];
-        }
-      }
-      row_out[x] = m;
-    }
+    van_herk_1d_contig(row_in, row_out, vh_r, vh_s, w, k);
   }
 
-  // Vertical pass: out[y, x] = max over y' in [y-half, y+half] of tmp[y', x].
-  for y in 0..h {
-    let lo = y.saturating_sub(half);
-    let hi = (y + half + 1).min(h);
-    for x in 0..w {
-      let mut m = 0u8;
-      for yy in lo..hi {
-        let v = tmp[yy * w + x];
-        if v > m {
-          m = v;
-        }
-      }
-      out[y * w + x] = m;
+  // Vertical pass: strided reads/writes via column index `x`.
+  for x in 0..w {
+    van_herk_1d_column(tmp, out, vh_r, vh_s, x, w, h, k);
+  }
+}
+
+/// 1D van-Herk dilation on a contiguous slice.
+///
+/// - `src`, `dst`: length `n`.
+/// - `r`, `s`: scratch of length ≥ `n`; filled with per-block forward /
+///   backward prefix-maxes.
+/// - `k`: odd kernel size ≥ 3.
+///
+/// The van-Herk formula `dst[p] = max(S[l], R[r_idx])` assumes the window
+/// `[l, r_idx]` has length exactly `k`. At the boundaries the window clips
+/// to something shorter, and the formula's block reads would spuriously
+/// include real pixels outside the clipped window. We handle the first and
+/// last `half` positions with a direct max instead — `2 * half` positions,
+/// each `≤ k` wide, is O(k²) extra work, negligible vs. the O(n) main pass.
+fn van_herk_1d_contig(src: &[u8], dst: &mut [u8], r: &mut [u8], s: &mut [u8], n: usize, k: usize) {
+  let half = k / 2;
+  if n == 0 {
+    return;
+  }
+
+  // If the signal is too short for an interior region, fall back to naive
+  // windowed max for every position.
+  if n <= 2 * half {
+    for p in 0..n {
+      let lo = p.saturating_sub(half);
+      let hi = (p + half + 1).min(n);
+      dst[p] = window_max_contig(src, lo, hi);
+    }
+    return;
+  }
+
+  // Forward prefix-max within each block of size k.
+  let mut i = 0;
+  while i < n {
+    let end = (i + k).min(n);
+    r[i] = src[i];
+    for j in (i + 1)..end {
+      r[j] = r[j - 1].max(src[j]);
+    }
+    i = end;
+  }
+
+  // Backward prefix-max within each block of size k.
+  let mut i = 0;
+  while i < n {
+    let end = (i + k).min(n);
+    s[end - 1] = src[end - 1];
+    for j in (i..(end - 1)).rev() {
+      s[j] = s[j + 1].max(src[j]);
+    }
+    i = end;
+  }
+
+  // Leading boundary: clipped window [0, p + half].
+  for p in 0..half {
+    dst[p] = window_max_contig(src, 0, p + half + 1);
+  }
+
+  // Interior: exact length-k window — van-Herk formula applies.
+  for p in half..(n - half) {
+    let l = p - half;
+    let r_idx = p + half;
+    dst[p] = s[l].max(r[r_idx]);
+  }
+
+  // Trailing boundary: clipped window [p - half, n).
+  for p in (n - half)..n {
+    dst[p] = window_max_contig(src, p - half, n);
+  }
+}
+
+/// 1D van-Herk dilation on a strided column of a `w × h` row-major buffer.
+///
+/// Reads column `x` from `src` with stride `w`, writes column `x` of `dst`
+/// with stride `w`. Same boundary handling as [`van_herk_1d_contig`].
+fn van_herk_1d_column(
+  src: &[u8],
+  dst: &mut [u8],
+  r: &mut [u8],
+  s: &mut [u8],
+  x: usize,
+  w: usize,
+  h: usize,
+  k: usize,
+) {
+  let half = k / 2;
+  if h == 0 {
+    return;
+  }
+
+  if h <= 2 * half {
+    for p in 0..h {
+      let lo = p.saturating_sub(half);
+      let hi = (p + half + 1).min(h);
+      dst[p * w + x] = window_max_column(src, lo, hi, x, w);
+    }
+    return;
+  }
+
+  let mut i = 0;
+  while i < h {
+    let end = (i + k).min(h);
+    r[i] = src[i * w + x];
+    for j in (i + 1)..end {
+      r[j] = r[j - 1].max(src[j * w + x]);
+    }
+    i = end;
+  }
+
+  let mut i = 0;
+  while i < h {
+    let end = (i + k).min(h);
+    s[end - 1] = src[(end - 1) * w + x];
+    for j in (i..(end - 1)).rev() {
+      s[j] = s[j + 1].max(src[j * w + x]);
+    }
+    i = end;
+  }
+
+  for p in 0..half {
+    dst[p * w + x] = window_max_column(src, 0, p + half + 1, x, w);
+  }
+
+  for p in half..(h - half) {
+    let l = p - half;
+    let r_idx = p + half;
+    dst[p * w + x] = s[l].max(r[r_idx]);
+  }
+
+  for p in (h - half)..h {
+    dst[p * w + x] = window_max_column(src, p - half, h, x, w);
+  }
+}
+
+/// Max of `src[lo..hi]`. Used only at clipped boundaries.
+#[cfg_attr(not(tarpaulin), inline(always))]
+fn window_max_contig(src: &[u8], lo: usize, hi: usize) -> u8 {
+  let mut m = 0u8;
+  for i in lo..hi {
+    if src[i] > m {
+      m = src[i];
     }
   }
+  m
+}
+
+/// Max of column `x` of `src` over rows `[lo, hi)`.
+#[cfg_attr(not(tarpaulin), inline(always))]
+fn window_max_column(src: &[u8], lo: usize, hi: usize, x: usize, w: usize) -> u8 {
+  let mut m = 0u8;
+  for i in lo..hi {
+    let v = src[i * w + x];
+    if v > m {
+      m = v;
+    }
+  }
+  m
 }
 
 #[cfg(test)]
@@ -1215,6 +1391,75 @@ mod tests {
     assert_eq!(median_u8(&v), 3);
     let v = vec![10u8; 100];
     assert_eq!(median_u8(&v), 10);
+  }
+
+  /// Naive O(n·k) reference dilate; used to cross-check van-Herk output.
+  fn naive_dilate(input: &[u8], w: usize, h: usize, k: usize) -> Vec<u8> {
+    let half = k / 2;
+    let mut out = vec![0u8; w * h];
+    for y in 0..h {
+      for x in 0..w {
+        let mut m = 0u8;
+        let yl = y.saturating_sub(half);
+        let yh = (y + half + 1).min(h);
+        let xl = x.saturating_sub(half);
+        let xh = (x + half + 1).min(w);
+        for yy in yl..yh {
+          for xx in xl..xh {
+            let v = input[yy * w + xx];
+            if v > m {
+              m = v;
+            }
+          }
+        }
+        out[y * w + x] = m;
+      }
+    }
+    out
+  }
+
+  #[test]
+  fn van_herk_dilate_matches_naive_square_input() {
+    // 16×16 edge-like input with isolated strong pixels near the edges and
+    // interior, exercising both boundary clamping and the block-seam case.
+    let w = 16usize;
+    let h = 16usize;
+    let mut input = vec![0u8; w * h];
+    for (y, x) in [(0, 0), (0, 15), (15, 0), (15, 15), (7, 7), (3, 11)] {
+      input[y * w + x] = 255;
+    }
+    for &k in &[3usize, 5, 7, 11, 13] {
+      let mut out = vec![0u8; w * h];
+      let mut tmp = vec![0u8; w * h];
+      let mut vh_r = vec![0u8; w.max(h)];
+      let mut vh_s = vec![0u8; w.max(h)];
+      dilate(&input, &mut out, &mut tmp, &mut vh_r, &mut vh_s, w as u32, h as u32, k as u32);
+      let expected = naive_dilate(&input, w, h, k);
+      assert_eq!(out, expected, "van-Herk vs naive mismatch at k={k}");
+    }
+  }
+
+  #[test]
+  fn van_herk_dilate_non_square_and_non_multiple_dims() {
+    // Dimensions not multiples of any typical k — exercises the partial
+    // trailing block in both row and column passes.
+    let w = 17usize;
+    let h = 11usize;
+    let mut input = vec![0u8; w * h];
+    let mut rng = 0x9E3779B9u32;
+    for v in input.iter_mut() {
+      rng = rng.wrapping_mul(1664525).wrapping_add(1013904223);
+      *v = if rng > 0xC000_0000 { 255 } else { 0 };
+    }
+    for &k in &[3usize, 5, 9] {
+      let mut out = vec![0u8; w * h];
+      let mut tmp = vec![0u8; w * h];
+      let mut vh_r = vec![0u8; w.max(h)];
+      let mut vh_s = vec![0u8; w.max(h)];
+      dilate(&input, &mut out, &mut tmp, &mut vh_r, &mut vh_s, w as u32, h as u32, k as u32);
+      let expected = naive_dilate(&input, w, h, k);
+      assert_eq!(out, expected, "van-Herk vs naive mismatch at k={k}, dims {w}x{h}");
+    }
   }
 
   #[test]
