@@ -124,6 +124,28 @@ impl Timebase {
     let nanos = (total_ns % 1_000_000_000) as u32;
     Duration::new(secs, nanos)
   }
+
+  /// Converts a [`Duration`] into the number of PTS units this timebase
+  /// represents, rounding toward zero.
+  ///
+  /// Inverse of "multiplying a PTS value by this timebase to get seconds".
+  /// Saturates at `i64::MAX` if the duration is absurdly large for this
+  /// timebase. Returns `0` if `self.num() == 0` (a degenerate timebase).
+  pub const fn duration_to_pts(&self, d: Duration) -> i64 {
+    let num = self.num as u128;
+    if num == 0 {
+      return 0;
+    }
+    let den = self.den.get() as u128;
+    // pts_units = duration_ns * den / (num * 1e9)
+    let ns = d.as_nanos();
+    let pts = ns * den / (num * 1_000_000_000);
+    if pts > i64::MAX as u128 {
+      i64::MAX
+    } else {
+      pts as i64
+    }
+  }
 }
 
 impl PartialEq for Timebase {
@@ -223,6 +245,19 @@ impl Timestamp {
       pts: self.timebase.rescale(self.pts, target),
       timebase: target,
     }
+  }
+
+  /// Returns a new [`Timestamp`] representing this instant shifted backward
+  /// by `d`, in the same timebase. Saturates at `i64::MIN` if the subtraction
+  /// would underflow (pathological for real video).
+  ///
+  /// Useful for "virtual past" seeding: e.g., initializing a warmup-filter
+  /// state to `ts - min_duration` so the first detected cut can fire
+  /// immediately.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn saturating_sub_duration(self, d: Duration) -> Self {
+    let units = self.timebase.duration_to_pts(d);
+    Self::new(self.pts.saturating_sub(units), self.timebase)
   }
 
   /// `const fn` form of [`Ord::cmp`]. Compares two timestamps by the instant
@@ -571,6 +606,198 @@ pub enum RgbFrameError {
   },
   /// `width * 3` or `stride * height` overflowed `usize` (can only happen
   /// on 32-bit targets with very large frames).
+  #[error("frame dimensions overflow usize: stride ({stride}) * height ({height})")]
+  DimensionsOverflow {
+    /// The stride in bytes.
+    stride: u32,
+    /// The frame height in pixels.
+    height: u32,
+  },
+}
+
+/// A frame in HSV color space, stored as three separate 8-bit planes.
+///
+/// Follows OpenCV's 8-bit HSV encoding: `H ∈ [0, 179]` (hue in degrees
+/// divided by 2 so it fits in `u8`), `S ∈ [0, 255]`, `V ∈ [0, 255]`.
+///
+/// This is the planar form produced by
+/// `cv2.split(cv2.cvtColor(..., COLOR_BGR2HSV))` in Python. If your
+/// producer hands you interleaved HSV triples, split them into planes
+/// first.
+///
+/// All three planes share the same dimensions and stride, and row `y`
+/// starts at byte offset `y * stride` in each plane.
+#[derive(Debug, Clone, Copy)]
+pub struct HsvFrame<'a> {
+  h: &'a [u8],
+  s: &'a [u8],
+  v: &'a [u8],
+  width: u32,
+  height: u32,
+  stride: u32,
+  timestamp: Timestamp,
+}
+
+impl<'a> HsvFrame<'a> {
+  /// Creates a new `HsvFrame`, validating dimensions of all three planes.
+  ///
+  /// # Panics
+  ///
+  /// Panics if any plane is invalid. See [`HsvFrameError`] for conditions.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn new(
+    h: &'a [u8],
+    s: &'a [u8],
+    v: &'a [u8],
+    width: u32,
+    height: u32,
+    stride: u32,
+    timestamp: Timestamp,
+  ) -> Self {
+    match Self::try_new(h, s, v, width, height, stride, timestamp) {
+      Ok(f) => f,
+      Err(_) => panic!("invalid HsvFrame dimensions or data length"),
+    }
+  }
+
+  /// Creates a new `HsvFrame`, returning an error if the three planes are
+  /// inconsistent in size or if any is too short for the given dimensions.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn try_new(
+    h: &'a [u8],
+    s: &'a [u8],
+    v: &'a [u8],
+    width: u32,
+    height: u32,
+    stride: u32,
+    timestamp: Timestamp,
+  ) -> Result<Self, HsvFrameError> {
+    if stride < width {
+      return Err(HsvFrameError::StrideTooSmall { width, stride });
+    }
+    let expected = match (stride as usize).checked_mul(height as usize) {
+      Some(v) => v,
+      None => return Err(HsvFrameError::DimensionsOverflow { stride, height }),
+    };
+    if h.len() < expected {
+      return Err(HsvFrameError::PlaneTooShort {
+        plane: HsvPlane::Hue,
+        expected,
+        actual: h.len(),
+      });
+    }
+    if s.len() < expected {
+      return Err(HsvFrameError::PlaneTooShort {
+        plane: HsvPlane::Saturation,
+        expected,
+        actual: s.len(),
+      });
+    }
+    if v.len() < expected {
+      return Err(HsvFrameError::PlaneTooShort {
+        plane: HsvPlane::Value,
+        expected,
+        actual: v.len(),
+      });
+    }
+    Ok(Self {
+      h,
+      s,
+      v,
+      width,
+      height,
+      stride,
+      timestamp,
+    })
+  }
+
+  /// Returns the hue (H) plane, `[0, 179]` per OpenCV's 8-bit encoding.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn hue(&self) -> &'a [u8] {
+    self.h
+  }
+
+  /// Returns the saturation (S) plane, `[0, 255]`.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn saturation(&self) -> &'a [u8] {
+    self.s
+  }
+
+  /// Returns the value / brightness (V) plane, `[0, 255]`.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn value(&self) -> &'a [u8] {
+    self.v
+  }
+
+  /// Returns the frame width in pixels.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn width(&self) -> u32 {
+    self.width
+  }
+
+  /// Returns the frame height in pixels.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn height(&self) -> u32 {
+    self.height
+  }
+
+  /// Returns the per-plane stride in bytes.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn stride(&self) -> u32 {
+    self.stride
+  }
+
+  /// Returns the presentation timestamp.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn timestamp(&self) -> Timestamp {
+    self.timestamp
+  }
+}
+
+/// Which plane of an [`HsvFrame`] failed validation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum HsvPlane {
+  /// Hue plane.
+  Hue,
+  /// Saturation plane.
+  Saturation,
+  /// Value (brightness) plane.
+  Value,
+}
+
+impl core::fmt::Display for HsvPlane {
+  fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+    match self {
+      Self::Hue => f.write_str("hue"),
+      Self::Saturation => f.write_str("saturation"),
+      Self::Value => f.write_str("value"),
+    }
+  }
+}
+
+/// Error returned by [`HsvFrame::try_new`] when the planes are inconsistent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, thiserror::Error)]
+#[non_exhaustive]
+pub enum HsvFrameError {
+  /// `stride` was smaller than `width`.
+  #[error("stride ({stride}) is smaller than width ({width})")]
+  StrideTooSmall {
+    /// The frame width in pixels.
+    width: u32,
+    /// The provided stride in bytes.
+    stride: u32,
+  },
+  /// One of the planes was too short.
+  #[error("{plane} plane has length {actual} but at least {expected} are required")]
+  PlaneTooShort {
+    /// Which plane had insufficient data.
+    plane: HsvPlane,
+    /// Minimum required byte length per plane.
+    expected: usize,
+    /// Actual byte length.
+    actual: usize,
+  },
+  /// `stride * height` overflowed `usize`.
   #[error("frame dimensions overflow usize: stride ({stride}) * height ({height})")]
   DimensionsOverflow {
     /// The stride in bytes.

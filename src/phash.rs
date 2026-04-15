@@ -51,6 +51,7 @@ pub struct Options {
   lowpass: u32,
   #[cfg_attr(feature = "serde", serde(with = "humantime_serde"))]
   min_duration: Duration,
+  allow_initial_cut: bool,
 }
 
 impl Default for Options {
@@ -69,6 +70,7 @@ impl Options {
       size: 16,
       lowpass: 2,
       min_duration: Duration::from_secs(1),
+      allow_initial_cut: true,
     }
   }
 
@@ -175,6 +177,31 @@ impl Options {
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn set_min_frames(&mut self, frames: u32, fps: Timebase) -> &mut Self {
     self.min_duration = fps.frames_to_duration(frames);
+    self
+  }
+
+  /// Whether the first detected cut is allowed to fire immediately.
+  ///
+  /// - `true` (default): the first detected cut fires as soon as the
+  ///   normalized Hamming distance exceeds `threshold`.
+  /// - `false`: suppresses cuts until the stream has actually run for at
+  ///   least [`Self::min_duration`]. Matches PySceneDetect's default.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn allow_initial_cut(&self) -> bool {
+    self.allow_initial_cut
+  }
+
+  /// Sets whether the first detected cut may fire immediately.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn with_allow_initial_cut(mut self, val: bool) -> Self {
+    self.allow_initial_cut = val;
+    self
+  }
+
+  /// Sets `allow_initial_cut` in place.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn set_allow_initial_cut(&mut self, val: bool) -> &mut Self {
+    self.allow_initial_cut = val;
     self
   }
 }
@@ -374,7 +401,11 @@ impl Detector {
     let ts = frame.timestamp();
 
     if self.last_cut_ts.is_none() {
-      self.last_cut_ts = Some(ts);
+      self.last_cut_ts = Some(if self.options.allow_initial_cut {
+        ts.saturating_sub_duration(self.options.min_duration)
+      } else {
+        ts
+      });
     }
 
     self.compute_hash(&frame);
@@ -936,7 +967,10 @@ mod tests {
 
   #[test]
   fn min_duration_suppresses_rapid_cuts() {
-    let opts = Options::default().with_min_duration(Duration::from_secs(1));
+    // Python-compat mode: no early cuts allowed.
+    let opts = Options::default()
+      .with_min_duration(Duration::from_secs(1))
+      .with_allow_initial_cut(false);
     let mut det = Detector::new(opts);
 
     let (a, b) = ortho_halves_frames();

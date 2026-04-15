@@ -89,6 +89,7 @@ pub struct Options {
   add_final_scene: bool,
   #[cfg_attr(feature = "serde", serde(with = "humantime_serde"))]
   min_duration: Duration,
+  initial_cut: bool,
 }
 
 impl Default for Options {
@@ -111,6 +112,7 @@ impl Options {
       fade_bias: 0.0,
       add_final_scene: false,
       min_duration: Duration::from_secs(1),
+      initial_cut: true,
     }
   }
 
@@ -236,6 +238,31 @@ impl Options {
     self.min_duration = fps.frames_to_duration(frames);
     self
   }
+
+  /// Whether the first detected cut is allowed to fire immediately.
+  ///
+  /// - `true` (default): the first complete fade cycle emits a cut as soon
+  ///   as the min-duration gate is satisfied relative to stream start.
+  /// - `false`: suppresses cuts until the stream has actually run for at
+  ///   least [`Self::min_duration`]. Matches PySceneDetect's default.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn initial_cut(&self) -> bool {
+    self.initial_cut
+  }
+
+  /// Sets whether the first detected cut may fire immediately.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn with_initial_cut(mut self, val: bool) -> Self {
+    self.initial_cut = val;
+    self
+  }
+
+  /// Sets `initial_cut` in place.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn set_initial_cut(&mut self, val: bool) -> &mut Self {
+    self.initial_cut = val;
+    self
+  }
 }
 
 /// Internal state: which side of the threshold the detector is currently on.
@@ -359,7 +386,11 @@ impl Detector {
   fn process_with_mean(&mut self, mean: f64, ts: Timestamp) -> Option<Timestamp> {
     self.last_avg = Some(mean);
     if self.last_scene_cut.is_none() {
-      self.last_scene_cut = Some(ts);
+      self.last_scene_cut = Some(if self.options.initial_cut {
+        ts.saturating_sub_duration(self.options.min_duration)
+      } else {
+        ts
+      });
     }
 
     let thresh = self.options.threshold as f64;
