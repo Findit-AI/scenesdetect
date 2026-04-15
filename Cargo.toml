@@ -1,25 +1,39 @@
 [package]
-name = "template-rs"
+name = "scenesdetect"
 version = "0.0.0"
-edition = "2021"
-repository = "https://github.com/al8n/template-rs"
-homepage = "https://github.com/al8n/template-rs"
-documentation = "https://docs.rs/template-rs"
+edition = "2024"
+repository = "https://github.com/al8n/scenesdetect"
+homepage = "https://github.com/al8n/scenesdetect"
+documentation = "https://docs.rs/scenesdetect"
 description = "A template for creating Rust open-source repo on GitHub"
 license = "MIT OR Apache-2.0"
-rust-version = "1.73"
+rust-version = "1.85.0"
 
 [[bench]]
-path = "benches/foo.rs"
-name = "foo"
+path = "benches/histogram.rs"
+name = "histogram"
+harness = false
+
+[[bench]]
+path = "benches/phash.rs"
+name = "phash"
 harness = false
 
 [features]
 default = ["std"]
 alloc = []
-std = []
+std = ["thiserror/default"]
+
+serde = ["dep:serde"]
 
 [dependencies]
+
+
+thiserror = { version = "2", default-features = false }
+
+serde = { version = "1", default-features = false, features = [
+  "derive",
+], optional = true }
 
 [dev-dependencies]
 criterion = "0.8"

@@ -1,4 +1,4 @@
-//! A template for creating Rust open-source repo on GitHub
+#![doc = include_str!("../README.md")]
 #![cfg_attr(not(feature = "std"), no_std)]
 #![cfg_attr(docsrs, feature(doc_cfg))]
 #![cfg_attr(docsrs, allow(unused_attributes))]
@@ -9,3 +9,12 @@ extern crate alloc as std;
 
 #[cfg(feature = "std")]
 extern crate std;
+
+/// Histogram-based scene detector using YUV luma correlation.
+pub mod histogram;
+
+/// Perceptual hash-based scene detector using the DCT-based pHash algorithm.
+pub mod phash;
+
+/// Frame types for scene detection.
+pub mod frame;
