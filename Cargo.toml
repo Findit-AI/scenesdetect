@@ -19,6 +19,16 @@ path = "benches/phash.rs"
 name = "phash"
 harness = false
 
+[[bench]]
+path = "benches/threshold.rs"
+name = "threshold"
+harness = false
+
+[[bench]]
+path = "benches/content.rs"
+name = "content"
+harness = false
+
 [features]
 default = ["std"]
 alloc = []
