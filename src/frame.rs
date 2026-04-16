@@ -582,7 +582,7 @@ impl<'a> LumaFrame<'a> {
 /// bytes per pixel, along with its dimensions and presentation timestamp.
 ///
 /// This type is byte-order-agnostic: detectors that only care about overall
-/// brightness (like [`crate::threshold::Detector`]) treat RGB and BGR
+/// brightness (like [`threshold::Detector`](crate::threshold::Detector)) treat RGB and BGR
 /// equivalently. For detectors that care about channel meaning (future
 /// color-based detectors), the caller is responsible for ensuring the bytes
 /// are in the expected order.

@@ -1,14 +1,15 @@
 //! Perceptual hash (pHash) scene detection via DCT signatures.
 //!
-//! This module implements [`Detector`], a port of PySceneDetect's
-//! `detect-hash` algorithm. Where [`crate::histogram::HistogramDetector`]
-//! looks at *brightness distribution*, the pHash detector looks at
-//! *spatial structure*: a cut fires when the low-frequency DCT signature of
-//! the frame changes significantly.
+//! This module implements [`Detector`](crate::phash::Detector), a port of
+//! PySceneDetect's `detect-hash` algorithm. Where
+//! [`histogram::Detector`](crate::histogram::Detector) looks at *brightness
+//! distribution*, the pHash detector looks at *spatial structure*: a cut
+//! fires when the low-frequency DCT signature of the frame changes
+//! significantly.
 //!
 //! # Algorithm
 //!
-//! For each incoming [`LumaFrame`]:
+//! For each incoming [`LumaFrame`](crate::frame::LumaFrame):
 //!
 //! 1. **Resize** the Y plane to `imsize × imsize` (where `imsize = size *
 //!    lowpass`) using area-weighted downsampling.

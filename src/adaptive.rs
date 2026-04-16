@@ -1,6 +1,6 @@
 //! Adaptive (rolling-average) scene detector.
 //!
-//! A thin layer built on top of [`crate::content::Detector`]. Each frame is
+//! A thin layer built on top of [`content::Detector`]. Each frame is
 //! scored exactly as the content detector scores it (weighted HSV / optional
 //! edges); the adaptive detector maintains a sliding window of `1 + 2W`
 //! scores around a **target** frame and decides whether the target is an
@@ -17,7 +17,7 @@
 //!
 //! For each incoming frame:
 //!
-//! 1. Pass the frame to an inner [`crate::content::Detector`] solely for
+//! 1. Pass the frame to an inner [`content::Detector`] solely for
 //!    its score; its own threshold is set to an unreachable value so it
 //!    never emits cuts.
 //! 2. Read the score and push `(timestamp, score)` onto a ring buffer of
@@ -277,7 +277,7 @@ impl Options {
   }
 
   /// Whether the first detected cut is allowed to fire immediately. See
-  /// [`crate::content::Options::initial_cut`] for semantics.
+  /// [`content::Options::initial_cut`] for semantics.
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn initial_cut(&self) -> bool {
     self.initial_cut

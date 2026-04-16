@@ -1,10 +1,11 @@
 //! Content-change scene detection via HSV-space deltas and optional Canny edges.
 //!
-//! This module implements [`Detector`], a port of PySceneDetect's
-//! `detect-content`. For each consecutive frame pair it computes up to four
-//! per-channel L1 differences in HSV color space (plus optionally a Canny
-//! edge map), combines them into a weighted **`frame_score`**, and emits a
-//! cut when the score exceeds [`Options::threshold`].
+//! This module implements [`Detector`](crate::content::Detector), a port of
+//! PySceneDetect's `detect-content`. For each consecutive frame pair it
+//! computes up to four per-channel L1 differences in HSV color space (plus
+//! optionally a Canny edge map), combines them into a weighted
+//! **`frame_score`**, and emits a cut when the score exceeds
+//! [`Options::threshold`](crate::content::Options::threshold).
 //!
 //! # Pipeline
 //!
@@ -20,25 +21,29 @@
 //!    - `delta_hue`, `delta_sat`, `delta_lum` — mean(|curr − prev|).
 //!    - `delta_edges` — same, but over the dilated binary edge maps.
 //! 4. **Combine into `frame_score`** as `Σ(component × weight) / Σ|weight|`.
-//! 5. **Apply threshold + min-duration gate** via the selected [`FilterMode`].
+//! 5. **Apply threshold + min-duration gate** via the selected
+//!    [`FilterMode`](crate::content::FilterMode).
 //!
 //! # Entry points
 //!
 //! | Method | Input | Notes |
 //! |---|---|---|
-//! | [`Detector::process_luma`] | [`LumaFrame`] | Hue / Saturation weights ignored (we have no chroma). Use when weights are luma-only. |
-//! | [`Detector::process_bgr`] | [`RgbFrame`] | Full pipeline. Byte layout is B,G,R per pixel. |
-//! | [`Detector::process_hsv`] | [`HsvFrame`] | Skip HSV conversion — assumes OpenCV's 8-bit encoding (H in `[0, 179]`). |
+//! | [`Detector::process_luma`](crate::content::Detector::process_luma) | [`LumaFrame`](crate::frame::LumaFrame) | Hue / Saturation weights ignored (we have no chroma). Use when weights are luma-only. |
+//! | [`Detector::process_bgr`](crate::content::Detector::process_bgr) | [`RgbFrame`](crate::frame::RgbFrame) | Full pipeline. Byte layout is B,G,R per pixel. |
+//! | [`Detector::process_hsv`](crate::content::Detector::process_hsv) | [`HsvFrame`](crate::frame::HsvFrame) | Skip HSV conversion — assumes OpenCV's 8-bit encoding (H in `[0, 179]`). |
 //!
 //! # Filter modes
 //!
-//! [`FilterMode::Suppress`] — emit a cut when score ≥ threshold and at
-//! least `min_duration` has elapsed since the previous cut.
+//! [`FilterMode::Suppress`](crate::content::FilterMode::Suppress) — emit a
+//! cut when score ≥ threshold and at least `min_duration` has elapsed since
+//! the previous cut.
 //!
-//! [`FilterMode::Merge`] (default, matches Python) — collapse rapid
-//! consecutive above-threshold frames into a single cut emitted after the
-//! signal has stayed below threshold for `min_duration`. See [`Options::initial_cut`]
-//! for the first-cut behavior.
+//! [`FilterMode::Merge`](crate::content::FilterMode::Merge) (default,
+//! matches Python) — collapse rapid consecutive above-threshold frames into
+//! a single cut emitted after the signal has stayed below threshold for
+//! `min_duration`. See
+//! [`Options::initial_cut`](crate::content::Options::initial_cut) for the
+//! first-cut behavior.
 //!
 //! # Attribution
 //!
@@ -701,6 +706,17 @@ impl Detector {
   /// (`sigma = 1/3`) to mirror the auto-threshold pattern PySceneDetect
   /// uses with `cv2.Canny`.
   fn compute_edges(&mut self) {
+    // The 3×3 Sobel / NMS / hysteresis passes need at least a 3×3 interior
+    // to produce output; smaller frames have no edge pixels to detect. Bail
+    // out early (rather than risk `h - 1` / `w - 1` underflowing the usize
+    // loop bounds in hysteresis) and leave `cur_edges` zeroed.
+    if self.width < 3 || self.height < 3 {
+      for v in self.cur_edges.iter_mut() {
+        *v = 0;
+      }
+      return;
+    }
+
     // Auto-tune Canny hysteresis thresholds from the V-plane median
     // (`sigma = 1/3`), same as `cv2.Canny`.
     let median = median_u8(&self.cur_v);
@@ -797,9 +813,11 @@ impl Detector {
 
     // Passes 2–3: propagate "strong" along 8-connectivity via forward and
     // backward scans. Two full sweeps converge for typical edge maps.
+    let y_end = h.saturating_sub(1);
+    let x_end = w.saturating_sub(1);
     for _ in 0..2 {
-      for y in 1..h - 1 {
-        for x in 1..w - 1 {
+      for y in 1..y_end {
+        for x in 1..x_end {
           let idx = y * w + x;
           if buf[idx] != 1 {
             continue;
@@ -814,8 +832,8 @@ impl Detector {
           }
         }
       }
-      for y in (1..h - 1).rev() {
-        for x in (1..w - 1).rev() {
+      for y in (1..y_end).rev() {
+        for x in (1..x_end).rev() {
           let idx = y * w + x;
           if buf[idx] != 1 {
             continue;
@@ -989,6 +1007,12 @@ impl Detector {
     self.merge_triggered = false;
     self.merge_start = None;
     self.has_previous = false;
+    // Drop per-frame outputs from the previous resolution so callers (and
+    // the adaptive layer reading `last_score()`) don't see stale values
+    // after a resize. They'll be repopulated once the first post-resize
+    // delta is computed.
+    self.last_score = None;
+    self.last_components = None;
   }
 }
 
@@ -1565,5 +1589,54 @@ mod tests {
         .process_luma(luma_frame(&a, 32, 32, 1_000_000))
         .is_none()
     );
+  }
+
+  #[test]
+  fn resize_clears_last_score_and_components() {
+    // Regression: a dimension change in the middle of a stream must drop
+    // the stale `last_score` / `last_components` from the previous
+    // resolution. Without this, `last_score()` would keep reporting the
+    // pre-resize value until two more frames at the new resolution have
+    // been processed — and the adaptive layer, which reads `last_score()`
+    // right after `process_*`, would push that stale number into its
+    // rolling window.
+    let opts = Options::default()
+      .with_weights(LUMA_ONLY_WEIGHTS)
+      .with_min_duration(Duration::from_millis(0));
+    let mut det = Detector::new(opts);
+
+    let a = vec![0u8; 32 * 32];
+    let b = vec![255u8; 32 * 32];
+    det.process_luma(luma_frame(&a, 32, 32, 0));
+    det.process_luma(luma_frame(&b, 32, 32, 33));
+    assert!(det.last_score().is_some_and(|s| s > 0.0));
+    assert!(det.last_components().is_some());
+
+    // Resize to a different resolution — first frame at the new size must
+    // reset per-frame outputs (no valid delta yet).
+    let c = vec![128u8; 16 * 16];
+    det.process_luma(luma_frame(&c, 16, 16, 66));
+    assert!(
+      det.last_score().is_none(),
+      "resize must clear last_score — previous value was for old resolution"
+    );
+    assert!(det.last_components().is_none());
+  }
+
+  #[test]
+  fn zero_sized_frame_with_edges_does_not_panic() {
+    // Regression: a 0-dimensional frame with edge weighting enabled used
+    // to underflow `h - 1` inside the hysteresis pass (debug) or run a
+    // runaway loop (release). Must gracefully no-op instead.
+    let opts = Options::default().with_weights(Components::new(1.0, 1.0, 1.0, 1.0));
+    let mut det = Detector::new(opts);
+    let empty: Vec<u8> = vec![];
+    // 0x0 frame.
+    det.process_luma(luma_frame(&empty, 0, 0, 0));
+    det.process_luma(luma_frame(&empty, 0, 0, 33));
+    // 1x1 frame: too small for the 3×3 Sobel kernel — also must not panic.
+    let one = vec![128u8];
+    det.process_luma(luma_frame(&one, 1, 1, 66));
+    det.process_luma(luma_frame(&one, 1, 1, 99));
   }
 }

@@ -1,10 +1,11 @@
 //! Intensity-threshold scene detection — fade-in / fade-out transitions.
 //!
-//! This module implements [`Detector`], a port of PySceneDetect's
-//! `detect-threshold` algorithm. Unlike the frame-difference detectors
-//! ([`crate::histogram`], [`crate::phash`]), this one looks at the
-//! **absolute mean brightness** of each frame and fires when the mean
-//! crosses a threshold in one direction and then the other.
+//! This module implements [`Detector`](crate::threshold::Detector), a port
+//! of PySceneDetect's `detect-threshold` algorithm. Unlike the
+//! frame-difference detectors ([`histogram`](crate::histogram),
+//! [`phash`](crate::phash)), this one looks at the **absolute mean
+//! brightness** of each frame and fires when the mean crosses a threshold
+//! in one direction and then the other.
 //!
 //! Typical use: detecting fades-to-black between scenes in films.
 //!
@@ -18,14 +19,17 @@
 //!
 //! For each frame:
 //!
-//! 1. **Compute mean intensity.** For [`LumaFrame`] inputs, the mean of the
-//!    Y plane. For [`RgbFrame`] inputs, the mean of all 3 × W × H bytes —
-//!    mirroring Python's `numpy.mean(frame_img)` over a BGR image.
+//! 1. **Compute mean intensity.** For [`LumaFrame`](crate::frame::LumaFrame)
+//!    inputs, the mean of the Y plane. For
+//!    [`RgbFrame`](crate::frame::RgbFrame) inputs, the mean of all
+//!    3 × W × H bytes — mirroring Python's `numpy.mean(frame_img)` over a
+//!    BGR image.
 //! 2. **Check for a state transition.**
 //!    - `In → Out`: store this frame's timestamp as the fade-out start.
 //!    - `Out → In`: we just completed a full fade cycle. Emit a cut
 //!      **interpolated between the fade-out and fade-in endpoints** by
-//!      [`Options::fade_bias`], gated by [`Options::min_duration`].
+//!      [`Options::fade_bias`](crate::threshold::Options::fade_bias), gated
+//!      by [`Options::min_duration`](crate::threshold::Options::min_duration).
 //!
 //! The interpolation is:
 //!
@@ -39,17 +43,22 @@
 //! # End-of-stream handling
 //!
 //! If the stream ends while the detector is in `Out` state (fade-to-black
-//! without a recovery) and [`Options::add_final_scene`] is set, calling
-//! [`Detector::finish`] emits one final cut at the fade-out frame. This
-//! represents "the last scene ended when the video faded out."
+//! without a recovery) and
+//! [`Options::add_final_scene`](crate::threshold::Options::add_final_scene)
+//! is set, calling
+//! [`Detector::finish`](crate::threshold::Detector::finish) emits one final
+//! cut at the fade-out frame. This represents "the last scene ended when
+//! the video faded out."
 //!
-//! [`Detector::clear`] resets stream state so the same detector instance
-//! can be reused for the next video.
+//! [`Detector::clear`](crate::threshold::Detector::clear) resets stream
+//! state so the same detector instance can be reused for the next video.
 //!
-//! # [`Method`] variants
+//! # [`Method`](crate::threshold::Method) variants
 //!
-//! - [`Method::Floor`] — "dark = below threshold" (fade to black, default).
-//! - [`Method::Ceiling`] — "bright = above threshold" (fade to white).
+//! - [`Method::Floor`](crate::threshold::Method::Floor) — "dark = below
+//!   threshold" (fade to black, default).
+//! - [`Method::Ceiling`](crate::threshold::Method::Ceiling) — "bright =
+//!   above threshold" (fade to white).
 //!
 //! # Attribution
 //!
@@ -370,8 +379,8 @@ impl Detector {
   /// detector instance is immediately ready for the next video. Subsequent
   /// calls to `finish` without any intervening `process_*` will return
   /// `None` (nothing to finish).
-  pub fn finish(&mut self, last_ts: Timestamp) -> Option<Timestamp> {
-    let cut = self.final_cut(last_ts);
+  pub fn finish(&mut self, _last_ts: Timestamp) -> Option<Timestamp> {
+    let cut = self.final_cut();
     // If we're emitting a final cut, record a degenerate range at the
     // fade-out frame (no matching fade-in at end-of-stream). This lets
     // callers query `last_fade_range()` after `finish` for consistency
@@ -384,7 +393,7 @@ impl Detector {
 
   /// Computes the end-of-stream cut (if any) without mutating state —
   /// [`Self::finish`] calls this, then clears.
-  fn final_cut(&self, last_ts: Timestamp) -> Option<Timestamp> {
+  fn final_cut(&self) -> Option<Timestamp> {
     if !self.options.add_final_scene {
       return None;
     }
@@ -392,8 +401,12 @@ impl Detector {
       return None;
     }
     let fade_frame = self.last_fade_frame?;
+    // Gate on the cut we're about to emit (`fade_frame`), not on the last
+    // observed frame — otherwise a long tail of above-threshold frames
+    // after the fade-out would let us emit `fade_frame` even though it's
+    // closer than `min_duration` to the previous cut.
     let min_elapsed = match &self.last_scene_cut {
-      Some(last) => last_ts
+      Some(last) => fade_frame
         .duration_since(last)
         .is_some_and(|d| d >= self.options.min_duration),
       None => true,
@@ -444,17 +457,20 @@ impl Detector {
         }
         FadeType::Out if !dark => {
           // Fade-in completes a fade cycle.
-          let min_elapsed = match &self.last_scene_cut {
-            Some(last) => ts
-              .duration_since(last)
-              .is_some_and(|d| d >= self.options.min_duration),
-            None => true,
-          };
-          if min_elapsed {
-            if let Some(f_out) = self.last_fade_frame {
-              let placed = interpolate_cut(f_out, ts, self.options.fade_bias);
+          if let Some(f_out) = self.last_fade_frame {
+            let placed = interpolate_cut(f_out, ts, self.options.fade_bias);
+            // min_duration is measured from the previously emitted cut to
+            // the one we're about to emit (`placed`), so the gate is
+            // consistent with what the caller observes.
+            let min_elapsed = match &self.last_scene_cut {
+              Some(last) => placed
+                .duration_since(last)
+                .is_some_and(|d| d >= self.options.min_duration),
+              None => true,
+            };
+            if min_elapsed {
               cut = Some(placed);
-              self.last_scene_cut = Some(ts);
+              self.last_scene_cut = Some(placed);
               // Expose the full [fade_out, fade_in] range for callers who
               // want richer info than the interpolated point. Rescale f_in
               // into f_out's timebase so endpoints share a timebase
@@ -883,6 +899,88 @@ mod tests {
     // it completes a fade cycle and emits a cut.
     let cut2 = det.process_luma(luma(&bright, 8, 8, 1_000_100));
     assert!(cut2.is_some(), "cut detection resumes after clear");
+  }
+
+  #[test]
+  fn min_duration_gate_measured_from_emitted_cut_not_fade_in() {
+    // Regression: the min-duration gate is anchored on the *emitted* cut
+    // (the interpolated placement between fade-out and fade-in), not on the
+    // fade-in frame. Otherwise long fades consume part of the gate window.
+    //
+    // Schedule (min_duration = 200 ms, fade_bias = 0 so placed = midpoint):
+    //   bright(0) dark(100)  -> fade-out starts at 100
+    //   bright(200)          -> fade-in; cut1 placed = 150  (midpoint)
+    //   dark(250)            -> fade-out starts at 250
+    //   bright(300)          -> fade-in; cut2 placed = 275
+    //
+    // Between cut1 (150) and cut2 (275): 125 ms < 200 ms → cut2 must be
+    // suppressed. The previous code set `last_scene_cut = 200` (fade-in),
+    // so the gate from the fade-in's POV looked like 300 - 200 = 100 ms,
+    // which was also < 200 ms and therefore happened to suppress cut2 in
+    // this exact schedule. Stretch the second fade so it's >200 ms from
+    // fade-in but <200 ms from the emitted cut to surface the bug:
+    //   cut1 placed = 150, cut2 placed = 250 (150 ms apart).
+    //   fade-in (201→400) sits 200 ms from fade-in-1 (=200), 250 ms from
+    //   the previously-wrongly-recorded fade-in.
+    // Concretely: bright(0) dark(100) bright(200) (cut1 @150) dark(300)
+    // bright(400) -> cut2 placed = 350.
+    //   gate-from-emitted: 350 - 150 = 200  ✅ allowed (exactly min_duration)
+    //   gate-from-fade-in: 350 - 200 = 150  ❌ would suppress
+    let mut det = Detector::new(
+      Options::default()
+        .with_min_duration(Duration::from_millis(200))
+        .with_fade_bias(0.0),
+    );
+    let bright = uniform_luma(200, 0);
+    let dark = uniform_luma(5, 0);
+
+    det.process_luma(luma(&bright, 8, 8, 0));
+    det.process_luma(luma(&dark, 8, 8, 100));
+    let cut1 = det.process_luma(luma(&bright, 8, 8, 200)).expect("cut1");
+    assert_eq!(cut1.pts(), 150);
+
+    det.process_luma(luma(&dark, 8, 8, 300));
+    let cut2 = det.process_luma(luma(&bright, 8, 8, 400));
+    assert!(
+      cut2.is_some(),
+      "cut2 should fire — 350 - 150 = 200 ms meets the gate",
+    );
+    assert_eq!(cut2.unwrap().pts(), 350);
+  }
+
+  #[test]
+  fn final_cut_gated_on_fade_frame_not_last_ts() {
+    // Regression: `finish()`'s min-duration gate compares the emitted
+    // `fade_frame` against the previous cut, not the `last_ts` argument.
+    // Otherwise a long tail of frames before finish() would let a final
+    // cut fire even though its timestamp is too close to the previous one.
+    //
+    // Schedule (min_duration = 200 ms, fade_bias = 0):
+    //   bright(0) dark(100) bright(200)   -> cut1 placed = 150
+    //   dark(250)                         -> fade-out at 250, no fade-in
+    //   finish(10_000)                    -> last_ts far in the future
+    //
+    // gate-from-fade_frame: 250 - 150 = 100 < 200 → suppress (correct).
+    // gate-from-last_ts:    10000 - 150 huge ≥ 200 → would emit (wrong).
+    let mut det = Detector::new(
+      Options::default()
+        .with_min_duration(Duration::from_millis(200))
+        .with_fade_bias(0.0)
+        .with_add_final_scene(true),
+    );
+    let bright = uniform_luma(200, 0);
+    let dark = uniform_luma(5, 0);
+
+    det.process_luma(luma(&bright, 8, 8, 0));
+    det.process_luma(luma(&dark, 8, 8, 100));
+    det.process_luma(luma(&bright, 8, 8, 200));
+    det.process_luma(luma(&dark, 8, 8, 250));
+
+    let final_cut = det.finish(Timestamp::new(10_000, tb()));
+    assert!(
+      final_cut.is_none(),
+      "final cut must be suppressed — 250 is only 100 ms from the previous cut (150)"
+    );
   }
 
   #[test]

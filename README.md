@@ -3,7 +3,7 @@
 </div>
 <div align="center">
 
-A template for creating Rust open-source GitHub repo.
+A Rust port of [PySceneDetect](https://github.com/Breakthrough/PySceneDetect) — scene/shot cut detection built around a Sans-I/O streaming API, designed to slot in any other frame source.
 
 [<img alt="github" src="https://img.shields.io/badge/github-al8n/scenesdetect-8da0cb?style=for-the-badge&logo=Github" height="22">][Github-url]
 <img alt="LoC" src="https://img.shields.io/endpoint?url=https%3A%2F%2Fgist.githubusercontent.com%2Fal8n%2F327b2a8aef9003246e45c6e47fe63937%2Fraw%2Fscenesdetect" height="22">
@@ -15,9 +15,37 @@ A template for creating Rust open-source GitHub repo.
 [<img alt="crates.io" src="https://img.shields.io/crates/d/scenesdetect?color=critical&logo=data:image/svg+xml;base64,PD94bWwgdmVyc2lvbj0iMS4wIiBzdGFuZGFsb25lPSJubyI/PjwhRE9DVFlQRSBzdmcgUFVCTElDICItLy9XM0MvL0RURCBTVkcgMS4xLy9FTiIgImh0dHA6Ly93d3cudzMub3JnL0dyYXBoaWNzL1NWRy8xLjEvRFREL3N2ZzExLmR0ZCI+PHN2ZyB0PSIxNjQ1MTE3MzMyOTU5IiBjbGFzcz0iaWNvbiIgdmlld0JveD0iMCAwIDEwMjQgMTAyNCIgdmVyc2lvbj0iMS4xIiB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHAtaWQ9IjM0MjEiIGRhdGEtc3BtLWFuY2hvci1pZD0iYTMxM3guNzc4MTA2OS4wLmkzIiB3aWR0aD0iNDgiIGhlaWdodD0iNDgiIHhtbG5zOnhsaW5rPSJodHRwOi8vd3d3LnczLm9yZy8xOTk5L3hsaW5rIj48ZGVmcz48c3R5bGUgdHlwZT0idGV4dC9jc3MiPjwvc3R5bGU+PC9kZWZzPjxwYXRoIGQ9Ik00NjkuMzEyIDU3MC4yNHYtMjU2aDg1LjM3NnYyNTZoMTI4TDUxMiA3NTYuMjg4IDM0MS4zMTIgNTcwLjI0aDEyOHpNMTAyNCA2NDAuMTI4QzEwMjQgNzgyLjkxMiA5MTkuODcyIDg5NiA3ODcuNjQ4IDg5NmgtNTEyQzEyMy45MDQgODk2IDAgNzYxLjYgMCA1OTcuNTA0IDAgNDUxLjk2OCA5NC42NTYgMzMxLjUyIDIyNi40MzIgMzAyLjk3NiAyODQuMTYgMTk1LjQ1NiAzOTEuODA4IDEyOCA1MTIgMTI4YzE1Mi4zMiAwIDI4Mi4xMTIgMTA4LjQxNiAzMjMuMzkyIDI2MS4xMkM5NDEuODg4IDQxMy40NCAxMDI0IDUxOS4wNCAxMDI0IDY0MC4xOTJ6IG0tMjU5LjItMjA1LjMxMmMtMjQuNDQ4LTEyOS4wMjQtMTI4Ljg5Ni0yMjIuNzItMjUyLjgtMjIyLjcyLTk3LjI4IDAtMTgzLjA0IDU3LjM0NC0yMjQuNjQgMTQ3LjQ1NmwtOS4yOCAyMC4yMjQtMjAuOTI4IDIuOTQ0Yy0xMDMuMzYgMTQuNC0xNzguMzY4IDEwNC4zMi0xNzguMzY4IDIxNC43MiAwIDExNy45NTIgODguODMyIDIxNC40IDE5Ni45MjggMjE0LjRoNTEyYzg4LjMyIDAgMTU3LjUwNC03NS4xMzYgMTU3LjUwNC0xNzEuNzEyIDAtODguMDY0LTY1LjkyLTE2NC45MjgtMTQ0Ljk2LTE3MS43NzZsLTI5LjUwNC0yLjU2LTUuODg4LTMwLjk3NnoiIGZpbGw9IiNmZmZmZmYiIHAtaWQ9IjM0MjIiIGRhdGEtc3BtLWFuY2hvci1pZD0iYTMxM3guNzc4MTA2OS4wLmkwIiBjbGFzcz0iIj48L3BhdGg+PC9zdmc+&style=for-the-badge" height="22">][crates-url]
 <img alt="license" src="https://img.shields.io/badge/License-Apache%202.0/MIT-blue.svg?style=for-the-badge&fontColor=white&logoColor=f5c076&logo=data:image/svg+xml;base64,PCFET0NUWVBFIHN2ZyBQVUJMSUMgIi0vL1czQy8vRFREIFNWRyAxLjEvL0VOIiAiaHR0cDovL3d3dy53My5vcmcvR3JhcGhpY3MvU1ZHLzEuMS9EVEQvc3ZnMTEuZHRkIj4KDTwhLS0gVXBsb2FkZWQgdG86IFNWRyBSZXBvLCB3d3cuc3ZncmVwby5jb20sIFRyYW5zZm9ybWVkIGJ5OiBTVkcgUmVwbyBNaXhlciBUb29scyAtLT4KPHN2ZyBmaWxsPSIjZmZmZmZmIiBoZWlnaHQ9IjgwMHB4IiB3aWR0aD0iODAwcHgiIHZlcnNpb249IjEuMSIgaWQ9IkNhcGFfMSIgeG1sbnM9Imh0dHA6Ly93d3cudzMub3JnLzIwMDAvc3ZnIiB4bWxuczp4bGluaz0iaHR0cDovL3d3dy53My5vcmcvMTk5OS94bGluayIgdmlld0JveD0iMCAwIDI3Ni43MTUgMjc2LjcxNSIgeG1sOnNwYWNlPSJwcmVzZXJ2ZSIgc3Ryb2tlPSIjZmZmZmZmIj4KDTxnIGlkPSJTVkdSZXBvX2JnQ2FycmllciIgc3Ryb2tlLXdpZHRoPSIwIi8+Cg08ZyBpZD0iU1ZHUmVwb190cmFjZXJDYXJyaWVyIiBzdHJva2UtbGluZWNhcD0icm91bmQiIHN0cm9rZS1saW5lam9pbj0icm91bmQiLz4KDTxnIGlkPSJTVkdSZXBvX2ljb25DYXJyaWVyIj4gPGc+IDxwYXRoIGQ9Ik0xMzguMzU3LDBDNjIuMDY2LDAsMCw2Mi4wNjYsMCwxMzguMzU3czYyLjA2NiwxMzguMzU3LDEzOC4zNTcsMTM4LjM1N3MxMzguMzU3LTYyLjA2NiwxMzguMzU3LTEzOC4zNTcgUzIxNC42NDgsMCwxMzguMzU3LDB6IE0xMzguMzU3LDI1OC43MTVDNzEuOTkyLDI1OC43MTUsMTgsMjA0LjcyMywxOCwxMzguMzU3UzcxLjk5MiwxOCwxMzguMzU3LDE4IHMxMjAuMzU3LDUzLjk5MiwxMjAuMzU3LDEyMC4zNTdTMjA0LjcyMywyNTguNzE1LDEzOC4zNTcsMjU4LjcxNXoiLz4gPHBhdGggZD0iTTE5NC43OTgsMTYwLjkwM2MtNC4xODgtMi42NzctOS43NTMtMS40NTQtMTIuNDMyLDIuNzMyYy04LjY5NCwxMy41OTMtMjMuNTAzLDIxLjcwOC0zOS42MTQsMjEuNzA4IGMtMjUuOTA4LDAtNDYuOTg1LTIxLjA3OC00Ni45ODUtNDYuOTg2czIxLjA3Ny00Ni45ODYsNDYuOTg1LTQ2Ljk4NmMxNS42MzMsMCwzMC4yLDcuNzQ3LDM4Ljk2OCwyMC43MjMgYzIuNzgyLDQuMTE3LDguMzc1LDUuMjAxLDEyLjQ5NiwyLjQxOGM0LjExOC0yLjc4Miw1LjIwMS04LjM3NywyLjQxOC0xMi40OTZjLTEyLjExOC0xNy45MzctMzIuMjYyLTI4LjY0NS01My44ODItMjguNjQ1IGMtMzUuODMzLDAtNjQuOTg1LDI5LjE1Mi02NC45ODUsNjQuOTg2czI5LjE1Miw2NC45ODYsNjQuOTg1LDY0Ljk4NmMyMi4yODEsMCw0Mi43NTktMTEuMjE4LDU0Ljc3OC0zMC4wMDkgQzIwMC4yMDgsMTY5LjE0NywxOTguOTg1LDE2My41ODIsMTk0Ljc5OCwxNjAuOTAzeiIvPiA8L2c+IDwvZz4KDTwvc3ZnPg==" height="22">
 
-English | [简体中文][zh-cn-url]
-
 </div>
+
+## Overview
+
+`scenesdetect` is a from-scratch Rust port of [PySceneDetect](https://github.com/Breakthrough/PySceneDetect). It is deliberately **Sans-I/O**: the crate never opens a file, decodes a packet, or spawns a thread. Callers hand frames in one by one, and each detector returns an `Option<Timestamp>` identifying the cut point — or nothing. Composing those point cuts into scene ranges is the caller's responsibility, which keeps this crate independent of any particular decoding pipeline.
+
+Timestamps are represented as raw integer `pts + Timebase` (matching FFmpeg's `AVRational`) rather than floating-point seconds, so all arithmetic is exact and cross-stream comparisons are unambiguous.
+
+## Detectors
+
+| Module | Algorithm | Good for |
+|---|---|---|
+| [`histogram`] | YUV-luma histogram correlation | Generic cuts, robust to camera shake |
+| [`phash`] | DCT-based perceptual hash (pHash) | Similarity-tolerant dedup / cut detection |
+| [`threshold`] | Mean-brightness state machine | Fade-to-black / fade-in transitions |
+| [`content`] | HSV-space delta + optional Canny edge delta | Motion/composition changes — the default PySceneDetect algorithm |
+| [`adaptive`] | Rolling-average wrapper over `content` | Suppresses false positives on sustained fast motion |
+
+[`histogram`]: https://docs.rs/scenesdetect/latest/scenesdetect/histogram/
+[`phash`]: https://docs.rs/scenesdetect/latest/scenesdetect/phash/
+[`threshold`]: https://docs.rs/scenesdetect/latest/scenesdetect/threshold/
+[`content`]: https://docs.rs/scenesdetect/latest/scenesdetect/content/
+[`adaptive`]: https://docs.rs/scenesdetect/latest/scenesdetect/adaptive/
+
+## Features
+
+- **Sans-I/O streaming API** — hand in `LumaFrame` / `RgbFrame` / `HsvFrame` (zero-copy slices), get `Option<Timestamp>` back per frame. No allocation on the hot path once the detector is primed.
+- **Hand-written SIMD backends** — aarch64 NEON, x86 SSSE3 + AVX2 (runtime-dispatched via `is_x86_feature_detected!`), and wasm `simd128`. All with scalar fallbacks, toggleable per-detector via `Options::with_simd(false)`.
+- **Exact rational timestamps** — `Timebase` mirrors FFmpeg's `AVRational`; `Timestamp` compares semantically across timebases via i128 cross-multiply.
+- **`no_std` + `alloc`** — the crate builds without `std`; enable the default `std` feature for runtime x86 feature detection.
+- **Optional `serde`** — all `Options` types derive `Serialize` / `Deserialize` under the `serde` feature.
 
 ## Installation
 
@@ -26,8 +54,17 @@ English | [简体中文][zh-cn-url]
 scenesdetect = "0.1"
 ```
 
-## Features
-- [x] Create a Rust open-source repo fast 
+## Crate features
+
+| Feature | Default | Purpose |
+|---|---|---|
+| `std` | ✓ | Runtime x86 SIMD dispatch, standard library types |
+| `alloc` |   | `no_std` build using `alloc` only |
+| `serde` |   | `Serialize` / `Deserialize` for all `Options` types |
+
+## Attribution
+
+Ported from [PySceneDetect](https://github.com/Breakthrough/PySceneDetect) (BSD 3-Clause). Algorithm behavior mirrors PySceneDetect where documented; deviations are noted in the relevant module docs.
 
 #### License
 
@@ -36,11 +73,10 @@ Apache License (Version 2.0).
 
 See [LICENSE-APACHE](LICENSE-APACHE), [LICENSE-MIT](LICENSE-MIT) for details.
 
-Copyright (c) 2021 Al Liu.
+Copyright (c) 2026 FinDIT studio authers.
 
 [Github-url]: https://github.com/al8n/scenesdetect/
 [CI-url]: https://github.com/al8n/scenesdetect/actions/workflows/ci.yml
 [doc-url]: https://docs.rs/scenesdetect
 [crates-url]: https://crates.io/crates/scenesdetect
 [codecov-url]: https://app.codecov.io/gh/al8n/scenesdetect/
-[zh-cn-url]: https://github.com/al8n/scenesdetect/tree/main/README-zh_CN.md
