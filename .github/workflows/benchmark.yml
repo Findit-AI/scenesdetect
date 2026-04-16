@@ -25,19 +25,90 @@ env:
 
 jobs:
   benchmark:
-    name: benchmark
+    name: ${{ matrix.label }}
     strategy:
+      fail-fast: false
       matrix:
-        os:
-          - ubuntu-latest
-          - macos-latest
-          - windows-latest
+        include:
+          # aarch64 — exercises the NEON SIMD backend (vld3q_u8 deinterleave,
+          # vabdq_u8 / vpaddlq mean-abs-diff, NEON Sobel).
+          - os: macos-latest
+            arch: aarch64
+            tier: neon
+            rustflags: ''
+            label: macos-aarch64-neon
+
+          # x86_64 default: the runtime dispatcher (`is_x86_feature_detected!`)
+          # picks AVX2 on modern GH runners, falls back to SSSE3 otherwise.
+          # This exercises the x86 dispatch code path as shipped.
+          - os: ubuntu-latest
+            arch: x86_64
+            tier: default
+            rustflags: ''
+            label: ubuntu-x86_64-default
+
+          # x86_64 with `-C target-cpu=native`: lets LLVM auto-vectorize the
+          # non-SIMD scalar code (histogram accumulate, phash DCT, adaptive
+          # rolling sum, etc.) with the full feature set of the runner's CPU.
+          # Complements the default tier to show the ceiling of scalar wins.
+          - os: ubuntu-latest
+            arch: x86_64
+            tier: native
+            rustflags: '-C target-cpu=native'
+            label: ubuntu-x86_64-native
+
+          # x86_64 with SSSE3 forced on at compile time and AVX/AVX2 off:
+          # exercises the SSSE3 dispatch path even when the runner CPU
+          # supports AVX2. We gate on compile-time target_feature in
+          # `content/arch.rs` only in the `not(feature = "std")` branch; with
+          # std the dispatcher uses `is_x86_feature_detected!`, so this tier
+          # primarily guards that the SSSE3 module *compiles* without AVX2.
+          - os: ubuntu-latest
+            arch: x86_64
+            tier: ssse3-only
+            rustflags: '-C target-feature=+ssse3,-avx,-avx2,-fma'
+            label: ubuntu-x86_64-ssse3-only
+
+          # Windows x86_64 — same dispatcher as Linux but validates the MSVC
+          # toolchain handles the intrinsics-heavy modules.
+          - os: windows-latest
+            arch: x86_64
+            tier: default
+            rustflags: ''
+            label: windows-x86_64-default
+
     runs-on: ${{ matrix.os }}
+    env:
+      RUSTFLAGS: ${{ matrix.rustflags }}
     steps:
       - uses: actions/checkout@v6
 
       - name: Install Rust
         run: rustup update stable --no-self-update && rustup default stable
+
+      - name: Print CPU info (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          echo "=== /proc/cpuinfo (first flags line) ==="
+          grep -m1 '^flags' /proc/cpuinfo || true
+          echo "=== lscpu ==="
+          lscpu || true
+
+      - name: Print CPU info (macOS)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          echo "=== sysctl machdep.cpu ==="
+          sysctl machdep.cpu || true
+          echo "=== uname -m ==="
+          uname -m
+
+      - name: Print CPU info (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          Get-CimInstance Win32_Processor | Select-Object Name, Manufacturer, NumberOfCores, NumberOfLogicalProcessors | Format-List
 
       - name: Cache cargo build and registry
         uses: actions/cache@v5
@@ -46,85 +117,80 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-bench-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-bench-${{ matrix.tier }}-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
+            ${{ runner.os }}-bench-${{ matrix.tier }}-
             ${{ runner.os }}-bench-
 
-      - name: Install Criterion
-        run: cargo install cargo-criterion || true
-
-      - name: Run benchmarks - interfaces
-        run: cargo bench --bench interfaces -- --output-format bencher | tee benchmark-interfaces-${{ matrix.os }}.txt
+      - name: Run benchmarks - histogram
+        shell: bash
+        run: cargo bench --bench histogram -- --output-format bencher | tee benchmark-histogram-${{ matrix.label }}.txt
         continue-on-error: true
 
-      - name: Run benchmarks - local_ip_address
-        run: cargo bench --bench local_ip_address -- --output-format bencher | tee benchmark-local-ip-${{ matrix.os }}.txt
+      - name: Run benchmarks - phash
+        shell: bash
+        run: cargo bench --bench phash -- --output-format bencher | tee benchmark-phash-${{ matrix.label }}.txt
         continue-on-error: true
 
-      - name: Run benchmarks - gateway
-        run: cargo bench --bench gateway -- --output-format bencher | tee benchmark-gateway-${{ matrix.os }}.txt
+      - name: Run benchmarks - threshold
+        shell: bash
+        run: cargo bench --bench threshold -- --output-format bencher | tee benchmark-threshold-${{ matrix.label }}.txt
         continue-on-error: true
 
-      - name: Collect Criterion results
+      - name: Run benchmarks - content
+        shell: bash
+        run: cargo bench --bench content -- --output-format bencher | tee benchmark-content-${{ matrix.label }}.txt
+        continue-on-error: true
+
+      - name: Run benchmarks - adaptive
+        shell: bash
+        run: cargo bench --bench adaptive -- --output-format bencher | tee benchmark-adaptive-${{ matrix.label }}.txt
+        continue-on-error: true
+
+      - name: Collect benchmark summary
         shell: bash
         run: |
-          echo "## Benchmark Results for ${{ matrix.os }}" > benchmark-summary-${{ matrix.os }}.md
-          echo "" >> benchmark-summary-${{ matrix.os }}.md
-          echo "### System Information" >> benchmark-summary-${{ matrix.os }}.md
-          echo "- OS: ${{ matrix.os }}" >> benchmark-summary-${{ matrix.os }}.md
-          echo "- Runner: ${{ runner.name }}" >> benchmark-summary-${{ matrix.os }}.md
-          echo "- Architecture: ${{ runner.arch }}" >> benchmark-summary-${{ matrix.os }}.md
-          echo "- Date: $(date -u +"%Y-%m-%d %H:%M:%S UTC")" >> benchmark-summary-${{ matrix.os }}.md
-          echo "" >> benchmark-summary-${{ matrix.os }}.md
+          summary="benchmark-summary-${{ matrix.label }}.md"
+          echo "## Benchmark Results for ${{ matrix.label }}" > "$summary"
+          echo "" >> "$summary"
+          echo "### System Information" >> "$summary"
+          echo "- OS: ${{ matrix.os }}" >> "$summary"
+          echo "- Arch: ${{ matrix.arch }}" >> "$summary"
+          echo "- SIMD tier: ${{ matrix.tier }}" >> "$summary"
+          echo "- Runner: ${{ runner.name }}" >> "$summary"
+          echo "- Runner arch (GH): ${{ runner.arch }}" >> "$summary"
+          echo "- RUSTFLAGS: \`${{ matrix.rustflags }}\`" >> "$summary"
+          echo "- Date: $(date -u +"%Y-%m-%d %H:%M:%S UTC")" >> "$summary"
+          echo "" >> "$summary"
 
-          # Process interfaces benchmarks
-          if [ -f "benchmark-interfaces-${{ matrix.os }}.txt" ]; then
-            echo "### Interface Operations" >> benchmark-summary-${{ matrix.os }}.md
-            echo "" >> benchmark-summary-${{ matrix.os }}.md
-            echo "\`\`\`" >> benchmark-summary-${{ matrix.os }}.md
-            grep "^test " benchmark-interfaces-${{ matrix.os }}.txt >> benchmark-summary-${{ matrix.os }}.md || echo "No results" >> benchmark-summary-${{ matrix.os }}.md
-            echo "\`\`\`" >> benchmark-summary-${{ matrix.os }}.md
-            echo "" >> benchmark-summary-${{ matrix.os }}.md
-          fi
+          for bench in histogram phash threshold content adaptive; do
+            file="benchmark-${bench}-${{ matrix.label }}.txt"
+            if [ -f "$file" ]; then
+              echo "### ${bench}" >> "$summary"
+              echo "" >> "$summary"
+              echo "\`\`\`" >> "$summary"
+              grep "^test " "$file" >> "$summary" || echo "No results" >> "$summary"
+              echo "\`\`\`" >> "$summary"
+              echo "" >> "$summary"
+            fi
+          done
 
-          # Process local IP benchmarks
-          if [ -f "benchmark-local-ip-${{ matrix.os }}.txt" ]; then
-            echo "### Local IP Operations" >> benchmark-summary-${{ matrix.os }}.md
-            echo "" >> benchmark-summary-${{ matrix.os }}.md
-            echo "\`\`\`" >> benchmark-summary-${{ matrix.os }}.md
-            grep "^test " benchmark-local-ip-${{ matrix.os }}.txt >> benchmark-summary-${{ matrix.os }}.md || echo "No results" >> benchmark-summary-${{ matrix.os }}.md
-            echo "\`\`\`" >> benchmark-summary-${{ matrix.os }}.md
-            echo "" >> benchmark-summary-${{ matrix.os }}.md
-          fi
-
-          # Process gateway benchmarks
-          if [ -f "benchmark-gateway-${{ matrix.os }}.txt" ]; then
-            echo "### Gateway Operations" >> benchmark-summary-${{ matrix.os }}.md
-            echo "" >> benchmark-summary-${{ matrix.os }}.md
-            echo "\`\`\`" >> benchmark-summary-${{ matrix.os }}.md
-            grep "^test " benchmark-gateway-${{ matrix.os }}.txt >> benchmark-summary-${{ matrix.os }}.md || echo "No results" >> benchmark-summary-${{ matrix.os }}.md
-            echo "\`\`\`" >> benchmark-summary-${{ matrix.os }}.md
-            echo "" >> benchmark-summary-${{ matrix.os }}.md
-          fi
-
-          cat benchmark-summary-${{ matrix.os }}.md
+          cat "$summary"
 
       - name: Create benchmark archive
         shell: bash
         run: |
           mkdir -p benchmark-results
           mv benchmark-*.txt benchmark-results/ 2>/dev/null || true
-          mv benchmark-summary-${{ matrix.os }}.md benchmark-results/ 2>/dev/null || true
-
-          # Copy Criterion output if it exists
+          mv benchmark-summary-${{ matrix.label }}.md benchmark-results/ 2>/dev/null || true
           if [ -d "target/criterion" ]; then
-            cp -r target/criterion benchmark-results/criterion-${{ matrix.os }} || true
+            cp -r target/criterion benchmark-results/criterion-${{ matrix.label }} || true
           fi
 
       - name: Upload benchmark results
         uses: actions/upload-artifact@v7
         with:
-          name: benchmark-results-${{ matrix.os }}
+          name: benchmark-results-${{ matrix.label }}
           path: benchmark-results/
           retention-days: 90
 
@@ -132,12 +198,12 @@ jobs:
         uses: actions/upload-artifact@v7
         if: always()
         with:
-          name: criterion-detailed-${{ matrix.os }}
+          name: criterion-detailed-${{ matrix.label }}
           path: target/criterion/
           retention-days: 90
         continue-on-error: true
 
-  # Aggregate results from all platforms
+  # Aggregate results from all platforms and SIMD tiers.
   aggregate-results:
     name: Aggregate benchmark results
     needs: benchmark
@@ -157,7 +223,6 @@ jobs:
           echo "Date: $(date -u +"%Y-%m-%d %H:%M:%S UTC")" >> BENCHMARK_SUMMARY.md
           echo "" >> BENCHMARK_SUMMARY.md
 
-          # Combine all platform results
           for os_dir in all-results/benchmark-results-*/; do
             if [ -d "$os_dir" ]; then
               for summary in "$os_dir"benchmark-summary-*.md; do
