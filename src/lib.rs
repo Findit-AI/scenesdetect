@@ -23,5 +23,9 @@ pub mod threshold;
 /// optional Canny edge comparison.
 pub mod content;
 
+/// Rolling-average / adaptive scene detector built on top of the content
+/// detector's scores. Reduces false positives on fast camera motion.
+pub mod adaptive;
+
 /// Frame types for scene detection.
 pub mod frame;

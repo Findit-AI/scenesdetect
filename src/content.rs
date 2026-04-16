@@ -175,7 +175,7 @@ impl Components {
 
   /// Returns the sum of absolute weights. Used for score normalization.
   #[cfg_attr(not(tarpaulin), inline(always))]
-  pub fn sum_abs(&self) -> f64 {
+  pub const fn sum_abs(&self) -> f64 {
     self.delta_hue.abs() + self.delta_sat.abs() + self.delta_lum.abs() + self.delta_edges.abs()
   }
 }
@@ -485,13 +485,15 @@ impl Detector {
   /// # Panics
   ///
   /// Panics if the options are invalid — see [`Error`].
+  #[cfg_attr(not(tarpaulin), inline(always))]
   pub fn new(options: Options) -> Self {
-    Self::try_new(options).expect("invalid content::Options")
+    Self::try_new(options).expect("invalid detector options")
   }
 
   /// Creates a new detector with the given options, returning [`Error`] on
   /// invalid configuration.
-  pub fn try_new(options: Options) -> Result<Self, Error> {
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn try_new(options: Options) -> Result<Self, Error> {
     let sum = options.weights.sum_abs();
     if sum == 0.0 {
       return Err(Error::ZeroWeights);
