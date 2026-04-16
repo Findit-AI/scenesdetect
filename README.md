@@ -62,9 +62,11 @@ scenesdetect = "0.1"
 | `alloc` |   | `no_std` build using `alloc` only |
 | `serde` |   | `Serialize` / `Deserialize` for all `Options` types |
 
-## Attribution
+## Acknowledgements
 
-Ported from [PySceneDetect](https://github.com/Breakthrough/PySceneDetect) (BSD 3-Clause). Algorithm behavior mirrors PySceneDetect where documented; deviations are noted in the relevant module docs.
+`scenesdetect` is a Rust port of [**PySceneDetect**](https://github.com/Breakthrough/PySceneDetect) by [Brandon Castellano](https://github.com/Breakthrough), released under the BSD 3-Clause license. The detector algorithms — histogram correlation, DCT-based pHash, brightness-threshold fades, HSV + Canny content deltas, and the rolling-average adaptive layer — are re-implementations of the algorithms described in PySceneDetect's source and documentation. Default parameters mirror PySceneDetect's where practical; any deliberate deviations are called out in the relevant module docs.
+
+See [THIRD-PARTY.md](THIRD-PARTY.md) for the full upstream license text and additional third-party notices.
 
 #### License
 
