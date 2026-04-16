@@ -53,6 +53,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::frame::{HsvFrame, LumaFrame, RgbFrame, Timebase, Timestamp};
 
+mod arch;
+use arch::bgr_to_hsv_planes;
+
 /// Default weights for the four score components. Matches PySceneDetect's
 /// `DEFAULT_COMPONENT_WEIGHTS`: hue, saturation, and luma equally weighted;
 /// edges off.
@@ -658,29 +661,208 @@ impl Detector {
   /// (`sigma = 1/3`) to mirror the auto-threshold pattern PySceneDetect
   /// uses with `cv2.Canny`.
   fn compute_edges(&mut self) {
-    // Pre-grab disjoint-field borrows so the sub-passes can run without the
-    // borrow checker needing to reason about re-borrowing `self`.
-    let input = &self.cur_v;
-    let sobel_mag = &mut self.sobel_mag;
-    let sobel_dir = &mut self.sobel_dir;
-    let nms_out = &mut self.nms_out;
-    let tmp = &mut self.dilate_tmp;
-    let out = &mut self.cur_edges;
-    let vh_r = &mut self.vh_r;
-    let vh_s = &mut self.vh_s;
-    let width = self.width;
-    let height = self.height;
-    let kernel = self.kernel;
-
-    let median = median_u8(input);
+    // Auto-tune Canny hysteresis thresholds from the V-plane median
+    // (`sigma = 1/3`), same as `cv2.Canny`.
+    let median = median_u8(&self.cur_v);
     let sigma = 1.0_f32 / 3.0;
     let low = ((1.0 - sigma) * median as f32).max(0.0) as u8;
     let high = ((1.0 + sigma) * median as f32).min(255.0) as u8;
 
-    sobel(input, sobel_mag, sobel_dir, width, height);
-    non_max_suppress(sobel_mag, sobel_dir, nms_out, width, height);
-    hysteresis(nms_out, sobel_mag, low, high, width, height);
-    dilate(nms_out, out, tmp, vh_r, vh_s, width, height, kernel);
+    self.sobel();
+    self.non_max_suppress();
+    self.hysteresis(low, high);
+    self.dilate();
+  }
+
+  /// 3×3 Sobel over `self.cur_v`, writing L1 magnitude into `self.sobel_mag`
+  /// and a quantized gradient direction (0=horizontal, 1=45°, 2=vertical,
+  /// 3=135°) into `self.sobel_dir`. Border pixels get magnitude 0.
+  fn sobel(&mut self) {
+    let input = &self.cur_v;
+    let mag = &mut self.sobel_mag;
+    let dir = &mut self.sobel_dir;
+    let w = self.width as usize;
+    let h = self.height as usize;
+
+    for v in mag.iter_mut() {
+      *v = 0;
+    }
+    for v in dir.iter_mut() {
+      *v = 0;
+    }
+    for y in 1..h.saturating_sub(1) {
+      for x in 1..w.saturating_sub(1) {
+        let i = |yy: usize, xx: usize| input[yy * w + xx] as i32;
+        // Gx: [-1 0 1; -2 0 2; -1 0 1]
+        let gx = -i(y - 1, x - 1) - 2 * i(y, x - 1) - i(y + 1, x - 1)
+          + i(y - 1, x + 1)
+          + 2 * i(y, x + 1)
+          + i(y + 1, x + 1);
+        // Gy: [-1 -2 -1; 0 0 0; 1 2 1]
+        let gy = -i(y - 1, x - 1) - 2 * i(y - 1, x) - i(y - 1, x + 1)
+          + i(y + 1, x - 1)
+          + 2 * i(y + 1, x)
+          + i(y + 1, x + 1);
+        let m = gx.abs() + gy.abs();
+        let idx = y * w + x;
+        mag[idx] = m;
+        // Quantize direction by comparing |gy|/|gx| against tan(22.5°)≈0.414
+        // and tan(67.5°)≈2.414. ay/ax < 0.414 → horizontal (0); ≥ 2.414 →
+        // vertical (2); else diagonal — sign of gx·gy picks 45° vs 135°.
+        let ax = gx.abs();
+        let ay = gy.abs();
+        let d: u8 = if ay * 1000 < ax * 414 {
+          0
+        } else if ay * 1000 > ax * 2414 {
+          2
+        } else if gx.signum() == gy.signum() {
+          1
+        } else {
+          3
+        };
+        dir[idx] = d;
+      }
+    }
+  }
+
+  /// Non-maximum suppression along the gradient direction. Pixels that
+  /// aren't a local max in the gradient direction are zeroed; survivors
+  /// carry their magnitude (clamped to u8 for the downstream hysteresis).
+  /// True magnitude is preserved in `self.sobel_mag` for the high-threshold
+  /// check.
+  fn non_max_suppress(&mut self) {
+    let mag = &self.sobel_mag;
+    let dir = &self.sobel_dir;
+    let out = &mut self.nms_out;
+    let w = self.width as usize;
+    let h = self.height as usize;
+
+    for v in out.iter_mut() {
+      *v = 0;
+    }
+    for y in 1..h.saturating_sub(1) {
+      for x in 1..w.saturating_sub(1) {
+        let idx = y * w + x;
+        let m = mag[idx];
+        if m == 0 {
+          continue;
+        }
+        let (dx, dy): (isize, isize) = match dir[idx] {
+          0 => (1, 0),  // horizontal
+          1 => (1, 1),  // 45°
+          2 => (0, 1),  // vertical
+          _ => (1, -1), // 135°
+        };
+        let a = mag[((y as isize + dy) as usize) * w + (x as isize + dx) as usize];
+        let b = mag[((y as isize - dy) as usize) * w + (x as isize - dx) as usize];
+        if m >= a && m >= b {
+          out[idx] = m.min(255) as u8;
+        }
+      }
+    }
+  }
+
+  /// Hysteresis thresholding: pixels in `self.nms_out` with true magnitude
+  /// ≥ `high` are strong edges (255); those ≥ `low` AND 8-connected to a
+  /// strong pixel become edges too; everything else is zeroed.
+  ///
+  /// Uses a two-pass forward/backward scan as a tractable stand-in for a
+  /// worklist flood-fill — converges for typical edge content.
+  fn hysteresis(&mut self, low: u8, high: u8) {
+    let buf = &mut self.nms_out;
+    let mag_raw = &self.sobel_mag;
+    let w = self.width as usize;
+    let h = self.height as usize;
+    let high = high as i32;
+    let low = low as i32;
+
+    // Pass 1: classify each NMS survivor as strong (2), weak (1), or zero.
+    for i in 0..(w * h) {
+      if buf[i] == 0 {
+        continue;
+      }
+      let m = mag_raw[i];
+      if m >= high {
+        buf[i] = 2;
+      } else if m >= low {
+        buf[i] = 1;
+      } else {
+        buf[i] = 0;
+      }
+    }
+
+    // Passes 2–3: propagate "strong" along 8-connectivity via forward and
+    // backward scans. Two full sweeps converge for typical edge maps.
+    for _ in 0..2 {
+      for y in 1..h - 1 {
+        for x in 1..w - 1 {
+          let idx = y * w + x;
+          if buf[idx] != 1 {
+            continue;
+          }
+          for (dy, dx) in [(-1i32, -1i32), (-1, 0), (-1, 1), (0, -1)] {
+            let ny = (y as i32 + dy) as usize;
+            let nx = (x as i32 + dx) as usize;
+            if buf[ny * w + nx] == 2 {
+              buf[idx] = 2;
+              break;
+            }
+          }
+        }
+      }
+      for y in (1..h - 1).rev() {
+        for x in (1..w - 1).rev() {
+          let idx = y * w + x;
+          if buf[idx] != 1 {
+            continue;
+          }
+          for (dy, dx) in [(1i32, 1i32), (1, 0), (1, -1), (0, 1)] {
+            let ny = (y as i32 + dy) as usize;
+            let nx = (x as i32 + dx) as usize;
+            if buf[ny * w + nx] == 2 {
+              buf[idx] = 2;
+              break;
+            }
+          }
+        }
+      }
+    }
+
+    // Finalize: 2 → 255, anything else → 0.
+    for v in buf.iter_mut() {
+      *v = if *v == 2 { 255 } else { 0 };
+    }
+  }
+
+  /// Separable morphological dilation with a `kernel × kernel` square
+  /// kernel via the van-Herk / Gil-Werman O(n) algorithm.
+  ///
+  /// Reads from `self.nms_out`, uses `self.dilate_tmp` as the horizontal
+  /// pass intermediate, and writes to `self.cur_edges`. `self.vh_r` and
+  /// `self.vh_s` are 1D prefix-max scratch of size `max(width, height)`.
+  fn dilate(&mut self) {
+    let input = &self.nms_out;
+    let out = &mut self.cur_edges;
+    let tmp = &mut self.dilate_tmp;
+    let vh_r = &mut self.vh_r;
+    let vh_s = &mut self.vh_s;
+    let w = self.width as usize;
+    let h = self.height as usize;
+    let k = self.kernel as usize;
+    debug_assert!(k >= 3 && k % 2 == 1);
+    debug_assert!(vh_r.len() >= w.max(h) && vh_s.len() >= w.max(h));
+
+    // Horizontal row pass: input → tmp.
+    for y in 0..h {
+      let row_in = &input[y * w..y * w + w];
+      let row_out = &mut tmp[y * w..y * w + w];
+      van_herk_1d_contig(row_in, row_out, vh_r, vh_s, w, k);
+    }
+
+    // Vertical column pass: tmp → out. Strided access.
+    for x in 0..w {
+      van_herk_1d_column(tmp, out, vh_r, vh_s, x, w, h, k);
+    }
   }
 
   /// Apply MERGE or SUPPRESS gating.
@@ -848,61 +1030,9 @@ fn mean_abs_diff(a: &[u8], b: &[u8], n: usize) -> f64 {
 }
 
 // -----------------------------------------------------------------------------
-// BGR → HSV (OpenCV-compatible 8-bit encoding; H in [0, 179])
+// BGR → HSV: implementation lives in `arch`, which compile-time dispatches
+// to aarch64 NEON where available and to a scalar fallback otherwise.
 // -----------------------------------------------------------------------------
-
-/// Converts a packed 24-bit BGR frame into three planar HSV buffers matching
-/// OpenCV's `cv2.COLOR_BGR2HSV` semantics.
-fn bgr_to_hsv_planes(
-  h_out: &mut [u8],
-  s_out: &mut [u8],
-  v_out: &mut [u8],
-  src: &[u8],
-  width: u32,
-  height: u32,
-  stride: u32,
-) {
-  let w = width as usize;
-  let h = height as usize;
-  let s = stride as usize;
-  for y in 0..h {
-    let row = &src[y * s..y * s + w * 3];
-    let dst_off = y * w;
-    for x in 0..w {
-      let b = row[x * 3] as f32;
-      let g = row[x * 3 + 1] as f32;
-      let r = row[x * 3 + 2] as f32;
-      let (hue, sat, val) = bgr_to_hsv_pixel(b, g, r);
-      h_out[dst_off + x] = hue;
-      s_out[dst_off + x] = sat;
-      v_out[dst_off + x] = val;
-    }
-  }
-}
-
-#[inline]
-fn bgr_to_hsv_pixel(b: f32, g: f32, r: f32) -> (u8, u8, u8) {
-  let v = b.max(g).max(r);
-  let min = b.min(g).min(r);
-  let delta = v - min;
-  let s = if v == 0.0 { 0.0 } else { 255.0 * delta / v };
-  let hue = if delta == 0.0 {
-    0.0
-  } else if v == r {
-    let h = 60.0 * (g - b) / delta;
-    if h < 0.0 { h + 360.0 } else { h }
-  } else if v == g {
-    60.0 * (b - r) / delta + 120.0
-  } else {
-    60.0 * (r - g) / delta + 240.0
-  };
-  let h8 = (hue * 0.5).round().clamp(0.0, 179.0) as u8;
-  (
-    h8,
-    s.round().clamp(0.0, 255.0) as u8,
-    v.round().clamp(0.0, 255.0) as u8,
-  )
-}
 
 // -----------------------------------------------------------------------------
 // Canny edge detection + morphological dilation (square kernel)
@@ -934,203 +1064,6 @@ fn median_u8(buf: &[u8]) -> u8 {
     }
   }
   255
-}
-
-/// 3×3 Sobel: computes magnitude (`|Gx| + |Gy|`, L1) and a quantized
-/// gradient direction (0=horizontal, 1=45°, 2=vertical, 3=135°).
-/// Border pixels get magnitude 0.
-fn sobel(input: &[u8], mag: &mut [i32], dir: &mut [u8], width: u32, height: u32) {
-  let w = width as usize;
-  let h = height as usize;
-  for v in mag.iter_mut() {
-    *v = 0;
-  }
-  for v in dir.iter_mut() {
-    *v = 0;
-  }
-  for y in 1..h.saturating_sub(1) {
-    for x in 1..w.saturating_sub(1) {
-      let i = |yy: usize, xx: usize| input[yy * w + xx] as i32;
-      // Gx: [-1 0 1; -2 0 2; -1 0 1]
-      let gx = -i(y - 1, x - 1) - 2 * i(y, x - 1) - i(y + 1, x - 1)
-        + i(y - 1, x + 1)
-        + 2 * i(y, x + 1)
-        + i(y + 1, x + 1);
-      // Gy: [-1 -2 -1; 0 0 0; 1 2 1]
-      let gy = -i(y - 1, x - 1) - 2 * i(y - 1, x) - i(y - 1, x + 1)
-        + i(y + 1, x - 1)
-        + 2 * i(y + 1, x)
-        + i(y + 1, x + 1);
-      let m = gx.abs() + gy.abs();
-      let idx = y * w + x;
-      mag[idx] = m;
-      // Quantize direction: angle = atan2(gy, gx), quantize to 4 bins.
-      let ax = gx.abs();
-      let ay = gy.abs();
-      // Compare gy/gx ratio against tan(22.5°)≈0.414 and tan(67.5°)≈2.414.
-      // ay / ax < 0.414 → horizontal (0)
-      // 0.414 ≤ ay/ax < 2.414 → diagonal — sign determines 45° (1) vs 135° (3)
-      // ay/ax ≥ 2.414 → vertical (2)
-      let d: u8 = if ay * 1000 < ax * 414 {
-        0
-      } else if ay * 1000 > ax * 2414 {
-        2
-      } else if gx.signum() == gy.signum() {
-        1
-      } else {
-        3
-      };
-      dir[idx] = d;
-    }
-  }
-}
-
-/// Non-maximum suppression along gradient direction. Pixels that aren't a
-/// local max in the gradient direction are zeroed; survivors retain their
-/// magnitude (clamped to u8 for downstream hysteresis, with true magnitude
-/// in `mag` preserved for the high-threshold check).
-fn non_max_suppress(mag: &[i32], dir: &[u8], out: &mut [u8], width: u32, height: u32) {
-  let w = width as usize;
-  let h = height as usize;
-  for v in out.iter_mut() {
-    *v = 0;
-  }
-  for y in 1..h.saturating_sub(1) {
-    for x in 1..w.saturating_sub(1) {
-      let idx = y * w + x;
-      let m = mag[idx];
-      if m == 0 {
-        continue;
-      }
-      let (dx, dy): (isize, isize) = match dir[idx] {
-        0 => (1, 0),  // horizontal
-        1 => (1, 1),  // 45°
-        2 => (0, 1),  // vertical
-        _ => (1, -1), // 135°
-      };
-      let a = mag[((y as isize + dy) as usize) * w + (x as isize + dx) as usize];
-      let b = mag[((y as isize - dy) as usize) * w + (x as isize - dx) as usize];
-      if m >= a && m >= b {
-        // Clamp magnitude to u8 for output.
-        out[idx] = m.min(255) as u8;
-      }
-    }
-  }
-}
-
-/// Hysteresis: mark `mag >= high` as strong (255), `mag >= low` AND
-/// 8-connected to strong as edges (255); else 0.
-fn hysteresis(buf: &mut [u8], mag_raw: &[i32], low: u8, high: u8, width: u32, height: u32) {
-  let w = width as usize;
-  let h = height as usize;
-  let high = high as i32;
-  let low = low as i32;
-
-  // Pass 1: mark strong edges (value 2) and weak edges (value 1).
-  for i in 0..(w * h) {
-    if buf[i] == 0 {
-      continue;
-    }
-    let m = mag_raw[i];
-    if m >= high {
-      buf[i] = 2;
-    } else if m >= low {
-      buf[i] = 1;
-    } else {
-      buf[i] = 0;
-    }
-  }
-
-  // Pass 2: propagate strong label via 8-connectivity using a simple
-  // worklist-free iterative scan. Two-pass forward/backward converges for
-  // dense edge maps; rare pathological layouts may require more iterations,
-  // but for typical edge content two passes suffice.
-  for _ in 0..2 {
-    // Forward.
-    for y in 1..h - 1 {
-      for x in 1..w - 1 {
-        let idx = y * w + x;
-        if buf[idx] != 1 {
-          continue;
-        }
-        for (dy, dx) in [(-1i32, -1i32), (-1, 0), (-1, 1), (0, -1)] {
-          let ny = (y as i32 + dy) as usize;
-          let nx = (x as i32 + dx) as usize;
-          if buf[ny * w + nx] == 2 {
-            buf[idx] = 2;
-            break;
-          }
-        }
-      }
-    }
-    // Backward.
-    for y in (1..h - 1).rev() {
-      for x in (1..w - 1).rev() {
-        let idx = y * w + x;
-        if buf[idx] != 1 {
-          continue;
-        }
-        for (dy, dx) in [(1i32, 1i32), (1, 0), (1, -1), (0, 1)] {
-          let ny = (y as i32 + dy) as usize;
-          let nx = (x as i32 + dx) as usize;
-          if buf[ny * w + nx] == 2 {
-            buf[idx] = 2;
-            break;
-          }
-        }
-      }
-    }
-  }
-
-  // Finalize: 2 → 255, anything else → 0.
-  for v in buf.iter_mut() {
-    *v = if *v == 2 { 255 } else { 0 };
-  }
-}
-
-/// Separable morphological dilation with a `k × k` square kernel via the
-/// van-Herk / Gil-Werman O(n) algorithm.
-///
-/// Classical naive dilation is O(n·k) per pass; for typical kernel sizes
-/// (9–13 for HD content) this is a ~10× speedup over the scalar sliding-max
-/// loop. The trick: partition each 1D signal into blocks of size `k`,
-/// compute a forward prefix-max (`R`) and backward prefix-max (`S`) within
-/// each block, then each output position `p` with window `[p-half, p+half]`
-/// is simply `max(S[p-half], R[p+half])` — the two half-window reads
-/// together cover exactly two adjacent blocks of size `k`.
-///
-/// Horizontal row pass writes into `tmp`; vertical column pass reads from
-/// `tmp` (strided) and writes into `out`. `vh_r` and `vh_s` are reusable
-/// scratch of size `max(width, height)`.
-///
-/// Kernel must be an odd integer ≥ 3 (validated by [`Detector::try_new`]).
-fn dilate(
-  input: &[u8],
-  out: &mut [u8],
-  tmp: &mut [u8],
-  vh_r: &mut [u8],
-  vh_s: &mut [u8],
-  width: u32,
-  height: u32,
-  kernel: u32,
-) {
-  let w = width as usize;
-  let h = height as usize;
-  let k = kernel as usize;
-  debug_assert!(k >= 3 && k % 2 == 1);
-  debug_assert!(vh_r.len() >= w.max(h) && vh_s.len() >= w.max(h));
-
-  // Horizontal pass: contiguous per-row, trivially cache-friendly.
-  for y in 0..h {
-    let row_in = &input[y * w..y * w + w];
-    let row_out = &mut tmp[y * w..y * w + w];
-    van_herk_1d_contig(row_in, row_out, vh_r, vh_s, w, k);
-  }
-
-  // Vertical pass: strided reads/writes via column index `x`.
-  for x in 0..w {
-    van_herk_1d_column(tmp, out, vh_r, vh_s, x, w, h, k);
-  }
 }
 
 /// 1D van-Herk dilation on a contiguous slice.
@@ -1293,6 +1226,7 @@ fn window_max_column(src: &[u8], lo: usize, hi: usize, x: usize, w: usize) -> u8
 
 #[cfg(test)]
 mod tests {
+  use super::arch::bgr_to_hsv_pixel;
   use super::*;
   use core::num::NonZeroU32;
 
@@ -1386,6 +1320,69 @@ mod tests {
   }
 
   #[test]
+  fn bgr_to_hsv_simd_matches_scalar() {
+    // Cover a wide range of BGR triples including edges (pure primaries,
+    // grayscale, max-sat corners) and a pseudo-random body. SIMD path
+    // should produce the same u8 HSV as the scalar reference.
+    let w = 64u32;
+    let h = 16u32;
+    let mut src = vec![0u8; (w * h * 3) as usize];
+    let mut rng = 0x9E3779B9u32;
+    for v in src.iter_mut() {
+      rng = rng.wrapping_mul(1664525).wrapping_add(1013904223);
+      *v = (rng >> 24) as u8;
+    }
+    // Splice known triples into the first row to exercise boundary cases.
+    let corners: &[(u8, u8, u8)] = &[
+      (0, 0, 255),     // pure red
+      (0, 255, 0),     // pure green
+      (255, 0, 0),     // pure blue
+      (0, 0, 0),       // black
+      (255, 255, 255), // white
+      (128, 128, 128), // gray
+      (0, 255, 255),   // yellow (R=G=255, B=0)
+      (255, 0, 255),   // magenta
+    ];
+    for (i, &(b, g, r)) in corners.iter().enumerate() {
+      src[i * 3] = b;
+      src[i * 3 + 1] = g;
+      src[i * 3 + 2] = r;
+    }
+
+    let n = (w * h) as usize;
+    let mut h_simd = vec![0u8; n];
+    let mut s_simd = vec![0u8; n];
+    let mut v_simd = vec![0u8; n];
+    bgr_to_hsv_planes(&mut h_simd, &mut s_simd, &mut v_simd, &src, w, h, w * 3);
+
+    // Scalar reference.
+    let mut h_ref = vec![0u8; n];
+    let mut s_ref = vec![0u8; n];
+    let mut v_ref = vec![0u8; n];
+    for yy in 0..(h as usize) {
+      for xx in 0..(w as usize) {
+        let b = src[yy * (w as usize) * 3 + xx * 3] as f32;
+        let g = src[yy * (w as usize) * 3 + xx * 3 + 1] as f32;
+        let r = src[yy * (w as usize) * 3 + xx * 3 + 2] as f32;
+        let (hh, ss, vv) = bgr_to_hsv_pixel(b, g, r);
+        h_ref[yy * (w as usize) + xx] = hh;
+        s_ref[yy * (w as usize) + xx] = ss;
+        v_ref[yy * (w as usize) + xx] = vv;
+      }
+    }
+
+    assert_eq!(v_simd, v_ref, "V plane diverges");
+    assert_eq!(s_simd, s_ref, "S plane diverges");
+    // Hue can differ by 1 at rounding boundaries (SIMD round_int uses
+    // banker's rounding, scalar `.round()` rounds half-away-from-zero);
+    // we accept ±1 mismatches but bound the per-lane difference.
+    for (i, (&a, &b)) in h_simd.iter().zip(h_ref.iter()).enumerate() {
+      let diff = (a as i16 - b as i16).abs();
+      assert!(diff <= 1, "H diverges at index {i}: simd={a} scalar={b}");
+    }
+  }
+
+  #[test]
   fn median_u8_basic() {
     let v = vec![1u8, 2, 3, 4, 5];
     assert_eq!(median_u8(&v), 3);
@@ -1433,7 +1430,7 @@ mod tests {
       let mut tmp = vec![0u8; w * h];
       let mut vh_r = vec![0u8; w.max(h)];
       let mut vh_s = vec![0u8; w.max(h)];
-      dilate(&input, &mut out, &mut tmp, &mut vh_r, &mut vh_s, w as u32, h as u32, k as u32);
+      test_dilate(&input, &mut out, &mut tmp, &mut vh_r, &mut vh_s, w, h, k);
       let expected = naive_dilate(&input, w, h, k);
       assert_eq!(out, expected, "van-Herk vs naive mismatch at k={k}");
     }
@@ -1441,8 +1438,6 @@ mod tests {
 
   #[test]
   fn van_herk_dilate_non_square_and_non_multiple_dims() {
-    // Dimensions not multiples of any typical k — exercises the partial
-    // trailing block in both row and column passes.
     let w = 17usize;
     let h = 11usize;
     let mut input = vec![0u8; w * h];
@@ -1456,9 +1451,34 @@ mod tests {
       let mut tmp = vec![0u8; w * h];
       let mut vh_r = vec![0u8; w.max(h)];
       let mut vh_s = vec![0u8; w.max(h)];
-      dilate(&input, &mut out, &mut tmp, &mut vh_r, &mut vh_s, w as u32, h as u32, k as u32);
+      test_dilate(&input, &mut out, &mut tmp, &mut vh_r, &mut vh_s, w, h, k);
       let expected = naive_dilate(&input, w, h, k);
-      assert_eq!(out, expected, "van-Herk vs naive mismatch at k={k}, dims {w}x{h}");
+      assert_eq!(
+        out, expected,
+        "van-Herk vs naive mismatch at k={k}, dims {w}x{h}"
+      );
+    }
+  }
+
+  /// Test-only wrapper that exercises the van-Herk dilate pipeline (now a
+  /// Detector method) by calling the underlying free-fn helpers directly.
+  fn test_dilate(
+    input: &[u8],
+    out: &mut [u8],
+    tmp: &mut [u8],
+    vh_r: &mut [u8],
+    vh_s: &mut [u8],
+    w: usize,
+    h: usize,
+    k: usize,
+  ) {
+    for y in 0..h {
+      let row_in = &input[y * w..y * w + w];
+      let row_out = &mut tmp[y * w..y * w + w];
+      van_herk_1d_contig(row_in, row_out, vh_r, vh_s, w, k);
+    }
+    for x in 0..w {
+      van_herk_1d_column(tmp, out, vh_r, vh_s, x, w, h, k);
     }
   }
 
