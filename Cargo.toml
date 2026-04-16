@@ -29,6 +29,11 @@ path = "benches/content.rs"
 name = "content"
 harness = false
 
+[[bench]]
+path = "benches/adaptive.rs"
+name = "adaptive"
+harness = false
+
 [features]
 default = ["std"]
 alloc = []

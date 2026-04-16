@@ -306,6 +306,10 @@ pub struct Detector {
   window_width: usize,
   required_frames: usize,
   buffer: VecDeque<(Timestamp, f64)>,
+  /// Rolling sum of all scores currently in `buffer`. Maintained as entries
+  /// are pushed / popped so the per-frame average cost is O(1) instead of
+  /// O(window_width).
+  buffer_sum: f64,
   last_cut_ts: Option<Timestamp>,
   last_adaptive_ratio: Option<f64>,
 }
@@ -341,6 +345,7 @@ impl Detector {
       window_width,
       required_frames,
       buffer: VecDeque::new(),
+      buffer_sum: 0.0,
       last_cut_ts: None,
       last_adaptive_ratio: None,
     })
@@ -387,6 +392,7 @@ impl Detector {
   pub fn clear(&mut self) {
     self.inner.clear();
     self.buffer.clear();
+    self.buffer_sum = 0.0;
     self.last_cut_ts = None;
     self.last_adaptive_ratio = None;
   }
@@ -422,8 +428,11 @@ impl Detector {
     let score = self.inner.last_score()?;
 
     self.buffer.push_back((ts, score));
+    self.buffer_sum += score;
     while self.buffer.len() > self.required_frames {
-      self.buffer.pop_front();
+      if let Some((_, popped)) = self.buffer.pop_front() {
+        self.buffer_sum -= popped;
+      }
     }
     if self.buffer.len() < self.required_frames {
       return None;
@@ -431,15 +440,11 @@ impl Detector {
 
     let (target_ts, target_score) = self.buffer[self.window_width];
 
-    // Average of all scores *except* the target.
+    // Average of all scores *except* the target. Rolling-sum form is O(1)
+    // per frame — the alternative (sum the buffer each frame) is
+    // O(window_width) and dominates adaptive overhead at larger windows.
     let denom = (2 * self.window_width) as f64;
-    let sum_others: f64 = self
-      .buffer
-      .iter()
-      .enumerate()
-      .filter_map(|(i, &(_, s))| (i != self.window_width).then_some(s))
-      .sum();
-    let avg = sum_others / denom;
+    let avg = (self.buffer_sum - target_score) / denom;
 
     let adaptive_ratio = if avg.abs() < 1e-5 {
       // Avoid divide-by-zero: if target has non-trivial content, treat as
