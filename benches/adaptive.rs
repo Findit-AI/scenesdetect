@@ -8,15 +8,16 @@
 //!
 //! Run with `cargo bench --bench adaptive`.
 
-use core::num::NonZeroU32;
-use core::time::Duration;
+use core::{num::NonZeroU32, time::Duration};
 use std::hint::black_box;
 
 use criterion::{Criterion, criterion_group, criterion_main};
 
-use scenesdetect::adaptive::{Detector, Options};
-use scenesdetect::content::{DEFAULT_WEIGHTS, LUMA_ONLY_WEIGHTS};
-use scenesdetect::frame::{LumaFrame, RgbFrame, Timebase, Timestamp};
+use scenesdetect::{
+  adaptive::{Detector, Options},
+  content::{DEFAULT_WEIGHTS, LUMA_ONLY_WEIGHTS},
+  frame::{LumaFrame, RgbFrame, Timebase, Timestamp},
+};
 
 fn make_buf(n: usize) -> Vec<u8> {
   let mut state: u32 = 0x9E3779B9;

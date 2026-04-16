@@ -18,8 +18,10 @@ use std::hint::black_box;
 
 use criterion::{Criterion, criterion_group, criterion_main};
 
-use scenesdetect::content::{Components, DEFAULT_WEIGHTS, Detector, LUMA_ONLY_WEIGHTS, Options};
-use scenesdetect::frame::{LumaFrame, RgbFrame, Timebase, Timestamp};
+use scenesdetect::{
+  content::{Components, DEFAULT_WEIGHTS, Detector, LUMA_ONLY_WEIGHTS, Options},
+  frame::{LumaFrame, RgbFrame, Timebase, Timestamp},
+};
 
 fn make_buf(n: usize) -> Vec<u8> {
   let mut state: u32 = 0x9E3779B9;

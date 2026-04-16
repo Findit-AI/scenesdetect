@@ -48,8 +48,10 @@ use std::collections::VecDeque;
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
 
-use crate::content;
-use crate::frame::{HsvFrame, LumaFrame, RgbFrame, Timebase, Timestamp};
+use crate::{
+  content,
+  frame::{HsvFrame, LumaFrame, RgbFrame, Timebase, Timestamp},
+};
 
 /// Error returned by [`Detector::try_new`] when the provided [`Options`]
 /// are inconsistent or the inner [`content::Options`] is invalid.

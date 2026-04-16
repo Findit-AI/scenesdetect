@@ -9,8 +9,10 @@ use std::hint::black_box;
 
 use criterion::{Criterion, criterion_group, criterion_main};
 
-use scenesdetect::frame::{LumaFrame, Timebase, Timestamp};
-use scenesdetect::histogram::{Detector, Options};
+use scenesdetect::{
+  frame::{LumaFrame, Timebase, Timestamp},
+  histogram::{Detector, Options},
+};
 
 /// Generates a deterministic pseudo-random Y-plane of the requested size.
 /// Uses a tiny LCG so regenerating per benchmark group is negligible.
