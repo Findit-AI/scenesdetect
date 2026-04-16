@@ -183,3 +183,155 @@ unsafe fn bgr_to_hsv_f32x4(
 
   (hue, sat, v)
 }
+
+/// NEON `mean_abs_diff`: `Σ|a[i] - b[i]| / n`.
+///
+/// Uses `vabdq_u8` (absolute-difference, 16 bytes) → `vpaddlq_u8` (pairwise
+/// add-long u8→u16) → `vpaddlq_u16` (u16→u32) → `vpaddlq_u32` (u32→u64),
+/// accumulating into a `u64x2`. Tail handled scalar.
+///
+/// # Safety
+///
+/// Caller must ensure NEON is available (always true on aarch64).
+#[target_feature(enable = "neon")]
+#[allow(unused_unsafe)]
+pub(super) unsafe fn mean_abs_diff(a: &[u8], b: &[u8], n: usize) -> f64 {
+  const LANES: usize = 16;
+  let whole = n / LANES * LANES;
+  let mut acc = unsafe { vdupq_n_u64(0) }; // u64x2 accumulator
+
+  let mut i = 0;
+  while i < whole {
+    let va = unsafe { vld1q_u8(a.as_ptr().add(i)) };
+    let vb = unsafe { vld1q_u8(b.as_ptr().add(i)) };
+    // |a - b| as u8x16.
+    let diff = unsafe { vabdq_u8(va, vb) };
+    // Widen + reduce: u8x16 → u16x8 → u32x4 → u64x2, each step pairwise-sums.
+    let s16 = unsafe { vpaddlq_u8(diff) };
+    let s32 = unsafe { vpaddlq_u16(s16) };
+    let s64 = unsafe { vpaddlq_u32(s32) };
+    acc = unsafe { vaddq_u64(acc, s64) };
+    i += LANES;
+  }
+
+  // Horizontal reduce u64x2 → u64.
+  let mut sum: u64 = unsafe { vgetq_lane_u64::<0>(acc) + vgetq_lane_u64::<1>(acc) };
+
+  // Scalar tail.
+  while i < n {
+    let da = a[i] as i32 - b[i] as i32;
+    sum += da.unsigned_abs() as u64;
+    i += 1;
+  }
+
+  sum as f64 / n as f64
+}
+
+/// NEON Sobel 3×3. Computes Gx, Gy, magnitude in i16x8 (8 pixels/iter)
+/// via shifted row loads. Direction quantization is scalar from extracted lanes.
+///
+/// # Safety
+///
+/// Caller must ensure NEON is available (always true on aarch64).
+#[target_feature(enable = "neon")]
+#[allow(unused_unsafe)]
+pub(super) unsafe fn sobel(input: &[u8], mag: &mut [i32], dir: &mut [u8], w: usize, h: usize) {
+  mag.fill(0);
+  dir.fill(0);
+
+  const LANES: usize = 8;
+
+  for y in 1..h.saturating_sub(1) {
+    let prev = &input[(y - 1) * w..];
+    let curr = &input[y * w..];
+    let next = &input[(y + 1) * w..];
+    let off = y * w;
+
+    let mut x = 1usize;
+
+    // SIMD body: 8 pixels per iteration.
+    while x + LANES < w {
+      // 9 shifted loads, widen u8x8 → i16x8.
+      macro_rules! ld {
+        ($row:expr, $o:expr) => {{ unsafe { vreinterpretq_s16_u16(vmovl_u8(vld1_u8($row.as_ptr().add($o)))) } }};
+      }
+      let pl = ld!(prev, x - 1);
+      let pm = ld!(prev, x);
+      let pr = ld!(prev, x + 1);
+      let cl = ld!(curr, x - 1);
+      let cr = ld!(curr, x + 1);
+      let nl = ld!(next, x - 1);
+      let nm = ld!(next, x);
+      let nr = ld!(next, x + 1);
+
+      // Gx = (pr + 2*cr + nr) - (pl + 2*cl + nl)
+      let gx = unsafe {
+        let pos = vaddq_s16(vaddq_s16(pr, vshlq_n_s16::<1>(cr)), nr);
+        let neg = vaddq_s16(vaddq_s16(pl, vshlq_n_s16::<1>(cl)), nl);
+        vsubq_s16(pos, neg)
+      };
+
+      // Gy = (nl + 2*nm + nr) - (pl + 2*pm + pr)
+      let gy = unsafe {
+        let pos = vaddq_s16(vaddq_s16(nl, vshlq_n_s16::<1>(nm)), nr);
+        let neg = vaddq_s16(vaddq_s16(pl, vshlq_n_s16::<1>(pm)), pr);
+        vsubq_s16(pos, neg)
+      };
+
+      // mag = |gx| + |gy| as i16, then widen to i32 and store.
+      let mag_i16 = unsafe { vaddq_s16(vabsq_s16(gx), vabsq_s16(gy)) };
+      unsafe {
+        vst1q_s32(
+          mag.as_mut_ptr().add(off + x),
+          vmovl_s16(vget_low_s16(mag_i16)),
+        );
+        vst1q_s32(mag.as_mut_ptr().add(off + x + 4), vmovl_high_s16(mag_i16));
+      }
+
+      // Direction: extract to scalar for the branchy quantization.
+      let gx_arr: [i16; 8] = unsafe { core::mem::transmute(gx) };
+      let gy_arr: [i16; 8] = unsafe { core::mem::transmute(gy) };
+      for j in 0..LANES {
+        let ax = gx_arr[j].unsigned_abs() as u32;
+        let ay = gy_arr[j].unsigned_abs() as u32;
+        dir[off + x + j] = if ay * 1000 < ax * 414 {
+          0
+        } else if ay * 1000 > ax * 2414 {
+          2
+        } else if (gx_arr[j] >= 0) == (gy_arr[j] >= 0) {
+          1
+        } else {
+          3
+        };
+      }
+
+      x += LANES;
+    }
+
+    // Scalar tail.
+    while x < w - 1 {
+      let i = |yy: usize, xx: usize| input[yy * w + xx] as i32;
+      let gx = -i(y - 1, x - 1) - 2 * i(y, x - 1) - i(y + 1, x - 1)
+        + i(y - 1, x + 1)
+        + 2 * i(y, x + 1)
+        + i(y + 1, x + 1);
+      let gy = -i(y - 1, x - 1) - 2 * i(y - 1, x) - i(y - 1, x + 1)
+        + i(y + 1, x - 1)
+        + 2 * i(y + 1, x)
+        + i(y + 1, x + 1);
+      mag[off + x] = gx.abs() + gy.abs();
+      let ax = gx.unsigned_abs();
+      let ay = gy.unsigned_abs();
+      dir[off + x] = if ay * 1000 < ax * 414 {
+        0
+      } else if ay * 1000 > ax * 2414 {
+        2
+      } else if gx.signum() == gy.signum() {
+        1
+      } else {
+        3
+      };
+      x += 1;
+    }
+  }
+}

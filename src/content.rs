@@ -54,7 +54,7 @@ use serde::{Deserialize, Serialize};
 use crate::frame::{HsvFrame, LumaFrame, RgbFrame, Timebase, Timestamp};
 
 mod arch;
-use arch::bgr_to_hsv_planes;
+use arch::{bgr_to_hsv_planes, mean_abs_diff, sobel};
 
 /// Default weights for the four score components. Matches PySceneDetect's
 /// `DEFAULT_COMPONENT_WEIGHTS`: hue, saturation, and luma equally weighted;
@@ -231,6 +231,7 @@ pub struct Options {
   #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
   kernel_size: Option<u32>,
   initial_cut: bool,
+  simd: bool,
 }
 
 impl Default for Options {
@@ -255,6 +256,7 @@ impl Options {
       filter_mode: FilterMode::Merge,
       kernel_size: None,
       initial_cut: true,
+      simd: true,
     }
   }
 
@@ -398,6 +400,33 @@ impl Options {
     self.initial_cut = val;
     self
   }
+
+  /// Whether to use platform-specific SIMD for BGR→HSV conversion and
+  /// other vectorizable inner loops.
+  ///
+  /// - `true` (default): dispatch to NEON / SSSE3 / AVX2 / wasm-simd128
+  ///   where available; fall back to scalar on unsupported targets.
+  /// - `false`: always use the scalar path, regardless of hardware. Useful
+  ///   for bit-reproducible output across platforms, debugging, or
+  ///   benchmarking the SIMD vs. scalar delta.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn simd(&self) -> bool {
+    self.simd
+  }
+
+  /// Sets whether to use SIMD.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn with_simd(mut self, val: bool) -> Self {
+    self.simd = val;
+    self
+  }
+
+  /// Sets whether to use SIMD in place.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn set_simd(&mut self, val: bool) -> &mut Self {
+    self.simd = val;
+    self
+  }
 }
 
 /// Content-change scene detector.
@@ -416,6 +445,7 @@ pub struct Detector {
   sum_abs_weights: f64,
   /// Whether we should compute the edge component at all.
   edges_enabled: bool,
+  use_simd: bool,
   // Stream state
   has_previous: bool,
   last_score: Option<f64>,
@@ -472,11 +502,13 @@ impl Detector {
       }
     }
     let edges_enabled = options.weights.delta_edges != 0.0;
+    let use_simd = options.simd;
 
     Ok(Self {
       options,
       sum_abs_weights: sum,
       edges_enabled,
+      use_simd,
       has_previous: false,
       last_score: None,
       last_components: None,
@@ -573,6 +605,7 @@ impl Detector {
       frame.width(),
       frame.height(),
       frame.stride(),
+      self.use_simd,
     );
     self.process_inner(ts)
   }
@@ -618,12 +651,13 @@ impl Detector {
     // Compute components and score only after the first frame.
     let mut cut: Option<Timestamp> = None;
     if self.has_previous {
+      let simd = self.use_simd;
       let components = Components::new(
-        mean_abs_diff(&self.cur_h, &self.prev_h, n),
-        mean_abs_diff(&self.cur_s, &self.prev_s, n),
-        mean_abs_diff(&self.cur_v, &self.prev_v, n),
+        mean_abs_diff(&self.cur_h, &self.prev_h, n, simd),
+        mean_abs_diff(&self.cur_s, &self.prev_s, n, simd),
+        mean_abs_diff(&self.cur_v, &self.prev_v, n, simd),
         if self.edges_enabled {
-          mean_abs_diff(&self.cur_edges, &self.prev_edges, n)
+          mean_abs_diff(&self.cur_edges, &self.prev_edges, n, simd)
         } else {
           0.0
         },
@@ -675,54 +709,18 @@ impl Detector {
   }
 
   /// 3×3 Sobel over `self.cur_v`, writing L1 magnitude into `self.sobel_mag`
-  /// and a quantized gradient direction (0=horizontal, 1=45°, 2=vertical,
-  /// 3=135°) into `self.sobel_dir`. Border pixels get magnitude 0.
+  /// 3×3 Sobel over `self.cur_v` → `self.sobel_mag` (L1 magnitude) +
+  /// `self.sobel_dir` (quantized direction). Delegates to the arch module
+  /// which picks SIMD or scalar based on `self.use_simd`.
   fn sobel(&mut self) {
-    let input = &self.cur_v;
-    let mag = &mut self.sobel_mag;
-    let dir = &mut self.sobel_dir;
-    let w = self.width as usize;
-    let h = self.height as usize;
-
-    for v in mag.iter_mut() {
-      *v = 0;
-    }
-    for v in dir.iter_mut() {
-      *v = 0;
-    }
-    for y in 1..h.saturating_sub(1) {
-      for x in 1..w.saturating_sub(1) {
-        let i = |yy: usize, xx: usize| input[yy * w + xx] as i32;
-        // Gx: [-1 0 1; -2 0 2; -1 0 1]
-        let gx = -i(y - 1, x - 1) - 2 * i(y, x - 1) - i(y + 1, x - 1)
-          + i(y - 1, x + 1)
-          + 2 * i(y, x + 1)
-          + i(y + 1, x + 1);
-        // Gy: [-1 -2 -1; 0 0 0; 1 2 1]
-        let gy = -i(y - 1, x - 1) - 2 * i(y - 1, x) - i(y - 1, x + 1)
-          + i(y + 1, x - 1)
-          + 2 * i(y + 1, x)
-          + i(y + 1, x + 1);
-        let m = gx.abs() + gy.abs();
-        let idx = y * w + x;
-        mag[idx] = m;
-        // Quantize direction by comparing |gy|/|gx| against tan(22.5°)≈0.414
-        // and tan(67.5°)≈2.414. ay/ax < 0.414 → horizontal (0); ≥ 2.414 →
-        // vertical (2); else diagonal — sign of gx·gy picks 45° vs 135°.
-        let ax = gx.abs();
-        let ay = gy.abs();
-        let d: u8 = if ay * 1000 < ax * 414 {
-          0
-        } else if ay * 1000 > ax * 2414 {
-          2
-        } else if gx.signum() == gy.signum() {
-          1
-        } else {
-          3
-        };
-        dir[idx] = d;
-      }
-    }
+    sobel(
+      &self.cur_v,
+      &mut self.sobel_mag,
+      &mut self.sobel_dir,
+      self.width as usize,
+      self.height as usize,
+      self.use_simd,
+    );
   }
 
   /// Non-maximum suppression along the gradient direction. Pixels that
@@ -879,17 +877,14 @@ impl Detector {
 
     match self.options.filter_mode {
       FilterMode::Suppress => {
-        if !above || !min_length_met {
-          if above {
-            // Track presence (Python behavior) — SUPPRESS updates last_above
-            // only when it emits, but we need it for min_length tracking.
-            // Match Python: update only on emission.
-          }
-          // Did NOT emit.
-          None
-        } else {
+        // Python SUPPRESS: emit iff above-threshold AND min-length met.
+        // `last_above` advances only on emission, so consecutive
+        // above-threshold frames without a gap don't keep pushing the gate.
+        if above && min_length_met {
           self.last_above = Some(ts);
           Some(ts)
+        } else {
+          None
         }
       }
       FilterMode::Merge => self.filter_merge(ts, above, min_length_met),
@@ -1018,26 +1013,6 @@ fn copy_plane(dst: &mut [u8], src: &[u8], width: u32, height: u32, stride: u32) 
   }
 }
 
-/// Mean of the absolute per-pixel difference over `n` values.
-fn mean_abs_diff(a: &[u8], b: &[u8], n: usize) -> f64 {
-  debug_assert!(a.len() >= n && b.len() >= n);
-  let mut sum: u64 = 0;
-  for i in 0..n {
-    let da = a[i] as i32 - b[i] as i32;
-    sum += da.unsigned_abs() as u64;
-  }
-  if n == 0 { 0.0 } else { sum as f64 / n as f64 }
-}
-
-// -----------------------------------------------------------------------------
-// BGR → HSV: implementation lives in `arch`, which compile-time dispatches
-// to aarch64 NEON where available and to a scalar fallback otherwise.
-// -----------------------------------------------------------------------------
-
-// -----------------------------------------------------------------------------
-// Canny edge detection + morphological dilation (square kernel)
-// -----------------------------------------------------------------------------
-
 /// Auto kernel-size heuristic matching PySceneDetect: `4 + round(sqrt(w*h)/192)`,
 /// bumped to odd.
 fn auto_kernel_size(width: u32, height: u32) -> u32 {
@@ -1079,6 +1054,7 @@ fn median_u8(buf: &[u8]) -> u8 {
 /// include real pixels outside the clipped window. We handle the first and
 /// last `half` positions with a direct max instead — `2 * half` positions,
 /// each `≤ k` wide, is O(k²) extra work, negligible vs. the O(n) main pass.
+#[allow(clippy::needless_range_loop)] // `p` used for offset arithmetic, not just indexing
 fn van_herk_1d_contig(src: &[u8], dst: &mut [u8], r: &mut [u8], s: &mut [u8], n: usize, k: usize) {
   let half = k / 2;
   if n == 0 {
@@ -1140,6 +1116,8 @@ fn van_herk_1d_contig(src: &[u8], dst: &mut [u8], r: &mut [u8], s: &mut [u8], n:
 ///
 /// Reads column `x` from `src` with stride `w`, writes column `x` of `dst`
 /// with stride `w`. Same boundary handling as [`van_herk_1d_contig`].
+#[allow(clippy::too_many_arguments)] // slice-transform shape; each arg is essential
+#[allow(clippy::needless_range_loop)]
 fn van_herk_1d_column(
   src: &[u8],
   dst: &mut [u8],
@@ -1202,13 +1180,7 @@ fn van_herk_1d_column(
 /// Max of `src[lo..hi]`. Used only at clipped boundaries.
 #[cfg_attr(not(tarpaulin), inline(always))]
 fn window_max_contig(src: &[u8], lo: usize, hi: usize) -> u8 {
-  let mut m = 0u8;
-  for i in lo..hi {
-    if src[i] > m {
-      m = src[i];
-    }
-  }
-  m
+  src[lo..hi].iter().copied().max().unwrap_or(0)
 }
 
 /// Max of column `x` of `src` over rows `[lo, hi)`.
@@ -1353,7 +1325,16 @@ mod tests {
     let mut h_simd = vec![0u8; n];
     let mut s_simd = vec![0u8; n];
     let mut v_simd = vec![0u8; n];
-    bgr_to_hsv_planes(&mut h_simd, &mut s_simd, &mut v_simd, &src, w, h, w * 3);
+    bgr_to_hsv_planes(
+      &mut h_simd,
+      &mut s_simd,
+      &mut v_simd,
+      &src,
+      w,
+      h,
+      w * 3,
+      true,
+    );
 
     // Scalar reference.
     let mut h_ref = vec![0u8; n];
@@ -1462,6 +1443,7 @@ mod tests {
 
   /// Test-only wrapper that exercises the van-Herk dilate pipeline (now a
   /// Detector method) by calling the underlying free-fn helpers directly.
+  #[allow(clippy::too_many_arguments)]
   fn test_dilate(
     input: &[u8],
     out: &mut [u8],

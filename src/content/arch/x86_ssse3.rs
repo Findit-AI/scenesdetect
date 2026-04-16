@@ -245,3 +245,157 @@ unsafe fn bgr_to_hsv_f32x4(b: __m128, g: __m128, r: __m128) -> (__m128, __m128, 
 unsafe fn blend(mask: __m128, t: __m128, f: __m128) -> __m128 {
   unsafe { _mm_or_ps(_mm_and_ps(mask, t), _mm_andnot_ps(mask, f)) }
 }
+
+/// SSE2 `mean_abs_diff`: `Σ|a[i] - b[i]| / n`.
+///
+/// Uses `_mm_sad_epu8` — a single instruction that computes the sum of
+/// absolute u8 differences for 16 bytes, returning two u16 partial sums
+/// in lanes 0 and 8 of a `__m128i` (the other lanes are zero).
+///
+/// # Safety
+///
+/// Caller must ensure at least SSE2 is available (true on every x86_64 target).
+/// Marked `ssse3` because the parent module is ssse3-gated, but only SSE2
+/// instructions are used here.
+#[target_feature(enable = "ssse3")]
+#[allow(unused_unsafe)]
+pub(super) unsafe fn mean_abs_diff(a: &[u8], b: &[u8], n: usize) -> f64 {
+  const LANES: usize = 16;
+  let whole = n / LANES * LANES;
+  let mut acc = unsafe { _mm_setzero_si128() }; // u64x2 accumulator
+
+  let mut i = 0;
+  while i < whole {
+    let va = unsafe { _mm_loadu_si128(a.as_ptr().add(i) as *const __m128i) };
+    let vb = unsafe { _mm_loadu_si128(b.as_ptr().add(i) as *const __m128i) };
+    // _mm_sad_epu8: per 8-byte half, sums |a[j]-b[j]| into a u16 in
+    // lanes 0 and 8. The other 6 lanes of each half are zero.
+    let sad = unsafe { _mm_sad_epu8(va, vb) };
+    acc = unsafe { _mm_add_epi64(acc, sad) };
+    i += LANES;
+  }
+
+  // Horizontal reduce u64x2 → u64.
+  let hi = unsafe { _mm_srli_si128::<8>(acc) };
+  let total = unsafe { _mm_add_epi64(acc, hi) };
+  let mut sum: u64 = unsafe { _mm_cvtsi128_si64(total) as u64 };
+
+  // Scalar tail.
+  while i < n {
+    let da = a[i] as i32 - b[i] as i32;
+    sum += da.unsigned_abs() as u64;
+    i += 1;
+  }
+
+  sum as f64 / n as f64
+}
+
+/// SSSE3 Sobel 3×3. Same structure as NEON: i16x8 stencil for magnitude,
+/// scalar direction.
+///
+/// # Safety
+///
+/// Caller must ensure SSSE3 is available.
+#[target_feature(enable = "ssse3")]
+#[allow(unused_unsafe)]
+pub(super) unsafe fn sobel(input: &[u8], mag: &mut [i32], dir: &mut [u8], w: usize, h: usize) {
+  mag.fill(0);
+  dir.fill(0);
+
+  const LANES: usize = 8;
+  let zero_i = unsafe { _mm_setzero_si128() };
+
+  for y in 1..h.saturating_sub(1) {
+    let prev = &input[(y - 1) * w..];
+    let curr = &input[y * w..];
+    let next = &input[(y + 1) * w..];
+    let off = y * w;
+
+    let mut x = 1usize;
+
+    while x + LANES <= w - 1 {
+      macro_rules! ld {
+        ($row:expr, $o:expr) => {{
+          let v = unsafe { _mm_loadl_epi64($row.as_ptr().add($o) as *const __m128i) };
+          unsafe { _mm_unpacklo_epi8(v, zero_i) } // u8→u16, treated as i16 (values 0..255)
+        }};
+      }
+      let pl = ld!(prev, x - 1);
+      let pm = ld!(prev, x);
+      let pr = ld!(prev, x + 1);
+      let cl = ld!(curr, x - 1);
+      let cr = ld!(curr, x + 1);
+      let nl = ld!(next, x - 1);
+      let nm = ld!(next, x);
+      let nr = ld!(next, x + 1);
+
+      // Gx = (pr + 2*cr + nr) - (pl + 2*cl + nl)
+      let gx = unsafe {
+        let pos = _mm_add_epi16(_mm_add_epi16(pr, _mm_slli_epi16::<1>(cr)), nr);
+        let neg = _mm_add_epi16(_mm_add_epi16(pl, _mm_slli_epi16::<1>(cl)), nl);
+        _mm_sub_epi16(pos, neg)
+      };
+      // Gy = (nl + 2*nm + nr) - (pl + 2*pm + pr)
+      let gy = unsafe {
+        let pos = _mm_add_epi16(_mm_add_epi16(nl, _mm_slli_epi16::<1>(nm)), nr);
+        let neg = _mm_add_epi16(_mm_add_epi16(pl, _mm_slli_epi16::<1>(pm)), pr);
+        _mm_sub_epi16(pos, neg)
+      };
+
+      let mag_i16 = unsafe { _mm_add_epi16(_mm_abs_epi16(gx), _mm_abs_epi16(gy)) };
+
+      // Widen i16→i32 and store.
+      let lo = unsafe { _mm_unpacklo_epi16(mag_i16, _mm_cmpgt_epi16(zero_i, mag_i16)) };
+      let hi = unsafe { _mm_unpackhi_epi16(mag_i16, _mm_cmpgt_epi16(zero_i, mag_i16)) };
+      unsafe {
+        _mm_storeu_si128(mag.as_mut_ptr().add(off + x) as *mut __m128i, lo);
+        _mm_storeu_si128(mag.as_mut_ptr().add(off + x + 4) as *mut __m128i, hi);
+      }
+
+      // Direction: scalar.
+      let gx_arr: [i16; 8] = unsafe { core::mem::transmute(gx) };
+      let gy_arr: [i16; 8] = unsafe { core::mem::transmute(gy) };
+      for j in 0..LANES {
+        let ax = gx_arr[j].unsigned_abs() as u32;
+        let ay = gy_arr[j].unsigned_abs() as u32;
+        dir[off + x + j] = if ay * 1000 < ax * 414 {
+          0
+        } else if ay * 1000 > ax * 2414 {
+          2
+        } else if (gx_arr[j] >= 0) == (gy_arr[j] >= 0) {
+          1
+        } else {
+          3
+        };
+      }
+
+      x += LANES;
+    }
+
+    // Scalar tail.
+    while x < w - 1 {
+      let i = |yy: usize, xx: usize| input[yy * w + xx] as i32;
+      let gx = -i(y - 1, x - 1) - 2 * i(y, x - 1) - i(y + 1, x - 1)
+        + i(y - 1, x + 1)
+        + 2 * i(y, x + 1)
+        + i(y + 1, x + 1);
+      let gy = -i(y - 1, x - 1) - 2 * i(y - 1, x) - i(y - 1, x + 1)
+        + i(y + 1, x - 1)
+        + 2 * i(y + 1, x)
+        + i(y + 1, x + 1);
+      mag[off + x] = gx.abs() + gy.abs();
+      let ax = gx.abs() as u32;
+      let ay = gy.abs() as u32;
+      dir[off + x] = if ay * 1000 < ax * 414 {
+        0
+      } else if ay * 1000 > ax * 2414 {
+        2
+      } else if gx.signum() == gy.signum() {
+        1
+      } else {
+        3
+      };
+      x += 1;
+    }
+  }
+}

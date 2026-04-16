@@ -58,7 +58,7 @@
 
 use core::time::Duration;
 
-use crate::frame::{LumaFrame, RgbFrame, Timebase, Timestamp};
+use crate::frame::{LumaFrame, RgbFrame, TimeRange, Timebase, Timestamp};
 
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
@@ -285,6 +285,10 @@ pub struct Detector {
   last_fade_frame: Option<Timestamp>,
   last_fade_type: FadeType,
   last_avg: Option<f64>,
+  /// Fade-out / fade-in endpoints of the most recent emission. Preserved
+  /// across [`Self::finish`] so callers can read it after an end-of-stream
+  /// cut; only [`Self::clear`] zeroes it.
+  last_fade_range: Option<TimeRange>,
 }
 
 impl Detector {
@@ -298,6 +302,7 @@ impl Detector {
       last_fade_frame: None,
       last_fade_type: FadeType::In,
       last_avg: None,
+      last_fade_range: None,
     }
   }
 
@@ -313,6 +318,25 @@ impl Detector {
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn last_avg(&self) -> Option<f64> {
     self.last_avg
+  }
+
+  /// Returns the fade-out / fade-in endpoints of the most recently emitted
+  /// cut, or `None` if no cut has fired since the last [`Self::clear`].
+  ///
+  /// The [`TimeRange`]'s `start` is the fade-out frame's timestamp; `end`
+  /// is the fade-in frame's timestamp (both in the fade-out frame's
+  /// timebase — `end` is rescaled if timebases differ between frames).
+  /// For cuts emitted by [`Self::finish`] there is no matching fade-in, so
+  /// the range is degenerate (`start == end == fade_out_ts`).
+  ///
+  /// `process_*` and `finish` return the single bias-interpolated point
+  /// between these two endpoints (see [`Options::fade_bias`]); this
+  /// accessor exposes the full range so callers that want the fade
+  /// duration — or want to pick a different interpolation — can get both
+  /// timestamps without recomputing.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn last_fade_range(&self) -> Option<TimeRange> {
+    self.last_fade_range
   }
 
   /// Processes a luma (Y-plane) frame.
@@ -348,7 +372,13 @@ impl Detector {
   /// `None` (nothing to finish).
   pub fn finish(&mut self, last_ts: Timestamp) -> Option<Timestamp> {
     let cut = self.final_cut(last_ts);
+    // If we're emitting a final cut, record a degenerate range at the
+    // fade-out frame (no matching fade-in at end-of-stream). This lets
+    // callers query `last_fade_range()` after `finish` for consistency
+    // with mid-stream emissions.
+    let range_after = cut.map(TimeRange::instant);
     self.clear();
+    self.last_fade_range = range_after;
     cut
   }
 
@@ -380,6 +410,7 @@ impl Detector {
     self.last_fade_frame = None;
     self.last_fade_type = FadeType::In;
     self.last_avg = None;
+    self.last_fade_range = None;
   }
 
   /// Shared state-machine logic, parameterized by the per-frame mean.
@@ -424,6 +455,16 @@ impl Detector {
               let placed = interpolate_cut(f_out, ts, self.options.fade_bias);
               cut = Some(placed);
               self.last_scene_cut = Some(ts);
+              // Expose the full [fade_out, fade_in] range for callers who
+              // want richer info than the interpolated point. Rescale f_in
+              // into f_out's timebase so endpoints share a timebase
+              // (rescale_to is a no-op when timebases already match).
+              let f_in_same = ts.rescale_to(f_out.timebase());
+              self.last_fade_range = Some(TimeRange::new(
+                f_out.pts(),
+                f_in_same.pts(),
+                f_out.timebase(),
+              ));
             }
           }
           self.last_fade_type = FadeType::In;
@@ -677,6 +718,67 @@ mod tests {
     // bright → dim: exit Out → In, cut fires.
     let cut = det.process_luma(luma(&dim, 8, 8, 200));
     assert!(cut.is_some());
+  }
+
+  #[test]
+  fn last_fade_range_exposes_full_endpoints() {
+    let mut det = Detector::new(
+      Options::default()
+        .with_min_duration(Duration::from_millis(0))
+        .with_fade_bias(0.0),
+    );
+    let bright = uniform_luma(200, 0);
+    let dark = uniform_luma(5, 0);
+
+    det.process_luma(luma(&bright, 8, 8, 0));
+    det.process_luma(luma(&dark, 8, 8, 200)); // fade-out begins
+    let cut = det.process_luma(luma(&bright, 8, 8, 400)).expect("cut"); // fade-in completes
+
+    // Interpolated midpoint.
+    assert_eq!(cut.pts(), 300);
+
+    // Full range available via accessor.
+    let range = det.last_fade_range().expect("range");
+    assert_eq!(range.start_pts(), 200);
+    assert_eq!(range.end_pts(), 400);
+    assert_eq!(range.timebase(), tb());
+    // Duration = 200 ms.
+    assert_eq!(range.duration(), Some(Duration::from_millis(200)));
+    // Interpolate midpoint matches the emitted cut.
+    assert_eq!(range.interpolate(0.5).pts(), 300);
+  }
+
+  #[test]
+  fn last_fade_range_cleared_by_clear() {
+    let mut det = Detector::new(Options::default().with_min_duration(Duration::from_millis(0)));
+    let bright = uniform_luma(200, 0);
+    let dark = uniform_luma(5, 0);
+    det.process_luma(luma(&bright, 8, 8, 0));
+    det.process_luma(luma(&dark, 8, 8, 200));
+    det.process_luma(luma(&bright, 8, 8, 400));
+    assert!(det.last_fade_range().is_some());
+    det.clear();
+    assert!(det.last_fade_range().is_none());
+  }
+
+  #[test]
+  fn last_fade_range_survives_finish_as_instant() {
+    let mut det = Detector::new(
+      Options::default()
+        .with_min_duration(Duration::from_millis(0))
+        .with_add_final_scene(true),
+    );
+    let bright = uniform_luma(200, 0);
+    let dark = uniform_luma(5, 0);
+    det.process_luma(luma(&bright, 8, 8, 0));
+    det.process_luma(luma(&dark, 8, 8, 200)); // fade-out at 200; never recovers
+    let final_cut = det.finish(Timestamp::new(400, tb())).expect("final cut");
+    assert_eq!(final_cut.pts(), 200);
+    // finish emits a degenerate range at the fade-out frame.
+    let range = det.last_fade_range().expect("range after finish");
+    assert!(range.is_instant());
+    assert_eq!(range.start_pts(), 200);
+    assert_eq!(range.end_pts(), 200);
   }
 
   #[test]

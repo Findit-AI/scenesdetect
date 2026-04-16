@@ -41,6 +41,7 @@ mod wasm_simd128;
 /// - Everything else → scalar.
 #[cfg_attr(not(tarpaulin), inline(always))]
 #[allow(unreachable_code)] // one branch per build config
+#[allow(clippy::too_many_arguments)] // signature fixed by the 3-plane + dims + flag shape
 pub(super) fn bgr_to_hsv_planes(
   h_out: &mut [u8],
   s_out: &mut [u8],
@@ -49,7 +50,12 @@ pub(super) fn bgr_to_hsv_planes(
   width: u32,
   height: u32,
   stride: u32,
+  use_simd: bool,
 ) {
+  if !use_simd {
+    return scalar::Scalar::bgr_to_hsv_planes(h_out, s_out, v_out, src, width, height, stride);
+  }
+
   #[cfg(target_arch = "aarch64")]
   {
     // SAFETY: NEON is part of the base ARMv8-A ISA — every aarch64 Rust
@@ -127,6 +133,99 @@ pub(super) fn bgr_to_hsv_pixel(b: f32, g: f32, r: f32) -> (u8, u8, u8) {
   scalar::Scalar::bgr_to_hsv_pixel(b, g, r)
 }
 
+/// Sum of absolute per-element differences of two equal-length `u8` slices,
+/// divided by `n`. Dispatches to the best SIMD backend or scalar based on
+/// `use_simd`.
+///
+/// NEON uses `vabdq_u8` + `vpaddlq` accumulate. x86 uses `_mm_sad_epu8`
+/// (a single-instruction SAD per 16 bytes). wasm uses widening subtract +
+/// abs reduce. All produce the same numerical result as scalar.
+#[cfg_attr(not(tarpaulin), inline(always))]
+#[allow(unreachable_code)]
+pub(super) fn mean_abs_diff(a: &[u8], b: &[u8], n: usize, use_simd: bool) -> f64 {
+  debug_assert!(a.len() >= n && b.len() >= n);
+  if n == 0 {
+    return 0.0;
+  }
+
+  if use_simd {
+    #[cfg(target_arch = "aarch64")]
+    {
+      // SAFETY: NEON is base ARMv8-A ISA.
+      return unsafe { neon::mean_abs_diff(a, b, n) };
+    }
+
+    #[cfg(all(any(target_arch = "x86", target_arch = "x86_64"), feature = "std"))]
+    {
+      if std::is_x86_feature_detected!("ssse3") {
+        // SAFETY: runtime-checked.
+        return unsafe { x86_ssse3::mean_abs_diff(a, b, n) };
+      }
+    }
+
+    #[cfg(all(
+      any(target_arch = "x86", target_arch = "x86_64"),
+      not(feature = "std"),
+      target_feature = "ssse3",
+    ))]
+    {
+      return unsafe { x86_ssse3::mean_abs_diff(a, b, n) };
+    }
+
+    #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+    {
+      return unsafe { wasm_simd128::mean_abs_diff(a, b, n) };
+    }
+  }
+
+  scalar::Scalar::mean_abs_diff(a, b, n)
+}
+
+/// 3×3 Sobel: computes L1 magnitude (`|Gx| + |Gy|`) into `mag` and a
+/// quantized gradient direction (0=horiz, 1=45°, 2=vert, 3=135°) into `dir`.
+/// Border pixels stay zero. Dispatches to SIMD for the magnitude computation;
+/// direction quantization is always scalar (branchy per pixel).
+#[cfg_attr(not(tarpaulin), inline(always))]
+#[allow(unreachable_code)]
+pub(super) fn sobel(
+  input: &[u8],
+  mag: &mut [i32],
+  dir: &mut [u8],
+  w: usize,
+  h: usize,
+  use_simd: bool,
+) {
+  if use_simd {
+    #[cfg(target_arch = "aarch64")]
+    {
+      return unsafe { neon::sobel(input, mag, dir, w, h) };
+    }
+
+    #[cfg(all(any(target_arch = "x86", target_arch = "x86_64"), feature = "std"))]
+    {
+      if std::is_x86_feature_detected!("ssse3") {
+        return unsafe { x86_ssse3::sobel(input, mag, dir, w, h) };
+      }
+    }
+
+    #[cfg(all(
+      any(target_arch = "x86", target_arch = "x86_64"),
+      not(feature = "std"),
+      target_feature = "ssse3",
+    ))]
+    {
+      return unsafe { x86_ssse3::sobel(input, mag, dir, w, h) };
+    }
+
+    #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+    {
+      return unsafe { wasm_simd128::sobel(input, mag, dir, w, h) };
+    }
+  }
+
+  scalar::Scalar::sobel(input, mag, dir, w, h);
+}
+
 // -----------------------------------------------------------------------------
 // Scalar implementation — used as the fallback on non-aarch64 targets and
 // as the reference for the single-pixel helper everywhere.
@@ -199,6 +298,49 @@ mod scalar {
         s.round().clamp(0.0, 255.0) as u8,
         v.round().clamp(0.0, 255.0) as u8,
       )
+    }
+
+    /// Scalar 3×3 Sobel: magnitude + direction.
+    pub(super) fn sobel(input: &[u8], mag: &mut [i32], dir: &mut [u8], w: usize, h: usize) {
+      mag.fill(0);
+      dir.fill(0);
+      for y in 1..h.saturating_sub(1) {
+        for x in 1..w.saturating_sub(1) {
+          let i = |yy: usize, xx: usize| input[yy * w + xx] as i32;
+          let gx = -i(y - 1, x - 1) - 2 * i(y, x - 1) - i(y + 1, x - 1)
+            + i(y - 1, x + 1)
+            + 2 * i(y, x + 1)
+            + i(y + 1, x + 1);
+          let gy = -i(y - 1, x - 1) - 2 * i(y - 1, x) - i(y - 1, x + 1)
+            + i(y + 1, x - 1)
+            + 2 * i(y + 1, x)
+            + i(y + 1, x + 1);
+          let idx = y * w + x;
+          mag[idx] = gx.abs() + gy.abs();
+          let ax = gx.abs();
+          let ay = gy.abs();
+          dir[idx] = if ay * 1000 < ax * 414 {
+            0
+          } else if ay * 1000 > ax * 2414 {
+            2
+          } else if gx.signum() == gy.signum() {
+            1
+          } else {
+            3
+          };
+        }
+      }
+    }
+
+    /// Scalar mean absolute difference: `Σ|a[i] - b[i]| / n`.
+    #[inline]
+    pub(super) fn mean_abs_diff(a: &[u8], b: &[u8], n: usize) -> f64 {
+      let mut sum: u64 = 0;
+      for i in 0..n {
+        let da = a[i] as i32 - b[i] as i32;
+        sum += da.unsigned_abs() as u64;
+      }
+      sum as f64 / n as f64
     }
   }
 }

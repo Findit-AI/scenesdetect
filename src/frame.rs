@@ -349,6 +349,130 @@ impl PartialOrd for Timestamp {
   }
 }
 
+/// A half-open time range `[start, end)` in a given [`Timebase`].
+///
+/// Represents the extent of a detected event — for example, the
+/// fade-out→fade-in duration exposed by
+/// [`crate::threshold::Detector::last_fade_range`]. When `start == end`,
+/// the range is degenerate (an instant); see [`Self::instant`].
+///
+/// Both endpoints share the same [`Timebase`]. To compare ranges across
+/// different timebases, rescale one of them first (e.g., by calling
+/// [`Timestamp::rescale_to`] on each endpoint).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct TimeRange {
+  start: i64,
+  end: i64,
+  timebase: Timebase,
+}
+
+impl TimeRange {
+  /// Creates a new `TimeRange` with the given start/end PTS and shared timebase.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn new(start: i64, end: i64, timebase: Timebase) -> Self {
+    Self {
+      start,
+      end,
+      timebase,
+    }
+  }
+
+  /// Creates a degenerate (instant) range where `start == end == ts.pts()`.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn instant(ts: Timestamp) -> Self {
+    Self {
+      start: ts.pts(),
+      end: ts.pts(),
+      timebase: ts.timebase(),
+    }
+  }
+
+  /// Returns the start PTS in the range's timebase units.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn start_pts(&self) -> i64 {
+    self.start
+  }
+
+  /// Returns the end PTS in the range's timebase units.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn end_pts(&self) -> i64 {
+    self.end
+  }
+
+  /// Returns the shared timebase.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn timebase(&self) -> Timebase {
+    self.timebase
+  }
+
+  /// Returns the start as a [`Timestamp`].
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn start(&self) -> Timestamp {
+    Timestamp::new(self.start, self.timebase)
+  }
+
+  /// Returns the end as a [`Timestamp`].
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn end(&self) -> Timestamp {
+    Timestamp::new(self.end, self.timebase)
+  }
+
+  /// Sets the start PTS.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn with_start(mut self, val: i64) -> Self {
+    self.start = val;
+    self
+  }
+
+  /// Sets the start PTS in place.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn set_start(&mut self, val: i64) -> &mut Self {
+    self.start = val;
+    self
+  }
+
+  /// Sets the end PTS.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn with_end(mut self, val: i64) -> Self {
+    self.end = val;
+    self
+  }
+
+  /// Sets the end PTS in place.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn set_end(&mut self, val: i64) -> &mut Self {
+    self.end = val;
+    self
+  }
+
+  /// Returns `true` if `start == end` (a degenerate instant range).
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn is_instant(&self) -> bool {
+    self.start == self.end
+  }
+
+  /// Returns the elapsed [`Duration`] from `start` to `end`, or `None` if
+  /// `end` is before `start`.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn duration(&self) -> Option<Duration> {
+    self.end().duration_since(&self.start())
+  }
+
+  /// Linearly interpolates between `start` and `end`: `t = 0.0` returns
+  /// `start`, `t = 1.0` returns `end`, `t = 0.5` the midpoint. `t` is
+  /// clamped to `[0.0, 1.0]`. Rounds toward zero.
+  ///
+  /// Use this to map an old-style bias value `b ∈ [-1, 1]` onto the range:
+  /// `range.interpolate((b + 1.0) * 0.5)`.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn interpolate(&self, t: f64) -> Timestamp {
+    let t = t.clamp(0.0, 1.0);
+    let delta = self.end.saturating_sub(self.start);
+    let offset = (delta as f64 * t) as i64;
+    Timestamp::new(self.start.saturating_add(offset), self.timebase)
+  }
+}
+
 /// A frame containing YUV luma (Y-plane) data, along with its dimensions and
 /// presentation timestamp.
 ///
@@ -1034,6 +1158,37 @@ mod tests {
       ntsc.frames_to_duration(15),
       Duration::from_nanos(500_500_000),
     );
+  }
+
+  #[test]
+  fn time_range_basic() {
+    let tb = Timebase::new(1, nz(1000));
+    let r = TimeRange::new(100, 500, tb);
+    assert_eq!(r.start_pts(), 100);
+    assert_eq!(r.end_pts(), 500);
+    assert_eq!(r.timebase(), tb);
+    assert_eq!(r.start(), Timestamp::new(100, tb));
+    assert_eq!(r.end(), Timestamp::new(500, tb));
+    assert!(!r.is_instant());
+    assert_eq!(r.duration(), Some(Duration::from_millis(400)));
+    // Interpolate: t=0 → start, t=1 → end, t=0.5 → midpoint.
+    assert_eq!(r.interpolate(0.0).pts(), 100);
+    assert_eq!(r.interpolate(1.0).pts(), 500);
+    assert_eq!(r.interpolate(0.5).pts(), 300);
+    // Out-of-range t is clamped.
+    assert_eq!(r.interpolate(-1.0).pts(), 100);
+    assert_eq!(r.interpolate(2.0).pts(), 500);
+  }
+
+  #[test]
+  fn time_range_instant() {
+    let tb = Timebase::new(1, nz(1000));
+    let ts = Timestamp::new(123, tb);
+    let r = TimeRange::instant(ts);
+    assert!(r.is_instant());
+    assert_eq!(r.start_pts(), 123);
+    assert_eq!(r.end_pts(), 123);
+    assert_eq!(r.duration(), Some(Duration::ZERO));
   }
 
   #[test]
