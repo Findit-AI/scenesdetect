@@ -237,6 +237,8 @@ pub(super) fn sobel(
 // -----------------------------------------------------------------------------
 
 mod scalar {
+  use crate::round_32;
+
   /// Zero-sized namespace for the scalar BGR→HSV kernels.
   pub(super) struct Scalar;
 
@@ -292,11 +294,11 @@ mod scalar {
       } else {
         60.0 * (r - g) / delta + 240.0
       };
-      let h8 = (hue * 0.5).round().clamp(0.0, 179.0) as u8;
+      let h8 = round_32(hue * 0.5).clamp(0.0, 179.0) as u8;
       (
         h8,
-        s.round().clamp(0.0, 255.0) as u8,
-        v.round().clamp(0.0, 255.0) as u8,
+        round_32(s).clamp(0.0, 255.0) as u8,
+        round_32(v).clamp(0.0, 255.0) as u8,
       )
     }
 

@@ -42,6 +42,10 @@ use crate::frame::{LumaFrame, Timebase, Timestamp};
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
 
+use std::{vec, vec::Vec};
+
+use super::{ceil_32, cos_32, floor_32, sqrt_32};
+
 /// Configuration for [`Detector`].
 #[derive(Debug, Clone)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
@@ -492,13 +496,13 @@ impl Detector {
 /// where `α(0) = 1/√N` and `α(k≠0) = √(2/N)`. This matches `cv2.dct`.
 fn build_dct_cos(n: usize) -> Vec<f32> {
   let mut c = vec![0.0f32; n * n];
-  let alpha0 = (1.0 / n as f32).sqrt();
-  let alpha_k = (2.0 / n as f32).sqrt();
+  let alpha0 = sqrt_32(1.0 / n as f32);
+  let alpha_k = sqrt_32(2.0 / n as f32);
   for k in 0..n {
     let a = if k == 0 { alpha0 } else { alpha_k };
     for m in 0..n {
       let angle = PI * (2.0 * m as f32 + 1.0) * k as f32 / (2.0 * n as f32);
-      c[k * n + m] = a * angle.cos();
+      c[k * n + m] = a * cos_32(angle);
     }
   }
   c
@@ -684,8 +688,8 @@ fn build_axis(
     range_starts.push(offsets.len() as u32);
     let a = dst as f32 * scale;
     let b = (dst + 1) as f32 * scale;
-    let s_start = a.floor() as u32;
-    let s_end = (b.ceil() as u32).min(src_size);
+    let s_start = floor_32(a) as u32;
+    let s_end = (ceil_32(b) as u32).min(src_size);
     for s in s_start..s_end {
       let w = ((s + 1) as f32).min(b) - (s as f32).max(a);
       if w > 0.0 {
@@ -736,6 +740,7 @@ mod tests {
   use super::*;
   use crate::frame::Timebase;
   use core::num::NonZeroU32;
+  use std::{vec, vec::Vec};
 
   const fn nz32(n: u32) -> NonZeroU32 {
     match NonZeroU32::new(n) {

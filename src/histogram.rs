@@ -77,6 +77,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::frame::{LumaFrame, Timebase, Timestamp};
 
+use std::{vec, vec::Vec};
+
 /// Options for the histogram-based scene detector. See the [module docs]
 /// for how each parameter shapes the algorithm.
 ///
@@ -477,7 +479,7 @@ fn correlation(a: &[u32], b: &[u32]) -> f64 {
   if var_a == 0.0 || var_b == 0.0 {
     return 0.0;
   }
-  num / (var_a * var_b).sqrt()
+  num / super::sqrt_64(var_a * var_b)
 }
 
 #[cfg(test)]

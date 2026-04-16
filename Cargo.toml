@@ -36,15 +36,15 @@ harness = false
 
 [features]
 default = ["std"]
-alloc = []
+alloc = ["libm"]
 std = ["thiserror/default"]
 
 serde = ["dep:serde", "dep:humantime-serde"]
 
 [dependencies]
-
-
 thiserror = { version = "2", default-features = false }
+
+libm = { version = "0.2", optional = true, default-features = false }
 
 serde = { version = "1", default-features = false, features = [
   "derive",

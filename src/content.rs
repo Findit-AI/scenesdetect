@@ -53,6 +53,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::frame::{HsvFrame, LumaFrame, RgbFrame, Timebase, Timestamp};
 
+use std::vec::Vec;
+
+use super::{round_64, sqrt_64};
+
 mod arch;
 use arch::{bgr_to_hsv_planes, mean_abs_diff, sobel};
 
@@ -1017,8 +1021,9 @@ fn copy_plane(dst: &mut [u8], src: &[u8], width: u32, height: u32, stride: u32) 
 
 /// Auto kernel-size heuristic matching PySceneDetect: `4 + round(sqrt(w*h)/192)`,
 /// bumped to odd.
+#[cfg_attr(not(tarpaulin), inline(always))]
 fn auto_kernel_size(width: u32, height: u32) -> u32 {
-  let d = ((width as f64 * height as f64).sqrt() / 192.0).round() as u32;
+  let d = round_64(sqrt_64(width as f64 * height as f64) / 192.0) as u32;
   let mut k = 4 + d;
   if k % 2 == 0 {
     k += 1;
@@ -1203,6 +1208,7 @@ mod tests {
   use super::arch::bgr_to_hsv_pixel;
   use super::*;
   use core::num::NonZeroU32;
+  use std::vec;
 
   const fn nz32(n: u32) -> NonZeroU32 {
     match NonZeroU32::new(n) {
