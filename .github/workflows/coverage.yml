@@ -1,0 +1,140 @@
+name: coverage
+
+on:
+  push:
+    branches:
+      - main
+    paths-ignore:
+      - 'README.md'
+      - 'COPYRIGHT'
+      - 'LICENSE*'
+      - '**.md'
+      - '**.txt'
+      - 'art'
+  pull_request:
+    paths-ignore:
+      - 'README.md'
+      - 'COPYRIGHT'
+      - 'LICENSE*'
+      - '**.md'
+      - '**.txt'
+      - 'art'
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+# Three-platform matrix so the merged Codecov report covers all SIMD
+# backends:
+#   - macOS aarch64  → covers src/content/arch/neon.rs
+#   - Linux x86_64   → covers src/content/arch/{x86_ssse3,x86_avx2}.rs
+#   - Windows x86_64 → same x86 paths on MSVC
+#
+# tarpaulin 0.22+ supports macOS and Windows via the LLVM instrumentation
+# engine (the default on non-Linux hosts). On Linux it uses ptrace.
+# Codecov merges uploads for the same commit, so the final dashboard
+# shows the union of all three platform reports.
+#
+# Each platform excludes the SIMD files it *cannot* compile (they're behind
+# #[cfg(target_arch)] gates). Without exclusion, tarpaulin would count
+# them as 0/N uncovered lines, dragging down the per-platform number.
+# After Codecov merges, every arch file is covered by its native host.
+
+jobs:
+  coverage:
+    name: coverage (${{ matrix.label }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # aarch64: NEON compiles; x86/wasm do not.
+          # Doctests skipped — tarpaulin LLVM engine can't build them on macOS.
+          - os: macos-latest
+            label: macos-aarch64
+            run_types: '--run-types tests'
+            exclude_arch: "--exclude-files 'src/content/arch/x86_ssse3.rs' --exclude-files 'src/content/arch/x86_avx2.rs' --exclude-files 'src/content/arch/wasm_simd128.rs'"
+          # x86_64 Linux: x86 backends compile; NEON/wasm do not.
+          - os: ubuntu-latest
+            label: linux-x86_64
+            run_types: '--run-types tests'
+            exclude_arch: "--exclude-files 'src/content/arch/neon.rs' --exclude-files 'src/content/arch/wasm_simd128.rs'"
+          # x86_64 Windows: same as Linux; doctests skipped (LLVM engine).
+          - os: windows-latest
+            label: windows-x86_64
+            run_types: '--run-types tests'
+            exclude_arch: "--exclude-files 'src/content/arch/neon.rs' --exclude-files 'src/content/arch/wasm_simd128.rs'"
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust
+        run: rustup update stable --no-self-update && rustup default stable
+
+      - name: Install cargo-tarpaulin
+        run: cargo install cargo-tarpaulin
+
+      - name: Generate coverage
+        shell: bash
+        run: |
+          mkdir -p coverage
+          cargo tarpaulin \
+            --all-features \
+            ${{ matrix.run_types }} \
+            --exclude-files 'benches/*' \
+            ${{ matrix.exclude_arch }} \
+            --out xml \
+            --output-dir coverage
+        continue-on-error: true
+
+      - name: Upload coverage artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: coverage-${{ matrix.label }}
+          path: coverage/cobertura.xml
+
+  upload-codecov:
+    name: Upload merged coverage to Codecov
+    needs: coverage
+    runs-on: ubuntu-latest
+    if: always()
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Download all coverage reports
+        uses: actions/download-artifact@v6
+        with:
+          path: reports/
+
+      - name: List downloaded reports
+        shell: bash
+        run: find reports/ -type f -name '*.xml' | head -20
+
+      - name: Upload macOS aarch64 report
+        if: always()
+        uses: codecov/codecov-action@v6
+        with:
+          files: reports/coverage-macos-aarch64/cobertura.xml
+          flags: macos-aarch64
+          fail_ci_if_error: true
+        env:
+          CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+
+      - name: Upload Linux x86_64 report
+        if: always()
+        uses: codecov/codecov-action@v6
+        with:
+          files: reports/coverage-linux-x86_64/cobertura.xml
+          flags: linux-x86_64
+          fail_ci_if_error: true
+        env:
+          CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+
+      - name: Upload Windows x86_64 report
+        if: always()
+        uses: codecov/codecov-action@v6
+        with:
+          files: reports/coverage-windows-x86_64/cobertura.xml
+          flags: windows-x86_64
+          fail_ci_if_error: true
+        env:
+          CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
