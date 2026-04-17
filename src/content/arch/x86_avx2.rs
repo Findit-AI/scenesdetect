@@ -33,8 +33,8 @@ const BLK2_R: [i8; 16] = [-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, 0, 3, 6, 9, 12
 ///
 /// # Safety
 ///
-/// Caller must ensure AVX2 is available.
-#[target_feature(enable = "avx2")]
+/// Caller must ensure AVX2 (which implies SSSE3) is available.
+#[target_feature(enable = "avx2", enable = "ssse3")]
 #[allow(unused_unsafe)]
 pub(super) unsafe fn bgr_to_hsv_planes(
   h_out: &mut [u8],

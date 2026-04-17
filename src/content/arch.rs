@@ -109,7 +109,8 @@ pub(super) fn bgr_to_hsv_planes(
   ))]
   {
     if std::is_x86_feature_detected!("avx2") {
-      // SAFETY: runtime-checked above.
+      // SAFETY: runtime-checked above. AVX2 implies SSSE3 at the hardware
+      // level; the callee is annotated with both target features.
       unsafe {
         x86_avx2::bgr_to_hsv_planes(h_out, s_out, v_out, src, width, height, stride);
       }
