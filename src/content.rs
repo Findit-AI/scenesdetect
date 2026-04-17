@@ -1963,4 +1963,62 @@ mod tests {
     // state machine paths have been exercised.
     assert!(det.last_score().is_some());
   }
+
+  // -------------------------------------------------------------------------
+  // SIMD toggle: exercise the `use_simd = false` scalar dispatch path in
+  // arch.rs so the `if !use_simd { return scalar::... }` early-return
+  // branches are covered. Each dispatcher (bgr_to_hsv_planes,
+  // mean_abs_diff, sobel) takes this path.
+  // -------------------------------------------------------------------------
+
+  #[test]
+  fn scalar_dispatch_bgr_no_edges() {
+    let opts = Options::default()
+      .with_min_duration(Duration::from_millis(0))
+      .with_simd(false);
+    let mut det = Detector::new(opts);
+    let a = vec![64u8; 32 * 32 * 3];
+    let b = vec![200u8; 32 * 32 * 3];
+    let tb = Timebase::new(1, core::num::NonZeroU32::new(1000).unwrap());
+    det.process_bgr(RgbFrame::new(&a, 32, 32, 96, Timestamp::new(0, tb)));
+    det.process_bgr(RgbFrame::new(&b, 32, 32, 96, Timestamp::new(33, tb)));
+    assert!(det.last_score().is_some());
+  }
+
+  #[test]
+  fn scalar_dispatch_bgr_with_edges() {
+    let opts = Options::default()
+      .with_weights(Components::new(1.0, 1.0, 1.0, 1.0))
+      .with_min_duration(Duration::from_millis(0))
+      .with_kernel_size(Some(3))
+      .with_simd(false);
+    let mut det = Detector::new(opts);
+    let mut a = vec![0u8; 16 * 16 * 3];
+    let mut b = vec![0u8; 16 * 16 * 3];
+    for (i, v) in a.iter_mut().enumerate() {
+      *v = ((i * 7) % 256) as u8;
+    }
+    for (i, v) in b.iter_mut().enumerate() {
+      *v = ((i * 13 + 100) % 256) as u8;
+    }
+    let tb = Timebase::new(1, core::num::NonZeroU32::new(1000).unwrap());
+    det.process_bgr(RgbFrame::new(&a, 16, 16, 48, Timestamp::new(0, tb)));
+    det.process_bgr(RgbFrame::new(&b, 16, 16, 48, Timestamp::new(33, tb)));
+    assert!(det.last_score().is_some());
+    assert!(det.last_components().expect("components").delta_edges() >= 0.0);
+  }
+
+  #[test]
+  fn scalar_dispatch_luma_only() {
+    let opts = Options::default()
+      .with_weights(LUMA_ONLY_WEIGHTS)
+      .with_min_duration(Duration::from_millis(0))
+      .with_simd(false);
+    let mut det = Detector::new(opts);
+    let a = vec![0u8; 32 * 32];
+    let b = vec![255u8; 32 * 32];
+    det.process_luma(luma_frame(&a, 32, 32, 0));
+    det.process_luma(luma_frame(&b, 32, 32, 33));
+    assert!(det.last_score().is_some());
+  }
 }
