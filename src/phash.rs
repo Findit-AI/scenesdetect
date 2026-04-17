@@ -58,7 +58,7 @@ pub struct Options {
   lowpass: u32,
   #[cfg_attr(feature = "serde", serde(with = "humantime_serde"))]
   min_duration: Duration,
-  allow_initial_cut: bool,
+  initial_cut: bool,
 }
 
 impl Default for Options {
@@ -77,7 +77,7 @@ impl Options {
       size: 16,
       lowpass: 2,
       min_duration: Duration::from_secs(1),
-      allow_initial_cut: true,
+      initial_cut: true,
     }
   }
 
@@ -194,21 +194,21 @@ impl Options {
   /// - `false`: suppresses cuts until the stream has actually run for at
   ///   least [`Self::min_duration`]. Matches PySceneDetect's default.
   #[cfg_attr(not(tarpaulin), inline(always))]
-  pub const fn allow_initial_cut(&self) -> bool {
-    self.allow_initial_cut
+  pub const fn initial_cut(&self) -> bool {
+    self.initial_cut
   }
 
   /// Sets whether the first detected cut may fire immediately.
   #[cfg_attr(not(tarpaulin), inline(always))]
-  pub const fn with_allow_initial_cut(mut self, val: bool) -> Self {
-    self.allow_initial_cut = val;
+  pub const fn with_initial_cut(mut self, val: bool) -> Self {
+    self.initial_cut = val;
     self
   }
 
-  /// Sets `allow_initial_cut` in place.
+  /// Sets `initial_cut` in place.
   #[cfg_attr(not(tarpaulin), inline(always))]
-  pub const fn set_allow_initial_cut(&mut self, val: bool) -> &mut Self {
-    self.allow_initial_cut = val;
+  pub const fn set_initial_cut(&mut self, val: bool) -> &mut Self {
+    self.initial_cut = val;
     self
   }
 }
@@ -408,7 +408,7 @@ impl Detector {
     let ts = frame.timestamp();
 
     if self.last_cut_ts.is_none() {
-      self.last_cut_ts = Some(if self.options.allow_initial_cut {
+      self.last_cut_ts = Some(if self.options.initial_cut {
         ts.saturating_sub_duration(self.options.min_duration)
       } else {
         ts
@@ -978,7 +978,7 @@ mod tests {
     // Python-compat mode: no early cuts allowed.
     let opts = Options::default()
       .with_min_duration(Duration::from_secs(1))
-      .with_allow_initial_cut(false);
+      .with_initial_cut(false);
     let mut det = Detector::new(opts);
 
     let (a, b) = ortho_halves_frames();
@@ -1075,12 +1075,12 @@ mod tests {
       .with_size(32)
       .with_lowpass(4)
       .with_min_duration(core::time::Duration::from_millis(333))
-      .with_allow_initial_cut(false);
+      .with_initial_cut(false);
     assert_eq!(opts.threshold(), 0.5);
     assert_eq!(opts.size(), 32);
     assert_eq!(opts.lowpass(), 4);
     assert_eq!(opts.min_duration(), core::time::Duration::from_millis(333));
-    assert!(!opts.allow_initial_cut());
+    assert!(!opts.initial_cut());
 
     let opts_frames = Options::default().with_min_frames(15, fps30);
     assert_eq!(
@@ -1095,11 +1095,11 @@ mod tests {
       .set_size(8)
       .set_lowpass(2)
       .set_min_duration(core::time::Duration::from_secs(1))
-      .set_allow_initial_cut(true);
+      .set_initial_cut(true);
     assert_eq!(opts.threshold(), 0.1);
     assert_eq!(opts.size(), 8);
     assert_eq!(opts.lowpass(), 2);
-    assert!(opts.allow_initial_cut());
+    assert!(opts.initial_cut());
 
     opts.set_min_frames(30, fps30);
     assert_eq!(opts.min_duration(), core::time::Duration::from_secs(1));

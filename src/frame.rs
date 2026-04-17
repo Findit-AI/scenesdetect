@@ -183,7 +183,7 @@ impl<'a> RgbFrame<'a> {
   ) -> Result<Self, RgbFrameError> {
     let min_stride = match width.checked_mul(Self::BYTES_PER_PIXEL) {
       Some(v) => v,
-      None => return Err(RgbFrameError::DimensionsOverflow { stride, height }),
+      None => return Err(RgbFrameError::WidthOverflow { width }),
     };
     if stride < min_stride {
       return Err(RgbFrameError::StrideTooSmall {
@@ -269,8 +269,14 @@ pub enum RgbFrameError {
     /// Actual byte length of `data`.
     actual: usize,
   },
-  /// `width * 3` or `stride * height` overflowed `usize` (can only happen
-  /// on 32-bit targets with very large frames).
+  /// `width * BYTES_PER_PIXEL` (i.e. `width * 3`) overflowed `u32`.
+  #[error("width ({width}) * 3 overflows u32")]
+  WidthOverflow {
+    /// The frame width in pixels.
+    width: u32,
+  },
+  /// `stride * height` overflowed `usize` (can only happen on 32-bit
+  /// targets with very large frames).
   #[error("frame dimensions overflow usize: stride ({stride}) * height ({height})")]
   DimensionsOverflow {
     /// The stride in bytes.
@@ -663,14 +669,12 @@ mod tests {
   #[test]
   fn rgb_frame_try_new_rejects_width_times_three_overflow() {
     // width * BYTES_PER_PIXEL (3) overflows u32 when width > u32::MAX / 3.
-    // The error path doesn't carry width in the struct but is still
-    // reachable — validates the first `checked_mul` guard in try_new.
     let buf = [0u8; 0];
     let tb = Timebase::new(1, nz(1000));
     let bad_w = u32::MAX / 3 + 1;
     let err = RgbFrame::try_new(&buf, bad_w, 1, u32::MAX, Timestamp::new(0, tb))
       .expect_err("width*3 should overflow");
-    assert!(matches!(err, RgbFrameError::DimensionsOverflow { .. }));
+    assert_eq!(err, RgbFrameError::WidthOverflow { width: bad_w });
   }
 
   // -------------------------------------------------------------------------

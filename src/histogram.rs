@@ -113,7 +113,7 @@ pub struct Options {
   bins: NonZeroUsize,
   #[cfg_attr(feature = "serde", serde(with = "humantime_serde"))]
   min_duration: Duration,
-  allow_initial_cut: bool,
+  initial_cut: bool,
 }
 
 impl Default for Options {
@@ -125,15 +125,13 @@ impl Default for Options {
 
 impl Options {
   /// Creates a new `Options` instance with default values.
-  ///
-  /// Defaults: `threshold = 0.5`, `bins = 256`, `min_duration = 1 s`.
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn new() -> Self {
     Self {
       threshold: 0.5,
       bins: NonZeroUsize::new(256).unwrap(),
       min_duration: Duration::from_secs(1),
-      allow_initial_cut: true,
+      initial_cut: true,
     }
   }
 
@@ -237,21 +235,21 @@ impl Options {
   /// - `false`: suppresses cuts until the stream has actually run for at
   ///   least [`Self::min_duration`]. Matches PySceneDetect's default.
   #[cfg_attr(not(tarpaulin), inline(always))]
-  pub const fn allow_initial_cut(&self) -> bool {
-    self.allow_initial_cut
+  pub const fn initial_cut(&self) -> bool {
+    self.initial_cut
   }
 
   /// Sets whether the first detected cut may fire immediately.
   #[cfg_attr(not(tarpaulin), inline(always))]
-  pub const fn with_allow_initial_cut(mut self, val: bool) -> Self {
-    self.allow_initial_cut = val;
+  pub const fn with_initial_cut(mut self, val: bool) -> Self {
+    self.initial_cut = val;
     self
   }
 
-  /// Sets `allow_initial_cut` in place.
+  /// Sets `initial_cut` in place.
   #[cfg_attr(not(tarpaulin), inline(always))]
-  pub const fn set_allow_initial_cut(&mut self, val: bool) -> &mut Self {
-    self.allow_initial_cut = val;
+  pub const fn set_initial_cut(&mut self, val: bool) -> &mut Self {
+    self.initial_cut = val;
     self
   }
 }
@@ -387,10 +385,10 @@ impl Detector {
 
     // Seed the cut-gating reference on the first frame.
     if self.last_cut_ts.is_none() {
-      // Seed: virtual-past if allow_initial_cut lets the first cut fire
+      // Seed: virtual-past if initial_cut lets the first cut fire
       // immediately, otherwise match Python — seed at `ts`, suppressing
       // cuts within the first min_duration of the stream.
-      self.last_cut_ts = Some(if self.options.allow_initial_cut {
+      self.last_cut_ts = Some(if self.options.initial_cut {
         ts.saturating_sub_duration(self.options.min_duration)
       } else {
         ts
@@ -579,12 +577,12 @@ mod tests {
 
   #[test]
   fn min_duration_suppresses_rapid_cuts() {
-    // 1 second min_duration, Python-compat mode (allow_initial_cut=false).
+    // 1 second min_duration, Python-compat mode (initial_cut=false).
     // Alternate black/white frames at 33 ms cadence — no cut should fire
     // before 1 s elapses from stream start.
     let opts = Options::default()
       .with_min_duration(Duration::from_secs(1))
-      .with_allow_initial_cut(false);
+      .with_initial_cut(false);
     let mut det = Detector::new(opts);
 
     let black = [0u8; 64 * 48];
@@ -610,7 +608,7 @@ mod tests {
     // Python-compat mode: no early cuts allowed.
     let opts = Options::default()
       .with_min_duration(Duration::from_millis(500))
-      .with_allow_initial_cut(false);
+      .with_initial_cut(false);
     let mut det = Detector::new(opts);
 
     let black = [0u8; 64 * 48];
@@ -761,11 +759,11 @@ mod tests {
       .with_threshold(0.42)
       .with_bins(core::num::NonZeroUsize::new(128).unwrap())
       .with_min_duration(core::time::Duration::from_millis(500))
-      .with_allow_initial_cut(false);
+      .with_initial_cut(false);
     assert_eq!(opts.threshold(), 0.42);
     assert_eq!(opts.bins(), 128);
     assert_eq!(opts.min_duration(), core::time::Duration::from_millis(500));
-    assert!(!opts.allow_initial_cut());
+    assert!(!opts.initial_cut());
 
     // with_min_frames — alternate min_duration form.
     let opts_frames = Options::default().with_min_frames(15, fps30);
@@ -780,10 +778,10 @@ mod tests {
       .set_threshold(0.1)
       .set_bins(core::num::NonZeroUsize::new(64).unwrap())
       .set_min_duration(core::time::Duration::from_secs(1))
-      .set_allow_initial_cut(true);
+      .set_initial_cut(true);
     assert_eq!(opts.threshold(), 0.1);
     assert_eq!(opts.bins(), 64);
-    assert!(opts.allow_initial_cut());
+    assert!(opts.initial_cut());
 
     opts.set_min_frames(30, fps30);
     assert_eq!(opts.min_duration(), core::time::Duration::from_secs(1));
