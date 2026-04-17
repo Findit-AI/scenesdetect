@@ -1,11 +1,11 @@
 [package]
 name = "scenesdetect"
-version = "0.0.0"
+version = "0.1.0"
 edition = "2024"
 repository = "https://github.com/findit-ai/scenesdetect"
 homepage = "https://github.com/findit-ai/scenesdetect"
 documentation = "https://docs.rs/scenesdetect"
-description = "A template for creating Rust open-source repo on GitHub"
+description = "Scene/shot cut detection ported from PySceneDetect — Sans-I/O streaming API with SIMD-accelerated detectors for histogram, pHash, threshold, content, and adaptive algorithms."
 license = "MIT OR Apache-2.0"
 rust-version = "1.85.0"
 

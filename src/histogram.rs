@@ -84,15 +84,21 @@ use std::{vec, vec::Vec};
 
 /// Error returned by [`Detector::try_new`] when the provided [`Options`]
 /// are inconsistent.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, IsVariant, Error)]
+#[derive(Debug, Clone, Copy, PartialEq, IsVariant, Error)]
 #[non_exhaustive]
 pub enum Error {
-  /// `N_ACCUM * bins` overflows `usize`. The bin count is too large for the
-  /// multi-accumulator scratch buffer.
-  #[error("histogram bin count ({bins}) is too large (N_ACCUM * bins overflows usize)")]
+  /// `N_ACCUM * bins` overflows `usize`, or `bins > u32::MAX` (the bin
+  /// lookup table stores indices as `u32`).
+  #[error("histogram bin count ({bins}) is too large")]
   BinCountTooLarge {
     /// The requested bin count that caused the overflow.
     bins: usize,
+  },
+  /// `threshold` is outside the documented `[0.0, 1.0]` range.
+  #[error("threshold ({threshold}) must be in [0.0, 1.0]")]
+  ThresholdOutOfRange {
+    /// The out-of-range threshold value.
+    threshold: f64,
   },
 }
 
@@ -313,11 +319,19 @@ impl Detector {
   /// scratch (`4 * bins` × `u32`) plus the two reduced histograms.
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub fn try_new(options: Options) -> Result<Self, Error> {
+    let threshold = options.threshold;
+    if !(0.0..=1.0).contains(&threshold) {
+      return Err(Error::ThresholdOutOfRange { threshold });
+    }
     let bins = options.bins.get();
+    // The bin lookup table stores indices as u32, so bins must fit.
+    if bins > u32::MAX as usize {
+      return Err(Error::BinCountTooLarge { bins });
+    }
     let scratch_len = N_ACCUM
       .checked_mul(bins)
       .ok_or(Error::BinCountTooLarge { bins })?;
-    let corr_threshold = (1.0 - options.threshold).clamp(0.0, 1.0);
+    let corr_threshold = (1.0 - threshold).clamp(0.0, 1.0);
     let bin_of = build_bin_lookup(bins);
     Ok(Self {
       options,

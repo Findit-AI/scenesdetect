@@ -63,6 +63,10 @@ pub enum Error {
   /// `options.window_width()` was zero. Must be `>= 1`.
   #[error("window_width must be >= 1")]
   ZeroWindowWidth,
+  /// `1 + 2 * window_width` overflows `usize` (window is too wide for this
+  /// target's address space).
+  #[error("window_width ({0}) is too large (1 + 2 * window_width overflows usize)")]
+  WindowWidthOverflow(u32),
   /// The inner content detector's options were invalid.
   #[error(transparent)]
   Content(#[from] content::Error),
@@ -341,7 +345,10 @@ impl Detector {
     let inner = content::Detector::try_new(Self::build_content_options(&options))?;
 
     let window_width = options.window_width as usize;
-    let required_frames = 1 + 2 * window_width;
+    let required_frames = window_width
+      .checked_mul(2)
+      .and_then(|v| v.checked_add(1))
+      .ok_or(Error::WindowWidthOverflow(options.window_width))?;
 
     Ok(Self {
       options,
