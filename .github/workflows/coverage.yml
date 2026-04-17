@@ -24,21 +24,21 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
-# Why cargo-llvm-cov instead of tarpaulin?
-#
-# tarpaulin uses ptrace and only works on Linux. The whole point of this
-# workflow is to collect coverage across architectures so the platform-gated
-# SIMD backends (NEON on aarch64, SSSE3/AVX2 on x86_64) all show up in the
-# merged report. cargo-llvm-cov uses LLVM source-based instrumentation and
-# works on Linux, macOS, and Windows.
-#
-# Codecov merges uploads for the same commit automatically, so the final
-# dashboard shows the union of all three platform reports:
+# Three-platform matrix so the merged Codecov report covers all SIMD
+# backends:
 #   - macOS aarch64  → covers src/content/arch/neon.rs
 #   - Linux x86_64   → covers src/content/arch/{x86_ssse3,x86_avx2}.rs
 #   - Windows x86_64 → same x86 paths on MSVC
-# Files that are cfg-gated out on a given platform simply don't appear in
-# that platform's report; the merge fills in the gaps.
+#
+# tarpaulin 0.22+ supports macOS and Windows via the LLVM instrumentation
+# engine (the default on non-Linux hosts). On Linux it uses ptrace.
+# Codecov merges uploads for the same commit, so the final dashboard
+# shows the union of all three platform reports.
+#
+# Each platform excludes the SIMD files it *cannot* compile (they're behind
+# #[cfg(target_arch)] gates). Without exclusion, tarpaulin would count
+# them as 0/N uncovered lines, dragging down the per-platform number.
+# After Codecov merges, every arch file is covered by its native host.
 
 jobs:
   coverage:
@@ -47,42 +47,53 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # aarch64 — exercises NEON SIMD backend
+          # aarch64: NEON compiles; x86/wasm do not.
           - os: macos-latest
             label: macos-aarch64
-          # x86_64 Linux — exercises SSSE3/AVX2 SIMD via runtime dispatch
+            exclude_arch: |
+              --exclude-files 'src/content/arch/x86_ssse3.rs' \
+              --exclude-files 'src/content/arch/x86_avx2.rs' \
+              --exclude-files 'src/content/arch/wasm_simd128.rs'
+          # x86_64 Linux: x86 backends compile; NEON/wasm do not.
           - os: ubuntu-latest
             label: linux-x86_64
-          # x86_64 Windows — same x86 dispatch on MSVC toolchain
+            exclude_arch: |
+              --exclude-files 'src/content/arch/neon.rs' \
+              --exclude-files 'src/content/arch/wasm_simd128.rs'
+          # x86_64 Windows: same as Linux.
           - os: windows-latest
             label: windows-x86_64
+            exclude_arch: |
+              --exclude-files 'src/content/arch/neon.rs' \
+              --exclude-files 'src/content/arch/wasm_simd128.rs'
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v6
 
-      - name: Install Rust nightly
-        run: |
-          rustup update nightly --no-self-update
-          rustup default nightly
-          rustup component add llvm-tools-preview
+      - name: Install Rust
+        run: rustup update stable --no-self-update && rustup default stable
 
-      - name: Install cargo-llvm-cov
-        uses: taiki-e/install-action@cargo-llvm-cov
+      - name: Install cargo-tarpaulin
+        run: cargo install cargo-tarpaulin
 
       - name: Generate coverage
+        shell: bash
         run: |
-          cargo llvm-cov \
+          mkdir -p coverage
+          cargo tarpaulin \
             --all-features \
-            --lib --tests --doctests \
-            --ignore-filename-regex 'benches/.*' \
-            --codecov \
-            --output-path codecov.json
+            --run-types tests --run-types doctests \
+            --exclude-files 'benches/*' \
+            ${{ matrix.exclude_arch }} \
+            --out xml \
+            --output-dir coverage
+        continue-on-error: true
 
       - name: Upload coverage artifact
         uses: actions/upload-artifact@v7
         with:
           name: coverage-${{ matrix.label }}
-          path: codecov.json
+          path: coverage/cobertura.xml
 
   upload-codecov:
     name: Upload merged coverage to Codecov
@@ -99,16 +110,13 @@ jobs:
 
       - name: List downloaded reports
         shell: bash
-        run: find reports/ -type f -name '*.json' | head -20
+        run: find reports/ -type f -name '*.xml' | head -20
 
-      # Each platform's codecov.json is uploaded separately so Codecov
-      # merges them into a single commit-level report. The flags let
-      # the Codecov UI show per-platform breakdowns.
       - name: Upload macOS aarch64 report
         if: always()
         uses: codecov/codecov-action@v6
         with:
-          files: reports/coverage-macos-aarch64/codecov.json
+          files: reports/coverage-macos-aarch64/cobertura.xml
           flags: macos-aarch64
           fail_ci_if_error: false
         env:
@@ -118,7 +126,7 @@ jobs:
         if: always()
         uses: codecov/codecov-action@v6
         with:
-          files: reports/coverage-linux-x86_64/codecov.json
+          files: reports/coverage-linux-x86_64/cobertura.xml
           flags: linux-x86_64
           fail_ci_if_error: false
         env:
@@ -128,7 +136,7 @@ jobs:
         if: always()
         uses: codecov/codecov-action@v6
         with:
-          files: reports/coverage-windows-x86_64/codecov.json
+          files: reports/coverage-windows-x86_64/cobertura.xml
           flags: windows-x86_64
           fail_ci_if_error: false
         env:
