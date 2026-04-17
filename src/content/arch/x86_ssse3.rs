@@ -313,7 +313,7 @@ pub(super) unsafe fn sobel(input: &[u8], mag: &mut [i32], dir: &mut [u8], w: usi
 
     let mut x = 1usize;
 
-    while x + LANES <= w - 1 {
+    while x + LANES < w {
       macro_rules! ld {
         ($row:expr, $o:expr) => {{
           let v = unsafe { _mm_loadl_epi64($row.as_ptr().add($o) as *const __m128i) };
@@ -384,8 +384,8 @@ pub(super) unsafe fn sobel(input: &[u8], mag: &mut [i32], dir: &mut [u8], w: usi
         + 2 * i(y + 1, x)
         + i(y + 1, x + 1);
       mag[off + x] = gx.abs() + gy.abs();
-      let ax = gx.abs() as u32;
-      let ay = gy.abs() as u32;
+      let ax = gx.unsigned_abs();
+      let ay = gy.unsigned_abs();
       dir[off + x] = if ay * 1000 < ax * 414 {
         0
       } else if ay * 1000 > ax * 2414 {

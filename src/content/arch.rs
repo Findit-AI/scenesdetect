@@ -26,10 +26,21 @@
 #[cfg(target_arch = "aarch64")]
 mod neon;
 
-#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+// x86 SIMD modules are only reachable when either:
+//   - `std` is enabled (runtime `is_x86_feature_detected!` dispatch), or
+//   - the matching `target_feature` is set at compile time (no-std dispatch).
+// Without either gate, the functions would compile but nothing calls them,
+// producing dead-code warnings under `-D warnings`.
+#[cfg(all(
+  any(target_arch = "x86", target_arch = "x86_64"),
+  any(feature = "std", target_feature = "ssse3"),
+))]
 mod x86_ssse3;
 
-#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[cfg(all(
+  any(target_arch = "x86", target_arch = "x86_64"),
+  any(feature = "std", target_feature = "avx2"),
+))]
 mod x86_avx2;
 
 #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
