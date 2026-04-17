@@ -1,0 +1,135 @@
+name: coverage
+
+on:
+  push:
+    branches:
+      - main
+    paths-ignore:
+      - 'README.md'
+      - 'COPYRIGHT'
+      - 'LICENSE*'
+      - '**.md'
+      - '**.txt'
+      - 'art'
+  pull_request:
+    paths-ignore:
+      - 'README.md'
+      - 'COPYRIGHT'
+      - 'LICENSE*'
+      - '**.md'
+      - '**.txt'
+      - 'art'
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+# Why cargo-llvm-cov instead of tarpaulin?
+#
+# tarpaulin uses ptrace and only works on Linux. The whole point of this
+# workflow is to collect coverage across architectures so the platform-gated
+# SIMD backends (NEON on aarch64, SSSE3/AVX2 on x86_64) all show up in the
+# merged report. cargo-llvm-cov uses LLVM source-based instrumentation and
+# works on Linux, macOS, and Windows.
+#
+# Codecov merges uploads for the same commit automatically, so the final
+# dashboard shows the union of all three platform reports:
+#   - macOS aarch64  → covers src/content/arch/neon.rs
+#   - Linux x86_64   → covers src/content/arch/{x86_ssse3,x86_avx2}.rs
+#   - Windows x86_64 → same x86 paths on MSVC
+# Files that are cfg-gated out on a given platform simply don't appear in
+# that platform's report; the merge fills in the gaps.
+
+jobs:
+  coverage:
+    name: coverage (${{ matrix.label }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # aarch64 — exercises NEON SIMD backend
+          - os: macos-latest
+            label: macos-aarch64
+          # x86_64 Linux — exercises SSSE3/AVX2 SIMD via runtime dispatch
+          - os: ubuntu-latest
+            label: linux-x86_64
+          # x86_64 Windows — same x86 dispatch on MSVC toolchain
+          - os: windows-latest
+            label: windows-x86_64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust nightly
+        run: |
+          rustup update nightly --no-self-update
+          rustup default nightly
+          rustup component add llvm-tools-preview
+
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@cargo-llvm-cov
+
+      - name: Generate coverage
+        run: |
+          cargo llvm-cov \
+            --all-features \
+            --lib --tests --doctests \
+            --ignore-filename-regex 'benches/.*' \
+            --codecov \
+            --output-path codecov.json
+
+      - name: Upload coverage artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: coverage-${{ matrix.label }}
+          path: codecov.json
+
+  upload-codecov:
+    name: Upload merged coverage to Codecov
+    needs: coverage
+    runs-on: ubuntu-latest
+    if: always()
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Download all coverage reports
+        uses: actions/download-artifact@v6
+        with:
+          path: reports/
+
+      - name: List downloaded reports
+        shell: bash
+        run: find reports/ -type f -name '*.json' | head -20
+
+      # Each platform's codecov.json is uploaded separately so Codecov
+      # merges them into a single commit-level report. The flags let
+      # the Codecov UI show per-platform breakdowns.
+      - name: Upload macOS aarch64 report
+        if: always()
+        uses: codecov/codecov-action@v6
+        with:
+          files: reports/coverage-macos-aarch64/codecov.json
+          flags: macos-aarch64
+          fail_ci_if_error: false
+        env:
+          CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+
+      - name: Upload Linux x86_64 report
+        if: always()
+        uses: codecov/codecov-action@v6
+        with:
+          files: reports/coverage-linux-x86_64/codecov.json
+          flags: linux-x86_64
+          fail_ci_if_error: false
+        env:
+          CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+
+      - name: Upload Windows x86_64 report
+        if: always()
+        uses: codecov/codecov-action@v6
+        with:
+          files: reports/coverage-windows-x86_64/codecov.json
+          flags: windows-x86_64
+          fail_ci_if_error: false
+        env:
+          CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
