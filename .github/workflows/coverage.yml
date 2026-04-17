@@ -48,21 +48,29 @@ jobs:
       matrix:
         include:
           # aarch64: NEON compiles; x86/wasm do not.
+          # Doctests skipped — tarpaulin's LLVM engine has known issues
+          # building doctests on macOS. Doctest coverage is picked up by
+          # the Linux job instead.
           - os: macos-latest
             label: macos-aarch64
+            run_types: '--run-types tests'
             exclude_arch: |
               --exclude-files 'src/content/arch/x86_ssse3.rs' \
               --exclude-files 'src/content/arch/x86_avx2.rs' \
               --exclude-files 'src/content/arch/wasm_simd128.rs'
           # x86_64 Linux: x86 backends compile; NEON/wasm do not.
+          # Doctests included — ptrace engine handles them reliably.
           - os: ubuntu-latest
             label: linux-x86_64
+            run_types: '--run-types tests --run-types doctests'
             exclude_arch: |
               --exclude-files 'src/content/arch/neon.rs' \
               --exclude-files 'src/content/arch/wasm_simd128.rs'
-          # x86_64 Windows: same as Linux.
+          # x86_64 Windows: same exclusions as Linux.
+          # Doctests skipped — same LLVM engine doctest issue as macOS.
           - os: windows-latest
             label: windows-x86_64
+            run_types: '--run-types tests'
             exclude_arch: |
               --exclude-files 'src/content/arch/neon.rs' \
               --exclude-files 'src/content/arch/wasm_simd128.rs'
@@ -82,7 +90,7 @@ jobs:
           mkdir -p coverage
           cargo tarpaulin \
             --all-features \
-            --run-types tests --run-types doctests \
+            ${{ matrix.run_types }} \
             --exclude-files 'benches/*' \
             ${{ matrix.exclude_arch }} \
             --out xml \
