@@ -1,12 +1,20 @@
 //! Platform-specific SIMD (plus a scalar fallback) for the content
 //! detector's BGR→HSV conversion.
 //!
-//! Dispatch is compile-time via `target_arch` — no runtime feature
-//! detection is needed because the current SIMD backend (aarch64 NEON)
-//! is in every aarch64 target's base ISA. Additional platforms can be
-//! added as sibling private modules (e.g. an `x86_ssse3` module exposing
-//! its own `bgr_to_hsv_planes`), wired into [`bgr_to_hsv_planes`] via
-//! another `cfg` branch.
+//! Dispatch is a mix of compile-time `cfg` / `target_feature` selection
+//! and, on `x86` / `x86_64` when `std` is enabled, runtime CPU-feature
+//! detection. In particular:
+//! - `aarch64` uses NEON selected at compile time because NEON is part of
+//!   the base ISA.
+//! - `wasm32` uses the wasm SIMD backend when `simd128` is enabled.
+//! - `x86` / `x86_64` use runtime dispatch with `is_x86_feature_detected!`
+//!   under `std` to pick AVX2, then SSSE3, then scalar; without `std`,
+//!   compile-time `target_feature` gating selects the best available path.
+//! - Other targets use the scalar fallback.
+//!
+//! Additional platforms can be added as sibling private modules exposing
+//! the same internal entry points and wired into [`bgr_to_hsv_planes`]
+//! through the appropriate `cfg` and/or dispatch branch.
 //!
 //! The module is private to `crate::content` — callers in `content.rs`
 //! use just the two entry points here; they never see platform details.
