@@ -24,16 +24,29 @@ use core::arch::x86_64::*;
 //   blk1: G5 R5 B6 G6 R6 B7 G7 R7 B8 G8 R8 B9 G9 R9 B10 G10
 //   blk2: R10 B11 G11 R11 B12 G12 R12 B13 G13 R13 B14 G14 R14 B15 G15 R15
 
+// When AVX2 is also enabled at compile time, the BGR→HSV dispatch takes
+// the AVX2 path, leaving the SSSE3 BGR function + its helpers and shuffle
+// constants unused. `mean_abs_diff` and `sobel` are still called via SSSE3
+// even when AVX2 is present (no AVX2 variants of those exist).
+#[allow(dead_code)]
 const BLK0_B: [i8; 16] = [0, 3, 6, 9, 12, 15, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1];
+#[allow(dead_code)]
 const BLK0_G: [i8; 16] = [1, 4, 7, 10, 13, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1];
+#[allow(dead_code)]
 const BLK0_R: [i8; 16] = [2, 5, 8, 11, 14, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1];
 
+#[allow(dead_code)]
 const BLK1_B: [i8; 16] = [-1, -1, -1, -1, -1, -1, 2, 5, 8, 11, 14, -1, -1, -1, -1, -1];
+#[allow(dead_code)]
 const BLK1_G: [i8; 16] = [-1, -1, -1, -1, -1, 0, 3, 6, 9, 12, 15, -1, -1, -1, -1, -1];
+#[allow(dead_code)]
 const BLK1_R: [i8; 16] = [-1, -1, -1, -1, -1, 1, 4, 7, 10, 13, -1, -1, -1, -1, -1, -1];
 
+#[allow(dead_code)]
 const BLK2_B: [i8; 16] = [-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, 1, 4, 7, 10, 13];
+#[allow(dead_code)]
 const BLK2_G: [i8; 16] = [-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, 2, 5, 8, 11, 14];
+#[allow(dead_code)]
 const BLK2_R: [i8; 16] = [-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, 0, 3, 6, 9, 12, 15];
 
 /// SSSE3 BGR→HSV: 16 pixels per iteration.
@@ -43,6 +56,7 @@ const BLK2_R: [i8; 16] = [-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, 0, 3, 6, 9, 12
 /// Caller must ensure SSSE3 is available (`is_x86_feature_detected!("ssse3")`
 /// or `target_feature = "ssse3"`). Buffers must cover the ranges indicated by
 /// `width`, `height`, `stride`.
+#[allow(dead_code)] // AVX2 takes the BGR path when both are compiled
 #[target_feature(enable = "ssse3")]
 #[allow(unused_unsafe)]
 pub(super) unsafe fn bgr_to_hsv_planes(
@@ -166,6 +180,7 @@ pub(super) unsafe fn bgr_to_hsv_planes(
 
 /// Clamp `i32x4` lanes to `[0, max]`. Our values are non-negative by
 /// construction (widened from `u8`), so no lower-bound check needed.
+#[allow(dead_code)]
 #[target_feature(enable = "ssse3")]
 #[allow(unused_unsafe)]
 #[inline]
@@ -177,6 +192,7 @@ unsafe fn clamp_i32_max(v: __m128i, max: i32) -> __m128i {
 
 /// Pack four `i32x4` vectors (values ≤ 255) into one `u8x16` via two levels
 /// of saturating narrow.
+#[allow(dead_code)]
 #[target_feature(enable = "ssse3")]
 #[allow(unused_unsafe)]
 #[inline]
@@ -190,6 +206,7 @@ unsafe fn pack_quad(a: __m128i, b: __m128i, c: __m128i, d: __m128i) -> __m128i {
 
 /// Branch-free 4-lane BGR→HSV core. Returns `(hue ∈ [0, 360), sat, val)` as
 /// `f32x4`. Caller divides hue by 2, rounds, and narrows to u8.
+#[allow(dead_code)]
 #[target_feature(enable = "ssse3")]
 #[allow(unused_unsafe)]
 #[inline]
@@ -243,6 +260,7 @@ unsafe fn bgr_to_hsv_f32x4(b: __m128, g: __m128, r: __m128) -> (__m128, __m128, 
 
 /// `mask ? t : f`, where `mask` is per-lane all-ones or all-zeros from a
 /// comparison intrinsic. SSE2 equivalent of SSE4.1 `_mm_blendv_ps`.
+#[allow(dead_code)]
 #[target_feature(enable = "ssse3")]
 #[allow(unused_unsafe)]
 #[inline]

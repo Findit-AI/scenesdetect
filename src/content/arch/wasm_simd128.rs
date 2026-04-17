@@ -267,7 +267,8 @@ pub(super) unsafe fn mean_abs_diff(a: &[u8], b: &[u8], n: usize) -> f64 {
     let hi64 = u64x2_extend_high_u32x4(sum32);
     let sum64 = u64x2_add(lo64, hi64); // u64x2: 2 partial sums
     // Extract lanes (wasm has no u64 extract; transmute to array).
-    let arr: [u64; 2] = core::mem::transmute(sum64);
+    // SAFETY: v128 and [u64; 2] have the same size and alignment.
+    let arr: [u64; 2] = unsafe { core::mem::transmute(sum64) };
     acc_lo += arr[0];
     acc_hi += arr[1];
     i += LANES;
@@ -345,8 +346,9 @@ pub(super) unsafe fn sobel(input: &[u8], mag: &mut [i32], dir: &mut [u8], w: usi
       }
 
       // Direction: scalar.
-      let gx_arr: [i16; 8] = core::mem::transmute(gx);
-      let gy_arr: [i16; 8] = core::mem::transmute(gy);
+      // SAFETY: v128 and [i16; 8] have the same size and alignment.
+      let gx_arr: [i16; 8] = unsafe { core::mem::transmute(gx) };
+      let gy_arr: [i16; 8] = unsafe { core::mem::transmute(gy) };
       for j in 0..LANES {
         let ax = gx_arr[j].unsigned_abs() as u32;
         let ay = gy_arr[j].unsigned_abs() as u32;

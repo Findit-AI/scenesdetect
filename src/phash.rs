@@ -995,6 +995,7 @@ mod tests {
   }
 
   #[test]
+  #[cfg_attr(miri, ignore)] // 128×96 phash is extremely slow under Miri (~650s)
   fn clear_resets_stream_state() {
     let opts = Options::default().with_min_duration(Duration::from_millis(0));
     let mut det = Detector::new(opts);
