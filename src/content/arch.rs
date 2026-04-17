@@ -23,7 +23,12 @@
 // bgr_to_hsv_planes(...)`. Gated so each file is only compiled on matching
 // targets — the source need not exist for other arches.
 
-#[cfg(target_arch = "aarch64")]
+// Miri cannot interpret platform SIMD intrinsics — gate all SIMD modules
+// on `not(miri)` so the dispatcher falls through to the scalar backend.
+// Detector tests then still run under Miri (validating memory safety of
+// the full pipeline) without hitting unsupported operations.
+
+#[cfg(all(target_arch = "aarch64", not(miri)))]
 mod neon;
 
 // x86 SIMD modules are only reachable when either:
@@ -34,16 +39,18 @@ mod neon;
 #[cfg(all(
   any(target_arch = "x86", target_arch = "x86_64"),
   any(feature = "std", target_feature = "ssse3"),
+  not(miri),
 ))]
 mod x86_ssse3;
 
 #[cfg(all(
   any(target_arch = "x86", target_arch = "x86_64"),
   any(feature = "std", target_feature = "avx2"),
+  not(miri),
 ))]
 mod x86_avx2;
 
-#[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+#[cfg(all(target_arch = "wasm32", target_feature = "simd128", not(miri)))]
 mod wasm_simd128;
 
 /// Converts a packed 24-bit BGR frame into three planar HSV buffers that
@@ -75,7 +82,7 @@ pub(super) fn bgr_to_hsv_planes(
     return scalar::Scalar::bgr_to_hsv_planes(h_out, s_out, v_out, src, width, height, stride);
   }
 
-  #[cfg(target_arch = "aarch64")]
+  #[cfg(all(target_arch = "aarch64", not(miri)))]
   {
     // SAFETY: NEON is part of the base ARMv8-A ISA — every aarch64 Rust
     // target has it. No runtime feature detection required.
@@ -85,7 +92,7 @@ pub(super) fn bgr_to_hsv_planes(
     return;
   }
 
-  #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+  #[cfg(all(target_arch = "wasm32", target_feature = "simd128", not(miri)))]
   {
     // SAFETY: simd128 target feature enabled at compile time.
     unsafe {
@@ -95,7 +102,7 @@ pub(super) fn bgr_to_hsv_planes(
   }
 
   // x86 runtime dispatch when std is available.
-  #[cfg(all(any(target_arch = "x86", target_arch = "x86_64"), feature = "std"))]
+  #[cfg(all(any(target_arch = "x86", target_arch = "x86_64"), feature = "std", not(miri)))]
   {
     if std::is_x86_feature_detected!("avx2") {
       // SAFETY: runtime-checked above.
@@ -118,6 +125,7 @@ pub(super) fn bgr_to_hsv_planes(
     any(target_arch = "x86", target_arch = "x86_64"),
     not(feature = "std"),
     target_feature = "avx2",
+    not(miri),
   ))]
   {
     // SAFETY: target feature enabled at compile time.
@@ -131,6 +139,7 @@ pub(super) fn bgr_to_hsv_planes(
     not(feature = "std"),
     target_feature = "ssse3",
     not(target_feature = "avx2"),
+    not(miri),
   ))]
   {
     // SAFETY: target feature enabled at compile time.
@@ -168,13 +177,13 @@ pub(super) fn mean_abs_diff(a: &[u8], b: &[u8], n: usize, use_simd: bool) -> f64
   }
 
   if use_simd {
-    #[cfg(target_arch = "aarch64")]
+    #[cfg(all(target_arch = "aarch64", not(miri)))]
     {
       // SAFETY: NEON is base ARMv8-A ISA.
       return unsafe { neon::mean_abs_diff(a, b, n) };
     }
 
-    #[cfg(all(any(target_arch = "x86", target_arch = "x86_64"), feature = "std"))]
+    #[cfg(all(any(target_arch = "x86", target_arch = "x86_64"), feature = "std", not(miri)))]
     {
       if std::is_x86_feature_detected!("ssse3") {
         // SAFETY: runtime-checked.
@@ -186,12 +195,13 @@ pub(super) fn mean_abs_diff(a: &[u8], b: &[u8], n: usize, use_simd: bool) -> f64
       any(target_arch = "x86", target_arch = "x86_64"),
       not(feature = "std"),
       target_feature = "ssse3",
+      not(miri),
     ))]
     {
       return unsafe { x86_ssse3::mean_abs_diff(a, b, n) };
     }
 
-    #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+    #[cfg(all(target_arch = "wasm32", target_feature = "simd128", not(miri)))]
     {
       return unsafe { wasm_simd128::mean_abs_diff(a, b, n) };
     }
@@ -215,12 +225,12 @@ pub(super) fn sobel(
   use_simd: bool,
 ) {
   if use_simd {
-    #[cfg(target_arch = "aarch64")]
+    #[cfg(all(target_arch = "aarch64", not(miri)))]
     {
       return unsafe { neon::sobel(input, mag, dir, w, h) };
     }
 
-    #[cfg(all(any(target_arch = "x86", target_arch = "x86_64"), feature = "std"))]
+    #[cfg(all(any(target_arch = "x86", target_arch = "x86_64"), feature = "std", not(miri)))]
     {
       if std::is_x86_feature_detected!("ssse3") {
         return unsafe { x86_ssse3::sobel(input, mag, dir, w, h) };
@@ -231,12 +241,13 @@ pub(super) fn sobel(
       any(target_arch = "x86", target_arch = "x86_64"),
       not(feature = "std"),
       target_feature = "ssse3",
+      not(miri),
     ))]
     {
       return unsafe { x86_ssse3::sobel(input, mag, dir, w, h) };
     }
 
-    #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+    #[cfg(all(target_arch = "wasm32", target_feature = "simd128", not(miri)))]
     {
       return unsafe { wasm_simd128::sobel(input, mag, dir, w, h) };
     }
@@ -372,7 +383,11 @@ mod scalar {
 // path untested. These tests call each backend directly so coverage includes
 // all compiled SIMD code regardless of which tier the host CPU supports.
 // ---------------------------------------------------------------------------
-#[cfg(all(test, feature = "std"))]
+// Miri: the scalar tests are fine, but the direct SIMD-call tests reference
+// modules that are gated out under `cfg(miri)`. Gate the whole test module
+// on `not(miri)` — Miri exercises the scalar paths through the detector-level
+// tests in content.rs instead.
+#[cfg(all(test, feature = "std", not(miri)))]
 mod tests {
   use super::*;
 
