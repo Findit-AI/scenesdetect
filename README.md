@@ -126,7 +126,7 @@ Apache License (Version 2.0).
 
 See [LICENSE-APACHE](LICENSE-APACHE), [LICENSE-MIT](LICENSE-MIT) for details.
 
-Copyright (c) 2026 FinDIT studio authers.
+Copyright (c) 2026 FinDIT studio authors.
 
 [Github-url]: https://github.com/al8n/scenesdetect/
 [CI-url]: https://github.com/al8n/scenesdetect/actions/workflows/ci.yml
