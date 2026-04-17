@@ -17,20 +17,30 @@ use libm::{
 };
 
 /// Histogram-based scene detector using YUV luma correlation.
+#[cfg(any(feature = "std", feature = "alloc"))]
+#[cfg_attr(docsrs, doc(cfg(any(feature = "std", feature = "alloc"))))]
 pub mod histogram;
 
 /// Perceptual hash-based scene detector using the DCT-based pHash algorithm.
+#[cfg(any(feature = "std", feature = "alloc"))]
+#[cfg_attr(docsrs, doc(cfg(any(feature = "std", feature = "alloc"))))]
 pub mod phash;
 
 /// Intensity-threshold scene detector for fade-in / fade-out transitions.
+#[cfg(any(feature = "std", feature = "alloc"))]
+#[cfg_attr(docsrs, doc(cfg(any(feature = "std", feature = "alloc"))))]
 pub mod threshold;
 
 /// Content-change scene detector using HSV-space per-frame deltas and
 /// optional Canny edge comparison.
+#[cfg(any(feature = "std", feature = "alloc"))]
+#[cfg_attr(docsrs, doc(cfg(any(feature = "std", feature = "alloc"))))]
 pub mod content;
 
 /// Rolling-average / adaptive scene detector built on top of the content
 /// detector's scores. Reduces false positives on fast camera motion.
+#[cfg(any(feature = "std", feature = "alloc"))]
+#[cfg_attr(docsrs, doc(cfg(any(feature = "std", feature = "alloc"))))]
 pub mod adaptive;
 
 /// Frame types for scene detection.

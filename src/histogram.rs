@@ -699,4 +699,70 @@ mod tests {
     let c = vec![7u32; 256];
     assert_eq!(correlation(&a, &c), 0.0); // flat but different
   }
+
+  #[test]
+  fn options_accessors_builders_setters_roundtrip() {
+    let fps30 = Timebase::new(30, nz32(1));
+
+    // Consuming builder form.
+    let opts = Options::default()
+      .with_threshold(0.42)
+      .with_bins(core::num::NonZeroUsize::new(128).unwrap())
+      .with_min_duration(core::time::Duration::from_millis(500))
+      .with_allow_initial_cut(false);
+    assert_eq!(opts.threshold(), 0.42);
+    assert_eq!(opts.bins(), 128);
+    assert_eq!(opts.min_duration(), core::time::Duration::from_millis(500));
+    assert!(!opts.allow_initial_cut());
+
+    // with_min_frames — alternate min_duration form.
+    let opts_frames = Options::default().with_min_frames(15, fps30);
+    assert_eq!(
+      opts_frames.min_duration(),
+      core::time::Duration::from_millis(500)
+    );
+
+    // In-place setters, chainable.
+    let mut opts = Options::default();
+    opts
+      .set_threshold(0.1)
+      .set_bins(core::num::NonZeroUsize::new(64).unwrap())
+      .set_min_duration(core::time::Duration::from_secs(1))
+      .set_allow_initial_cut(true);
+    assert_eq!(opts.threshold(), 0.1);
+    assert_eq!(opts.bins(), 64);
+    assert!(opts.allow_initial_cut());
+
+    opts.set_min_frames(30, fps30);
+    assert_eq!(opts.min_duration(), core::time::Duration::from_secs(1));
+  }
+
+  #[test]
+  fn detector_options_and_last_hist_diff_accessors() {
+    let opts = Options::default().with_min_duration(core::time::Duration::from_millis(0));
+    let mut det = Detector::new(opts.clone());
+    assert_eq!(det.options().threshold(), opts.threshold());
+    assert!(det.last_hist_diff().is_none());
+
+    let buf = vec![64u8; 32 * 32];
+    det.process(make_frame(&buf, 32, 32, 0));
+    det.process(make_frame(&buf, 32, 32, 33));
+    // After two frames the correlation is defined.
+    assert!(det.last_hist_diff().is_some());
+  }
+
+  #[test]
+  fn histogram_tail_three_hits_acc3_arm() {
+    // The 4-way tail handles the last (pixel_count % 4) pixels. Use a
+    // frame whose pixel count ≡ 3 (mod 4) so the match arm `_` (acc3)
+    // is exercised.
+    //
+    // 7 * 5 = 35 pixels; 35 % 4 = 3 → tail length 3 → arms 0, 1, 2 AND _.
+    let buf = vec![100u8; 35];
+    let mut det =
+      Detector::new(Options::default().with_min_duration(core::time::Duration::from_millis(0)));
+    det.process(make_frame(&buf, 7, 5, 0));
+    det.process(make_frame(&buf, 7, 5, 33));
+    assert_eq!(det.last_hist_diff(), Some(1.0));
+  }
 }

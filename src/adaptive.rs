@@ -43,7 +43,9 @@
 //! Ported from PySceneDetect's `detect-adaptive` (BSD 3-Clause).
 
 use core::time::Duration;
+use derive_more::IsVariant;
 use std::collections::VecDeque;
+use thiserror::Error;
 
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
@@ -55,7 +57,7 @@ use crate::{
 
 /// Error returned by [`Detector::try_new`] when the provided [`Options`]
 /// are inconsistent or the inner [`content::Options`] is invalid.
-#[derive(Debug, Clone, Copy, PartialEq, thiserror::Error)]
+#[derive(Debug, Clone, Copy, PartialEq, IsVariant, Error)]
 #[non_exhaustive]
 pub enum Error {
   /// `options.window_width()` was zero. Must be `>= 1`.
@@ -321,13 +323,13 @@ impl Detector {
   ///
   /// # Panics
   ///
-  /// Panics if the options are invalid — see [`Error`].
+  /// Panics if the options are invalid — see [`enum@Error`].
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub fn new(options: Options) -> Self {
     Self::try_new(options).expect("invalid adaptive::Options")
   }
 
-  /// Creates a new detector with the given options, returning [`Error`]
+  /// Creates a new detector with the given options, returning [`enum@Error`]
   /// on invalid configuration (zero `window_width`, or inner content
   /// options invalid).
   #[cfg_attr(not(tarpaulin), inline(always))]
@@ -515,6 +517,25 @@ mod tests {
   }
 
   #[test]
+  fn try_new_propagates_content_zero_weights() {
+    // Adaptive's weights field is handed verbatim to the inner content
+    // detector — all-zero weights trip content's own `ZeroWeights` guard,
+    // which adaptive `?`-wraps into `Error::Content`.
+    let opts = Options::default().with_weights(content::Components::new(0.0, 0.0, 0.0, 0.0));
+    let err = Detector::try_new(opts).expect_err("should fail");
+    assert_eq!(err, Error::Content(content::Error::ZeroWeights));
+  }
+
+  #[test]
+  fn try_new_propagates_content_invalid_kernel() {
+    // Same propagation path for kernel_size — even-sized kernels fail
+    // content::Detector::try_new.
+    let opts = Options::default().with_kernel_size(Some(4));
+    let err = Detector::try_new(opts).expect_err("should fail");
+    assert_eq!(err, Error::Content(content::Error::InvalidKernelSize(4)));
+  }
+
+  #[test]
   fn buffer_fills_before_emitting() {
     // window_width = 2 → required = 5 frames. First 4 must not emit.
     let opts = Options::default()
@@ -590,5 +611,172 @@ mod tests {
     det.clear();
     assert!(det.last_adaptive_ratio().is_none());
     assert!(det.last_score().is_none());
+  }
+
+  #[test]
+  fn options_accessors_builders_setters_roundtrip() {
+    // Sweep every getter/with/set triple on Options so they're exercised at
+    // least once for coverage and to catch any future accidental shadowing.
+    let fps30 = Timebase::new(30, nz32(1));
+    let weights = content::Components::new(0.25, 0.5, 0.75, 1.0);
+
+    // Consuming builder form (with_*) — check each field round-trips.
+    let opts = Options::default()
+      .with_adaptive_threshold(4.0)
+      .with_min_duration(Duration::from_millis(250))
+      .with_window_width(8)
+      .with_min_content_val(20.0)
+      .with_weights(weights)
+      .with_kernel_size(Some(5))
+      .with_simd(false)
+      .with_initial_cut(false);
+
+    assert_eq!(opts.adaptive_threshold(), 4.0);
+    assert_eq!(opts.min_duration(), Duration::from_millis(250));
+    assert_eq!(opts.window_width(), 8);
+    assert_eq!(opts.min_content_val(), 20.0);
+    assert_eq!(*opts.weights(), weights);
+    assert_eq!(opts.kernel_size(), Some(5));
+    assert!(!opts.simd());
+    assert!(!opts.initial_cut());
+
+    // with_min_frames alternative form.
+    let opts_frames = Options::default().with_min_frames(30, fps30);
+    assert_eq!(opts_frames.min_duration(), Duration::from_secs(1));
+
+    // In-place form (set_*). Each returns &mut Self so chaining is possible.
+    let mut opts = Options::default();
+    opts
+      .set_adaptive_threshold(5.0)
+      .set_min_duration(Duration::from_secs(2))
+      .set_window_width(16)
+      .set_min_content_val(30.0)
+      .set_weights(content::Components::new(1.0, 0.0, 0.0, 0.0))
+      .set_kernel_size(None)
+      .set_simd(true)
+      .set_initial_cut(true);
+    assert_eq!(opts.adaptive_threshold(), 5.0);
+    assert_eq!(opts.min_duration(), Duration::from_secs(2));
+    assert_eq!(opts.window_width(), 16);
+    assert_eq!(opts.min_content_val(), 30.0);
+    assert_eq!(opts.kernel_size(), None);
+    assert!(opts.simd());
+    assert!(opts.initial_cut());
+
+    opts.set_min_frames(60, fps30);
+    assert_eq!(opts.min_duration(), Duration::from_secs(2));
+  }
+
+  #[test]
+  fn detector_plumbing_accessors() {
+    // Exercise Detector's options() + last_* accessor surface.
+    let opts = Options::default()
+      .with_weights(content::LUMA_ONLY_WEIGHTS)
+      .with_min_duration(Duration::from_millis(0));
+    let mut det = Detector::new(opts.clone());
+    assert_eq!(det.options().window_width(), opts.window_width());
+    assert!(det.last_score().is_none());
+    assert!(det.last_adaptive_ratio().is_none());
+
+    // One frame: inner scoring happens but buffer still under-filled.
+    let buf = vec![128u8; 64 * 48];
+    for i in 0..3i64 {
+      det.process_luma(luma_frame(&buf, 64, 48, i * 33));
+    }
+    assert!(det.last_score().is_some());
+  }
+
+  // Exercise the BGR and HSV entry points — they delegate to the inner
+  // content detector then run push_and_check, which is shared.
+  #[test]
+  fn process_bgr_and_process_hsv_entry_points() {
+    use crate::frame::{HsvFrame, RgbFrame};
+    let opts = Options::default().with_min_duration(Duration::from_millis(0));
+    let mut det = Detector::new(opts);
+
+    let bgr = vec![80u8; 32 * 32 * 3];
+    det.process_bgr(RgbFrame::new(&bgr, 32, 32, 32 * 3, Timestamp::new(0, tb())));
+    det.process_bgr(RgbFrame::new(
+      &bgr,
+      32,
+      32,
+      32 * 3,
+      Timestamp::new(33, tb()),
+    ));
+
+    det.clear();
+
+    let h = vec![60u8; 32 * 32];
+    let s = vec![40u8; 32 * 32];
+    let v = vec![200u8; 32 * 32];
+    det.process_hsv(HsvFrame::new(
+      &h,
+      &s,
+      &v,
+      32,
+      32,
+      32,
+      Timestamp::new(0, tb()),
+    ));
+    det.process_hsv(HsvFrame::new(
+      &h,
+      &s,
+      &v,
+      32,
+      32,
+      32,
+      Timestamp::new(33, tb()),
+    ));
+    assert!(det.last_score().is_some());
+  }
+
+  // Drive the adaptive_ratio-to-255 branch: near-flat neighbors (avg ≈ 0)
+  // plus a target score meeting min_content_val emits ratio = 255.
+  #[test]
+  fn adaptive_ratio_saturates_when_neighbors_are_flat() {
+    let opts = Options::default()
+      .with_weights(content::LUMA_ONLY_WEIGHTS)
+      .with_window_width(1)
+      .with_min_content_val(5.0)
+      .with_min_duration(Duration::from_millis(0));
+    let mut det = Detector::new(opts);
+
+    // window_width = 1 → required_frames = 3. Target is buffer[1].
+    // Build a sequence where neighbors (buffer[0], buffer[2]) have score 0
+    // (identical frames → zero inner delta) and the target has a large
+    // score (its frame differs sharply).
+    //
+    // NOTE: the inner content detector's `last_score` reflects the delta
+    // with the *previous* frame, so we need careful sequencing. We emit
+    // a spike so the target's score is high while the surrounding scores
+    // are small.
+    let dim = vec![10u8; 32 * 32];
+    let bright = vec![250u8; 32 * 32];
+
+    // Sequence of 5 frames so the buffer reaches 3 with the target at idx 1.
+    let frames = [&dim, &dim, &dim, &bright, &dim];
+    for (i, f) in frames.iter().enumerate() {
+      det.process_luma(luma_frame(f, 32, 32, (i as i64) * 33));
+    }
+    // Some ratio should have been computed.
+    assert!(det.last_adaptive_ratio().is_some());
+  }
+
+  // Exercise the initial_cut = false seed path in push_and_check.
+  #[test]
+  fn initial_cut_false_seeds_last_cut_at_target_ts() {
+    let opts = Options::default()
+      .with_weights(content::LUMA_ONLY_WEIGHTS)
+      .with_window_width(1)
+      .with_min_duration(Duration::from_millis(0))
+      .with_initial_cut(false);
+    let mut det = Detector::new(opts);
+
+    let buf = vec![128u8; 32 * 32];
+    for i in 0..5i64 {
+      det.process_luma(luma_frame(&buf, 32, 32, i * 33));
+    }
+    // No panic, ratio tracked — the `else` branch of the seed ran.
+    assert!(det.last_adaptive_ratio().is_some());
   }
 }

@@ -37,6 +37,8 @@
 //! (BSD 3-Clause).
 
 use core::{f32::consts::PI, time::Duration};
+use derive_more::IsVariant;
+use thiserror::Error;
 
 use crate::frame::{LumaFrame, Timebase, Timestamp};
 
@@ -213,7 +215,7 @@ impl Options {
 
 /// Error returned by [`Detector::try_new`] when the provided [`Options`] are
 /// inconsistent.
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[derive(Debug, Clone, PartialEq, Eq, IsVariant, Error)]
 #[non_exhaustive]
 pub enum Error {
   /// `options.size() < 2`. The algorithm needs at least a `2 × 2` hash block
@@ -291,13 +293,13 @@ impl Detector {
   ///
   /// # Panics
   ///
-  /// Panics if the options are invalid — see [`Error`] for the specific
+  /// Panics if the options are invalid — see [`enum@Error`] for the specific
   /// conditions.
   pub fn new(options: Options) -> Self {
     Self::try_new(options).expect("invalid phash Options")
   }
 
-  /// Creates a new detector with the given options, returning [`Error`] if
+  /// Creates a new detector with the given options, returning [`enum@Error`] if
   /// the options are inconsistent.
   ///
   /// Validates:
@@ -1062,5 +1064,65 @@ mod tests {
     // Every odd index should be set.
     let set: u32 = det.current_hash.iter().map(|w| w.count_ones()).sum();
     assert_eq!(set as usize, size * size / 2);
+  }
+
+  #[test]
+  fn options_accessors_builders_setters_roundtrip() {
+    let fps30 = Timebase::new(30, nz32(1));
+
+    let opts = Options::default()
+      .with_threshold(0.5)
+      .with_size(32)
+      .with_lowpass(4)
+      .with_min_duration(core::time::Duration::from_millis(333))
+      .with_allow_initial_cut(false);
+    assert_eq!(opts.threshold(), 0.5);
+    assert_eq!(opts.size(), 32);
+    assert_eq!(opts.lowpass(), 4);
+    assert_eq!(opts.min_duration(), core::time::Duration::from_millis(333));
+    assert!(!opts.allow_initial_cut());
+
+    let opts_frames = Options::default().with_min_frames(15, fps30);
+    assert_eq!(
+      opts_frames.min_duration(),
+      core::time::Duration::from_millis(500)
+    );
+
+    // In-place setters, chainable.
+    let mut opts = Options::default();
+    opts
+      .set_threshold(0.1)
+      .set_size(8)
+      .set_lowpass(2)
+      .set_min_duration(core::time::Duration::from_secs(1))
+      .set_allow_initial_cut(true);
+    assert_eq!(opts.threshold(), 0.1);
+    assert_eq!(opts.size(), 8);
+    assert_eq!(opts.lowpass(), 2);
+    assert!(opts.allow_initial_cut());
+
+    opts.set_min_frames(30, fps30);
+    assert_eq!(opts.min_duration(), core::time::Duration::from_secs(1));
+  }
+
+  #[test]
+  fn try_new_rejects_imsize_squared_overflow() {
+    // imsize = size * lowpass = 100_000 * 100_000 = 1e10 fits in usize on
+    // 64-bit. imsize^2 = 1e20 > usize::MAX (≈1.8e19) → DimensionsOverflow.
+    let opts = Options::default().with_size(100_000).with_lowpass(100_000);
+    let err = Detector::try_new(opts).expect_err("imsize*imsize should overflow");
+    assert_eq!(
+      err,
+      Error::DimensionsOverflow {
+        size: 100_000,
+        lowpass: 100_000,
+      },
+    );
+  }
+
+  #[test]
+  fn median_f32_singleton() {
+    let mut buf = [42.0f32];
+    assert_eq!(super::median_f32(&mut buf), 42.0);
   }
 }

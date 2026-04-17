@@ -69,13 +69,16 @@ use core::time::Duration;
 
 use crate::frame::{LumaFrame, RgbFrame, TimeRange, Timebase, Timestamp};
 
+use derive_more::{Display, IsVariant};
+
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
 
 /// Which direction of threshold crossing counts as a fade.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash, IsVariant, Display)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
+#[display("{}", self.as_str())]
 #[non_exhaustive]
 pub enum Method {
   /// Fade detected when mean pixel intensity **falls below** `threshold`.
@@ -85,6 +88,17 @@ pub enum Method {
   /// Fade detected when mean pixel intensity **rises above** `threshold`
   /// (fade to white, or overexposure detection).
   Ceiling,
+}
+
+impl Method {
+  /// Returns a human-friendly name for this method variant.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn as_str(&self) -> &'static str {
+    match self {
+      Method::Floor => "floor",
+      Method::Ceiling => "ceiling",
+    }
+  }
 }
 
 /// Options for the intensity-threshold scene detector. See the
@@ -1004,5 +1018,85 @@ mod tests {
     let cut_r = det_r.process_rgb(rgb(&rgb_bright, 8, 8, 400));
 
     assert_eq!(cut_l.map(|t| t.pts()), cut_r.map(|t| t.pts()));
+  }
+
+  #[test]
+  fn method_as_str_all_variants() {
+    assert_eq!(Method::Floor.as_str(), "floor");
+    assert_eq!(Method::Ceiling.as_str(), "ceiling");
+  }
+
+  #[test]
+  fn options_accessors_builders_setters_roundtrip() {
+    let fps30 = Timebase::new(30, nz32(1));
+
+    // Consuming builder form — each field round-trips.
+    let opts = Options::default()
+      .with_threshold(50)
+      .with_method(Method::Ceiling)
+      .with_fade_bias(0.25)
+      .with_add_final_scene(true)
+      .with_min_duration(Duration::from_millis(750))
+      .with_initial_cut(false);
+    assert_eq!(opts.threshold(), 50);
+    assert_eq!(opts.method(), Method::Ceiling);
+    assert_eq!(opts.fade_bias(), 0.25);
+    assert!(opts.add_final_scene());
+    assert_eq!(opts.min_duration(), Duration::from_millis(750));
+    assert!(!opts.initial_cut());
+
+    // with_min_frames alternate.
+    let opts_frames = Options::default().with_min_frames(15, fps30);
+    assert_eq!(opts_frames.min_duration(), Duration::from_millis(500));
+
+    // In-place setters, chainable.
+    let mut opts = Options::default();
+    opts
+      .set_threshold(100)
+      .set_method(Method::Floor)
+      .set_fade_bias(-0.5)
+      .set_add_final_scene(true)
+      .set_min_duration(Duration::from_secs(2))
+      .set_initial_cut(true);
+    assert_eq!(opts.threshold(), 100);
+    assert_eq!(opts.method(), Method::Floor);
+    assert_eq!(opts.fade_bias(), -0.5);
+    assert!(opts.add_final_scene());
+    assert!(opts.initial_cut());
+
+    opts.set_min_frames(60, fps30);
+    assert_eq!(opts.min_duration(), Duration::from_secs(2));
+  }
+
+  #[test]
+  fn detector_options_accessor() {
+    let opts = Options::default().with_threshold(77);
+    let det = Detector::new(opts);
+    assert_eq!(det.options().threshold(), 77);
+  }
+
+  #[test]
+  fn initial_cut_false_seeds_last_cut_at_ts() {
+    // With `initial_cut = false`, the first frame should seed
+    // `last_scene_cut` to the frame's own ts (not ts - min_duration), so
+    // the first complete fade-in-from-out transition that happens within
+    // min_duration of the first frame is suppressed. This exercises the
+    // `else` branch of the seed in process_with_mean.
+    let opts = Options::default()
+      .with_min_duration(Duration::from_millis(200))
+      .with_initial_cut(false);
+    let mut det = Detector::new(opts);
+    let bright = uniform_luma(200, 0);
+    let dark = uniform_luma(5, 0);
+
+    // A full fade cycle compressed into 200 ms — the emitted cut's placed
+    // midpoint is too close to the seeded ts=0 anchor → gate fails.
+    det.process_luma(luma(&bright, 8, 8, 0));
+    det.process_luma(luma(&dark, 8, 8, 50));
+    let cut = det.process_luma(luma(&bright, 8, 8, 150));
+    assert!(
+      cut.is_none(),
+      "cut should be suppressed with initial_cut=false"
+    );
   }
 }

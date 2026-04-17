@@ -42,7 +42,10 @@ std = ["thiserror/default"]
 serde = ["dep:serde", "dep:humantime-serde"]
 
 [dependencies]
+derive_more = { version = "2", default-features = false, features = ["is_variant", "display"] }
 thiserror = { version = "2", default-features = false }
+
+mediatime = { version = "0.1", default-features = false }
 
 libm = { version = "0.2", optional = true, default-features = false }
 
