@@ -116,7 +116,7 @@ jobs:
         with:
           files: reports/coverage-macos-aarch64/cobertura.xml
           flags: macos-aarch64
-          fail_ci_if_error: false
+          fail_ci_if_error: true
         env:
           CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
 
@@ -126,7 +126,7 @@ jobs:
         with:
           files: reports/coverage-linux-x86_64/cobertura.xml
           flags: linux-x86_64
-          fail_ci_if_error: false
+          fail_ci_if_error: true
         env:
           CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
 
@@ -136,6 +136,6 @@ jobs:
         with:
           files: reports/coverage-windows-x86_64/cobertura.xml
           flags: windows-x86_64
-          fail_ci_if_error: false
+          fail_ci_if_error: true
         env:
           CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}

@@ -1397,11 +1397,17 @@ mod tests {
       }
     }
 
+    // V = max(B,G,R) — identical in SIMD and scalar, so exact match.
     assert_eq!(v_simd, v_ref, "V plane diverges");
-    assert_eq!(s_simd, s_ref, "S plane diverges");
-    // Hue can differ by 1 at rounding boundaries (SIMD round_int uses
-    // banker's rounding, scalar `.round()` rounds half-away-from-zero);
-    // we accept ±1 mismatches but bound the per-lane difference.
+    // H and S involve division / rounding. The x86 SSSE3/AVX2 SIMD paths
+    // use fixed-point integer approximations (multiply + shift) that can
+    // differ by ±1 LSB from the scalar f32 path. NEON on aarch64 happens
+    // to match exactly, but we allow ±1 everywhere so the test is
+    // portable across all SIMD backends.
+    for (i, (&a, &b)) in s_simd.iter().zip(s_ref.iter()).enumerate() {
+      let diff = (a as i16 - b as i16).abs();
+      assert!(diff <= 1, "S diverges at index {i}: simd={a} scalar={b}");
+    }
     for (i, (&a, &b)) in h_simd.iter().zip(h_ref.iter()).enumerate() {
       let diff = (a as i16 - b as i16).abs();
       assert!(diff <= 1, "H diverges at index {i}: simd={a} scalar={b}");
