@@ -508,7 +508,7 @@ pub enum LumaFrameError {
   },
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "std"))]
 mod tests {
   use super::*;
   use core::num::NonZeroU32;

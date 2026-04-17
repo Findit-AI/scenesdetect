@@ -513,7 +513,7 @@ fn correlation(a: &[u32], b: &[u32]) -> f64 {
   num / super::sqrt_64(var_a * var_b)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "std"))]
 mod tests {
   use super::*;
   use crate::frame::Timebase;
@@ -732,13 +732,13 @@ mod tests {
   }
 
   #[test]
-  #[test]
   fn try_new_rejects_overflowing_bin_count() {
     let opts = Options::default().with_bins(NonZeroUsize::new(usize::MAX).unwrap());
     let err = Detector::try_new(opts).expect_err("should fail");
     assert_eq!(err, Error::BinCountTooLarge { bins: usize::MAX });
   }
 
+  #[test]
   fn options_accessors_builders_setters_roundtrip() {
     let fps30 = Timebase::new(30, nz32(1));
 

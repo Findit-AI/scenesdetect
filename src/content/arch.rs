@@ -361,7 +361,7 @@ mod scalar {
 // path untested. These tests call each backend directly so coverage includes
 // all compiled SIMD code regardless of which tier the host CPU supports.
 // ---------------------------------------------------------------------------
-#[cfg(test)]
+#[cfg(all(test, feature = "std"))]
 mod tests {
   use super::*;
 

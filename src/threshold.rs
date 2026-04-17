@@ -572,7 +572,7 @@ fn interpolate_cut(f_out: Timestamp, f_in: Timestamp, bias: f64) -> Timestamp {
   Timestamp::new(f_out.pts() + offset, f_out.timebase())
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "std"))]
 mod tests {
   use super::*;
   use core::num::NonZeroU32;

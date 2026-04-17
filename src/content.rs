@@ -1241,7 +1241,7 @@ fn window_max_column(src: &[u8], lo: usize, hi: usize, x: usize, w: usize) -> u8
   m
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "std"))]
 mod tests {
   use super::{arch::bgr_to_hsv_pixel, *};
   use core::num::NonZeroU32;

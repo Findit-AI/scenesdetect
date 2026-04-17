@@ -738,7 +738,7 @@ fn hamming_distance(a: &[u64], b: &[u64]) -> u32 {
     .sum()
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "std"))]
 mod tests {
   use super::*;
   use crate::frame::Timebase;
