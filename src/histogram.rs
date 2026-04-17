@@ -72,12 +72,29 @@
 
 use core::{num::NonZeroUsize, time::Duration};
 
+use derive_more::IsVariant;
+use thiserror::Error;
+
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
 
 use crate::frame::{LumaFrame, Timebase, Timestamp};
 
 use std::{vec, vec::Vec};
+
+/// Error returned by [`Detector::try_new`] when the provided [`Options`]
+/// are inconsistent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, IsVariant, Error)]
+#[non_exhaustive]
+pub enum Error {
+  /// `N_ACCUM * bins` overflows `usize`. The bin count is too large for the
+  /// multi-accumulator scratch buffer.
+  #[error("histogram bin count ({bins}) is too large (N_ACCUM * bins overflows usize)")]
+  BinCountTooLarge {
+    /// The requested bin count that caused the overflow.
+    bins: usize,
+  },
+}
 
 /// Options for the histogram-based scene detector. See the [module docs]
 /// for how each parameter shapes the algorithm.
@@ -281,24 +298,38 @@ pub struct Detector {
 impl Detector {
   /// Creates a new `Detector` instance with the given options.
   ///
+  /// # Panics
+  ///
+  /// Panics if the options are invalid — see [`enum@Error`].
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub fn new(options: Options) -> Self {
+    Self::try_new(options).expect("invalid histogram::Options")
+  }
+
+  /// Creates a new `Detector` instance, returning [`enum@Error`] if the
+  /// options are invalid.
+  ///
   /// Builds the pixel → bin lookup table and pre-allocates the multi-accumulator
   /// scratch (`4 * bins` × `u32`) plus the two reduced histograms.
   #[cfg_attr(not(tarpaulin), inline(always))]
-  pub fn new(options: Options) -> Self {
+  pub fn try_new(options: Options) -> Result<Self, Error> {
     let bins = options.bins.get();
+    let scratch_len = N_ACCUM
+      .checked_mul(bins)
+      .ok_or(Error::BinCountTooLarge { bins })?;
     let corr_threshold = (1.0 - options.threshold).clamp(0.0, 1.0);
     let bin_of = build_bin_lookup(bins);
-    Self {
+    Ok(Self {
       options,
       corr_threshold,
       bin_of,
-      scratch: vec![0u32; N_ACCUM * bins],
+      scratch: vec![0u32; scratch_len],
       current: vec![0u32; bins],
       previous: vec![0u32; bins],
       has_previous: false,
       last_cut_ts: None,
       last_hist_diff: None,
-    }
+    })
   }
 
   /// Returns a reference to the options used by this detector.
@@ -701,6 +732,13 @@ mod tests {
   }
 
   #[test]
+  #[test]
+  fn try_new_rejects_overflowing_bin_count() {
+    let opts = Options::default().with_bins(NonZeroUsize::new(usize::MAX).unwrap());
+    let err = Detector::try_new(opts).expect_err("should fail");
+    assert_eq!(err, Error::BinCountTooLarge { bins: usize::MAX });
+  }
+
   fn options_accessors_builders_setters_roundtrip() {
     let fps30 = Timebase::new(30, nz32(1));
 
