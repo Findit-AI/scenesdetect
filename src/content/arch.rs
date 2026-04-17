@@ -102,7 +102,11 @@ pub(super) fn bgr_to_hsv_planes(
   }
 
   // x86 runtime dispatch when std is available.
-  #[cfg(all(any(target_arch = "x86", target_arch = "x86_64"), feature = "std", not(miri)))]
+  #[cfg(all(
+    any(target_arch = "x86", target_arch = "x86_64"),
+    feature = "std",
+    not(miri)
+  ))]
   {
     if std::is_x86_feature_detected!("avx2") {
       // SAFETY: runtime-checked above.
@@ -183,7 +187,11 @@ pub(super) fn mean_abs_diff(a: &[u8], b: &[u8], n: usize, use_simd: bool) -> f64
       return unsafe { neon::mean_abs_diff(a, b, n) };
     }
 
-    #[cfg(all(any(target_arch = "x86", target_arch = "x86_64"), feature = "std", not(miri)))]
+    #[cfg(all(
+      any(target_arch = "x86", target_arch = "x86_64"),
+      feature = "std",
+      not(miri)
+    ))]
     {
       if std::is_x86_feature_detected!("ssse3") {
         // SAFETY: runtime-checked.
@@ -230,7 +238,11 @@ pub(super) fn sobel(
       return unsafe { neon::sobel(input, mag, dir, w, h) };
     }
 
-    #[cfg(all(any(target_arch = "x86", target_arch = "x86_64"), feature = "std", not(miri)))]
+    #[cfg(all(
+      any(target_arch = "x86", target_arch = "x86_64"),
+      feature = "std",
+      not(miri)
+    ))]
     {
       if std::is_x86_feature_detected!("ssse3") {
         return unsafe { x86_ssse3::sobel(input, mag, dir, w, h) };

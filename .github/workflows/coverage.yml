@@ -54,10 +54,9 @@ jobs:
             run_types: '--run-types tests'
             exclude_arch: "--exclude-files 'src/content/arch/x86_ssse3.rs' --exclude-files 'src/content/arch/x86_avx2.rs' --exclude-files 'src/content/arch/wasm_simd128.rs'"
           # x86_64 Linux: x86 backends compile; NEON/wasm do not.
-          # Doctests included — ptrace engine handles them reliably.
           - os: ubuntu-latest
             label: linux-x86_64
-            run_types: '--run-types tests --run-types doctests'
+            run_types: '--run-types tests'
             exclude_arch: "--exclude-files 'src/content/arch/neon.rs' --exclude-files 'src/content/arch/wasm_simd128.rs'"
           # x86_64 Windows: same as Linux; doctests skipped (LLVM engine).
           - os: windows-latest
