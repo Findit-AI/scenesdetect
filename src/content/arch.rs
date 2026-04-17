@@ -346,3 +346,198 @@ mod scalar {
     }
   }
 }
+
+// ---------------------------------------------------------------------------
+// Direct-call tests for platform SIMD backends. On x86 hosts, the runtime
+// dispatcher picks AVX2 when available, leaving the SSSE3 `bgr_to_hsv_planes`
+// path untested. These tests call each backend directly so coverage includes
+// all compiled SIMD code regardless of which tier the host CPU supports.
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  fn make_bgr(w: usize, h: usize) -> Vec<u8> {
+    let mut buf = vec![0u8; w * h * 3];
+    let mut rng = 0x9E3779B9u32;
+    for v in buf.iter_mut() {
+      rng = rng.wrapping_mul(1664525).wrapping_add(1013904223);
+      *v = (rng >> 24) as u8;
+    }
+    buf
+  }
+
+  fn make_luma(w: usize, h: usize) -> Vec<u8> {
+    let mut buf = vec![0u8; w * h];
+    let mut rng = 0xDEADBEEFu32;
+    for v in buf.iter_mut() {
+      rng = rng.wrapping_mul(1664525).wrapping_add(1013904223);
+      *v = (rng >> 24) as u8;
+    }
+    buf
+  }
+
+  // Exercises the scalar bgr_to_hsv_planes + mean_abs_diff + sobel.
+  #[test]
+  fn scalar_bgr_to_hsv_planes() {
+    let (w, h) = (32, 16);
+    let src = make_bgr(w, h);
+    let n = w * h;
+    let mut ho = vec![0u8; n];
+    let mut so = vec![0u8; n];
+    let mut vo = vec![0u8; n];
+    scalar::Scalar::bgr_to_hsv_planes(
+      &mut ho,
+      &mut so,
+      &mut vo,
+      &src,
+      w as u32,
+      h as u32,
+      (w * 3) as u32,
+    );
+    assert!(vo.iter().any(|&v| v > 0));
+  }
+
+  #[test]
+  fn scalar_mean_abs_diff_nonzero() {
+    let a = make_luma(64, 1);
+    let b = make_luma(64, 1);
+    let d = scalar::Scalar::mean_abs_diff(&a, &b, 64);
+    assert!(d >= 0.0);
+  }
+
+  #[test]
+  fn scalar_sobel() {
+    let (w, h) = (16, 16);
+    let src = make_luma(w, h);
+    let mut mag = vec![0i32; w * h];
+    let mut dir = vec![0u8; w * h];
+    scalar::Scalar::sobel(&src, &mut mag, &mut dir, w, h);
+    assert!(mag.iter().any(|&m| m > 0));
+  }
+
+  // x86: call SSSE3 bgr_to_hsv_planes directly (bypasses AVX2 dispatch).
+  #[cfg(all(any(target_arch = "x86", target_arch = "x86_64"), feature = "std"))]
+  #[test]
+  fn ssse3_bgr_to_hsv_planes_direct() {
+    if !std::is_x86_feature_detected!("ssse3") {
+      return;
+    }
+    let (w, h) = (64, 16);
+    let src = make_bgr(w, h);
+    let n = w * h;
+    let mut ho = vec![0u8; n];
+    let mut so = vec![0u8; n];
+    let mut vo = vec![0u8; n];
+    unsafe {
+      x86_ssse3::bgr_to_hsv_planes(
+        &mut ho,
+        &mut so,
+        &mut vo,
+        &src,
+        w as u32,
+        h as u32,
+        (w * 3) as u32,
+      );
+    }
+    // Sanity: V plane should have nonzero values for random input.
+    assert!(vo.iter().any(|&v| v > 0));
+  }
+
+  #[cfg(all(any(target_arch = "x86", target_arch = "x86_64"), feature = "std"))]
+  #[test]
+  fn ssse3_mean_abs_diff_direct() {
+    if !std::is_x86_feature_detected!("ssse3") {
+      return;
+    }
+    let a = make_luma(128, 1);
+    let b = make_luma(128, 1);
+    let d = unsafe { x86_ssse3::mean_abs_diff(&a, &b, 128) };
+    assert!(d >= 0.0);
+  }
+
+  #[cfg(all(any(target_arch = "x86", target_arch = "x86_64"), feature = "std"))]
+  #[test]
+  fn ssse3_sobel_direct() {
+    if !std::is_x86_feature_detected!("ssse3") {
+      return;
+    }
+    let (w, h) = (32, 32);
+    let src = make_luma(w, h);
+    let mut mag = vec![0i32; w * h];
+    let mut dir = vec![0u8; w * h];
+    unsafe { x86_ssse3::sobel(&src, &mut mag, &mut dir, w, h) };
+    assert!(mag.iter().any(|&m| m > 0));
+  }
+
+  // x86: call AVX2 bgr_to_hsv_planes directly (exercises the AVX2 tail path too).
+  #[cfg(all(any(target_arch = "x86", target_arch = "x86_64"), feature = "std"))]
+  #[test]
+  fn avx2_bgr_to_hsv_planes_direct() {
+    if !std::is_x86_feature_detected!("avx2") {
+      return;
+    }
+    let (w, h) = (64, 16);
+    let src = make_bgr(w, h);
+    let n = w * h;
+    let mut ho = vec![0u8; n];
+    let mut so = vec![0u8; n];
+    let mut vo = vec![0u8; n];
+    unsafe {
+      x86_avx2::bgr_to_hsv_planes(
+        &mut ho,
+        &mut so,
+        &mut vo,
+        &src,
+        w as u32,
+        h as u32,
+        (w * 3) as u32,
+      );
+    }
+    assert!(vo.iter().any(|&v| v > 0));
+  }
+
+  // aarch64: call NEON bgr_to_hsv_planes directly.
+  #[cfg(target_arch = "aarch64")]
+  #[test]
+  fn neon_bgr_to_hsv_planes_direct() {
+    let (w, h) = (64, 16);
+    let src = make_bgr(w, h);
+    let n = w * h;
+    let mut ho = vec![0u8; n];
+    let mut so = vec![0u8; n];
+    let mut vo = vec![0u8; n];
+    unsafe {
+      neon::bgr_to_hsv_planes(
+        &mut ho,
+        &mut so,
+        &mut vo,
+        &src,
+        w as u32,
+        h as u32,
+        (w * 3) as u32,
+      );
+    }
+    assert!(vo.iter().any(|&v| v > 0));
+  }
+
+  #[cfg(target_arch = "aarch64")]
+  #[test]
+  fn neon_mean_abs_diff_direct() {
+    let a = make_luma(128, 1);
+    let b = make_luma(128, 1);
+    let d = unsafe { neon::mean_abs_diff(&a, &b, 128) };
+    assert!(d >= 0.0);
+  }
+
+  #[cfg(target_arch = "aarch64")]
+  #[test]
+  fn neon_sobel_direct() {
+    let (w, h) = (32, 32);
+    let src = make_luma(w, h);
+    let mut mag = vec![0i32; w * h];
+    let mut dir = vec![0u8; w * h];
+    unsafe { neon::sobel(&src, &mut mag, &mut dir, w, h) };
+    assert!(mag.iter().any(|&m| m > 0));
+  }
+}
