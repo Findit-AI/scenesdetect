@@ -278,7 +278,16 @@ pub(super) unsafe fn mean_abs_diff(a: &[u8], b: &[u8], n: usize) -> f64 {
   // Horizontal reduce u64x2 → u64.
   let hi = unsafe { _mm_srli_si128::<8>(acc) };
   let total = unsafe { _mm_add_epi64(acc, hi) };
+  // `_mm_cvtsi128_si64` is x86_64-only (no 64-bit GPRs on i686).
+  // Fall back to a memory round-trip on 32-bit.
+  #[cfg(target_arch = "x86_64")]
   let mut sum: u64 = unsafe { _mm_cvtsi128_si64(total) as u64 };
+  #[cfg(target_arch = "x86")]
+  let mut sum: u64 = {
+    let mut tmp = 0u64;
+    unsafe { _mm_storel_epi64(&mut tmp as *mut u64 as *mut __m128i, total) };
+    tmp
+  };
 
   // Scalar tail.
   while i < n {
