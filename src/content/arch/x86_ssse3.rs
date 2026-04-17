@@ -119,10 +119,14 @@ pub(super) unsafe fn bgr_to_hsv_planes(
           let gf = unsafe { _mm_cvtepi32_ps(gu) };
           let rf = unsafe { _mm_cvtepi32_ps(ru) };
           let (hue, sat, val) = unsafe { bgr_to_hsv_f32x4(bf, gf, rf) };
+          // Use add-0.5 + truncate (round half-up for non-negative values)
+          // to match the scalar `round()` semantics instead of MXCSR's
+          // default round-to-nearest-even via `_mm_cvtps_epi32`.
+          let half = unsafe { _mm_set1_ps(0.5) };
           let hh = unsafe { _mm_mul_ps(hue, _mm_set1_ps(0.5)) };
-          let h_u32 = unsafe { clamp_i32_max(_mm_cvtps_epi32(hh), 179) };
-          let s_u32 = unsafe { clamp_i32_max(_mm_cvtps_epi32(sat), 255) };
-          let v_u32 = unsafe { clamp_i32_max(_mm_cvtps_epi32(val), 255) };
+          let h_u32 = unsafe { clamp_i32_max(_mm_cvttps_epi32(_mm_add_ps(hh, half)), 179) };
+          let s_u32 = unsafe { clamp_i32_max(_mm_cvttps_epi32(_mm_add_ps(sat, half)), 255) };
+          let v_u32 = unsafe { clamp_i32_max(_mm_cvttps_epi32(_mm_add_ps(val, half)), 255) };
           (h_u32, s_u32, v_u32)
         }};
       }

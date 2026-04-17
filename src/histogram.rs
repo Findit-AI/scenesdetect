@@ -802,12 +802,13 @@ mod tests {
   }
 
   #[test]
-  fn histogram_tail_three_hits_acc3_arm() {
-    // The 4-way tail handles the last (pixel_count % 4) pixels. Use a
-    // frame whose pixel count ≡ 3 (mod 4) so the match arm `_` (acc3)
-    // is exercised.
+  fn histogram_tail_three_exercises_three_remainder_pixels() {
+    // The 4-way tail handles the last (pixel_count % 4) pixels via a
+    // `match i { 0 => acc0, 1 => acc1, 2 => acc2, _ => acc3 }` dispatch.
+    // With `chunks_exact(4)`, the remainder length is at most 3, so the
+    // `_` (acc3) arm is unreachable — only arms 0, 1, 2 can fire.
     //
-    // 7 * 5 = 35 pixels; 35 % 4 = 3 → tail length 3 → arms 0, 1, 2 AND _.
+    // 7 * 5 = 35 pixels; 35 % 4 = 3 → tail length 3 → arms 0, 1, 2.
     let buf = vec![100u8; 35];
     let mut det =
       Detector::new(Options::default().with_min_duration(core::time::Duration::from_millis(0)));

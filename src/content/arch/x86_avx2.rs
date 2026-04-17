@@ -112,13 +112,19 @@ pub(super) unsafe fn bgr_to_hsv_planes(
       let (hue_hi, sat_hi, val_hi) = unsafe { bgr_to_hsv_f32x8(b_hi, g_hi, r_hi) };
 
       // Hue/2 → i32, clamp [0, 179]; S, V → i32, clamp [0, 255].
+      // Use add-0.5 + truncate (round half-up for non-negative values) to
+      // match the scalar `round()` semantics instead of MXCSR's default
+      // round-to-nearest-even via `_mm256_cvtps_epi32`.
       let half = unsafe { _mm256_set1_ps(0.5) };
-      let hh_lo_i = unsafe { _mm256_cvtps_epi32(_mm256_mul_ps(hue_lo, half)) };
-      let hh_hi_i = unsafe { _mm256_cvtps_epi32(_mm256_mul_ps(hue_hi, half)) };
-      let ss_lo_i = unsafe { _mm256_cvtps_epi32(sat_lo) };
-      let ss_hi_i = unsafe { _mm256_cvtps_epi32(sat_hi) };
-      let vv_lo_i = unsafe { _mm256_cvtps_epi32(val_lo) };
-      let vv_hi_i = unsafe { _mm256_cvtps_epi32(val_hi) };
+      let round_half = half; // reuse for the add-then-truncate pattern
+      let hh_lo_i =
+        unsafe { _mm256_cvttps_epi32(_mm256_add_ps(_mm256_mul_ps(hue_lo, half), round_half)) };
+      let hh_hi_i =
+        unsafe { _mm256_cvttps_epi32(_mm256_add_ps(_mm256_mul_ps(hue_hi, half), round_half)) };
+      let ss_lo_i = unsafe { _mm256_cvttps_epi32(_mm256_add_ps(sat_lo, round_half)) };
+      let ss_hi_i = unsafe { _mm256_cvttps_epi32(_mm256_add_ps(sat_hi, round_half)) };
+      let vv_lo_i = unsafe { _mm256_cvttps_epi32(_mm256_add_ps(val_lo, round_half)) };
+      let vv_hi_i = unsafe { _mm256_cvttps_epi32(_mm256_add_ps(val_hi, round_half)) };
 
       let h_lo = unsafe { _mm256_min_epi32(hh_lo_i, _mm256_set1_epi32(179)) };
       let h_hi = unsafe { _mm256_min_epi32(hh_hi_i, _mm256_set1_epi32(179)) };
