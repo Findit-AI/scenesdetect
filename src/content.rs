@@ -63,8 +63,7 @@ use std::vec::Vec;
 
 use super::{round_64, sqrt_64};
 
-mod arch;
-use arch::{bgr_to_hsv_planes, mean_abs_diff, sobel};
+use crate::arch::{bgr_to_hsv_planes, mean_abs_diff, sobel};
 
 /// Default weights for the four score components. Matches PySceneDetect's
 /// `DEFAULT_COMPONENT_WEIGHTS`: hue, saturation, and luma equally weighted;
@@ -1243,7 +1242,8 @@ fn window_max_column(src: &[u8], lo: usize, hi: usize, x: usize, w: usize) -> u8
 
 #[cfg(all(test, feature = "std"))]
 mod tests {
-  use super::{arch::bgr_to_hsv_pixel, *};
+  use super::*;
+  use crate::arch::bgr_to_hsv_pixel;
   use core::num::NonZeroU32;
   use std::vec;
 

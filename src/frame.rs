@@ -14,6 +14,14 @@ use thiserror::Error;
 
 pub use mediatime::{TimeRange, Timebase, Timestamp};
 
+/// Color-space conversions for the frame types in this module.
+///
+/// Backed by the crate's SIMD kernels (NEON / SSSE3 / AVX2 / wasm-simd128)
+/// with a scalar fallback, runtime-dispatched on x86 when `std` is enabled.
+#[cfg(any(feature = "std", feature = "alloc"))]
+#[cfg_attr(docsrs, doc(cfg(any(feature = "std", feature = "alloc"))))]
+pub mod convert;
+
 /// A frame containing YUV luma (Y-plane) data, along with its dimensions and
 /// presentation timestamp.
 ///

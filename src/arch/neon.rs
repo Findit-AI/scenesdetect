@@ -335,3 +335,337 @@ pub(super) unsafe fn sobel(input: &[u8], mag: &mut [i32], dir: &mut [u8], w: usi
     }
   }
 }
+
+/// NEON BGR → BT.601 luma: `Y = (77·R + 150·G + 29·B) >> 8`.
+/// Processes 16 pixels per iteration via `vld3q_u8` deinterleave + two
+/// u8-to-u16 multiply-accumulate chains (one per 8-lane half), then
+/// right-shift-narrow back to u8. Tail handled scalar.
+///
+/// Coefficients sum to exactly 256, so the u16 accumulator stays in
+/// `[0, 65280]` with no saturation risk.
+///
+/// # Safety
+///
+/// Caller must ensure NEON is available (always true on aarch64).
+#[target_feature(enable = "neon")]
+#[allow(unused_unsafe)]
+pub(super) unsafe fn bgr_to_luma(
+  out: &mut [u8],
+  src: &[u8],
+  width: u32,
+  height: u32,
+  stride: u32,
+) {
+  const LANES: usize = 16;
+  let w = width as usize;
+  let h = height as usize;
+  let s = stride as usize;
+  let whole = w / LANES * LANES;
+
+  // Splat the BT.601 coefficients once; same values for every row.
+  let k_b = unsafe { vdup_n_u8(29) };
+  let k_g = unsafe { vdup_n_u8(150) };
+  let k_r = unsafe { vdup_n_u8(77) };
+
+  for y in 0..h {
+    let row_base = y * s;
+    let dst_off = y * w;
+
+    let mut x = 0;
+    while x < whole {
+      // Load and deinterleave 16 packed BGR pixels.
+      let bgr = unsafe { vld3q_u8(src.as_ptr().add(row_base + x * 3)) };
+      let b = bgr.0;
+      let g = bgr.1;
+      let r = bgr.2;
+
+      // Low 8 lanes: acc_lo = 29·B + 150·G + 77·R, widening u8×u8→u16.
+      let mut acc_lo = unsafe { vmull_u8(vget_low_u8(b), k_b) };
+      acc_lo = unsafe { vmlal_u8(acc_lo, vget_low_u8(g), k_g) };
+      acc_lo = unsafe { vmlal_u8(acc_lo, vget_low_u8(r), k_r) };
+
+      // High 8 lanes.
+      let mut acc_hi = unsafe { vmull_u8(vget_high_u8(b), k_b) };
+      acc_hi = unsafe { vmlal_u8(acc_hi, vget_high_u8(g), k_g) };
+      acc_hi = unsafe { vmlal_u8(acc_hi, vget_high_u8(r), k_r) };
+
+      // Shift right by 8 (divide by 256) and narrow to u8.
+      let y_lo = unsafe { vshrn_n_u16::<8>(acc_lo) };
+      let y_hi = unsafe { vshrn_n_u16::<8>(acc_hi) };
+
+      // Combine halves and store.
+      let y_u8 = unsafe { vcombine_u8(y_lo, y_hi) };
+      unsafe {
+        vst1q_u8(out.as_mut_ptr().add(dst_off + x), y_u8);
+      }
+
+      x += LANES;
+    }
+
+    // Scalar tail.
+    while x < w {
+      let b = src[row_base + x * 3] as u32;
+      let g = src[row_base + x * 3 + 1] as u32;
+      let r = src[row_base + x * 3 + 2] as u32;
+      out[dst_off + x] = ((77 * r + 150 * g + 29 * b) >> 8) as u8;
+      x += 1;
+    }
+  }
+}
+
+/// NEON clipping-pixel count. 16 pixels per iteration via `vld3q_u8`
+/// deinterleave; per-pixel `max(B, G, R)` via two `vmaxq_u8` calls;
+/// two lane-wise compares (`vcltq_u8` and `vcgtq_u8`) OR'd together to
+/// form a 0/0xFF mask per pixel. The mask is right-shifted by 7 to
+/// 0/1 and horizontally reduced with `vaddvq_u8` (max sum per
+/// iteration is 16, fits comfortably in u8). Tail handled scalar.
+///
+/// # Safety
+///
+/// Caller must ensure NEON is available (always true on aarch64).
+#[target_feature(enable = "neon")]
+#[allow(unused_unsafe)]
+pub(super) unsafe fn clipping_count(
+  src: &[u8],
+  width: u32,
+  height: u32,
+  stride: u32,
+) -> u64 {
+  const LANES: usize = 16;
+  let w = width as usize;
+  let h = height as usize;
+  let s = stride as usize;
+  let whole = w / LANES * LANES;
+
+  // Thresholds splatted once.
+  let lo = unsafe { vdupq_n_u8(5) };
+  let hi = unsafe { vdupq_n_u8(250) };
+
+  let mut count: u64 = 0;
+  for y in 0..h {
+    let row_base = y * s;
+
+    let mut x = 0;
+    while x < whole {
+      let bgr = unsafe { vld3q_u8(src.as_ptr().add(row_base + x * 3)) };
+      let max = unsafe { vmaxq_u8(bgr.0, vmaxq_u8(bgr.1, bgr.2)) };
+      let is_low = unsafe { vcltq_u8(max, lo) };
+      let is_high = unsafe { vcgtq_u8(max, hi) };
+      let mask = unsafe { vorrq_u8(is_low, is_high) };
+      // Lane is either 0 or 0xFF → shift to 0 or 1, then sum.
+      let zeroed = unsafe { vshrq_n_u8::<7>(mask) };
+      count += unsafe { vaddvq_u8(zeroed) } as u64;
+      x += LANES;
+    }
+
+    // Scalar tail.
+    while x < w {
+      let b = src[row_base + x * 3];
+      let g = src[row_base + x * 3 + 1];
+      let r = src[row_base + x * 3 + 2];
+      let m = b.max(g).max(r);
+      if !(5..=250).contains(&m) {
+        count += 1;
+      }
+      x += 1;
+    }
+  }
+
+  count
+}
+
+/// NEON Tenengrad: processes 8 interior pixels per iteration.
+///
+/// For each output pixel `(y, x)`, the 3×3 Sobel needs samples at
+/// offsets `{-1, 0, +1}` in both axes. We load three `u8x8` vectors
+/// per row (at offsets `x-1`, `x`, `x+1`) for the prev/curr/next
+/// rows, widen to `i16x8`, compute `gx` / `gy` lane-wise, square via
+/// `vmull_s16` / `vmull_high_s16` (i16×i16 → i32 with widening), sum
+/// per-pixel and pair-add into a `i64x2` accumulator. Tail pixels
+/// handled scalar.
+///
+/// Max per-pixel |gx| / |gy| on 8-bit input is 4·255 = 1020, well
+/// within i16 range; the squared sum per pixel fits in i32; the
+/// accumulator lives in i64.
+///
+/// # Safety
+///
+/// Caller must ensure NEON is available (always true on aarch64).
+#[target_feature(enable = "neon")]
+#[allow(unused_unsafe)]
+pub(super) unsafe fn tenengrad(luma: &[u8], w: usize, h: usize, s: usize) -> f32 {
+  if w < 3 || h < 3 {
+    return 0.0;
+  }
+  let interior = (w - 2) * (h - 2);
+  if interior == 0 {
+    return 0.0;
+  }
+
+  const LANES: usize = 8;
+
+  // Process interior x in [1, w-1); the main loop strides LANES
+  // starting at x=1, so the last vector iteration starts at
+  // `1 + k*LANES` with `1 + k*LANES + LANES <= w-1`, i.e.
+  // `k*LANES <= w - 2 - LANES`.
+  let x_vec_end = if w >= 2 + LANES {
+    1 + ((w - 2) / LANES) * LANES
+  } else {
+    1
+  };
+
+  // i64x2 accumulator.
+  let mut acc = unsafe { vdupq_n_s64(0) };
+
+  for y in 1..h - 1 {
+    let prev = &luma[(y - 1) * s..];
+    let curr = &luma[y * s..];
+    let next = &luma[(y + 1) * s..];
+
+    let mut x = 1;
+    while x < x_vec_end {
+      // Load three u8x8 vectors per row, at offsets x-1, x, x+1.
+      let prev_m1 = unsafe { vld1_u8(prev.as_ptr().add(x - 1)) };
+      let prev_0 = unsafe { vld1_u8(prev.as_ptr().add(x)) };
+      let prev_p1 = unsafe { vld1_u8(prev.as_ptr().add(x + 1)) };
+      let curr_m1 = unsafe { vld1_u8(curr.as_ptr().add(x - 1)) };
+      let curr_p1 = unsafe { vld1_u8(curr.as_ptr().add(x + 1)) };
+      let next_m1 = unsafe { vld1_u8(next.as_ptr().add(x - 1)) };
+      let next_0 = unsafe { vld1_u8(next.as_ptr().add(x)) };
+      let next_p1 = unsafe { vld1_u8(next.as_ptr().add(x + 1)) };
+
+      // Widen to i16x8 (zero-extend u8 then reinterpret as signed).
+      let tl = unsafe { vreinterpretq_s16_u16(vmovl_u8(prev_m1)) };
+      let t = unsafe { vreinterpretq_s16_u16(vmovl_u8(prev_0)) };
+      let tr = unsafe { vreinterpretq_s16_u16(vmovl_u8(prev_p1)) };
+      let l = unsafe { vreinterpretq_s16_u16(vmovl_u8(curr_m1)) };
+      let r = unsafe { vreinterpretq_s16_u16(vmovl_u8(curr_p1)) };
+      let bl = unsafe { vreinterpretq_s16_u16(vmovl_u8(next_m1)) };
+      let b = unsafe { vreinterpretq_s16_u16(vmovl_u8(next_0)) };
+      let br = unsafe { vreinterpretq_s16_u16(vmovl_u8(next_p1)) };
+
+      // gx = -tl - 2·l - bl + tr + 2·r + br
+      let two_l = unsafe { vshlq_n_s16::<1>(l) };
+      let two_r = unsafe { vshlq_n_s16::<1>(r) };
+      let pos_x = unsafe { vaddq_s16(vaddq_s16(tr, two_r), br) };
+      let neg_x = unsafe { vaddq_s16(vaddq_s16(tl, two_l), bl) };
+      let gx = unsafe { vsubq_s16(pos_x, neg_x) };
+
+      // gy = -tl - 2·t - tr + bl + 2·b + br
+      let two_t = unsafe { vshlq_n_s16::<1>(t) };
+      let two_b = unsafe { vshlq_n_s16::<1>(b) };
+      let pos_y = unsafe { vaddq_s16(vaddq_s16(bl, two_b), br) };
+      let neg_y = unsafe { vaddq_s16(vaddq_s16(tl, two_t), tr) };
+      let gy = unsafe { vsubq_s16(pos_y, neg_y) };
+
+      // gx² + gy² per lane, widened to i32x4 low and i32x4 high.
+      let gx_lo = unsafe { vget_low_s16(gx) };
+      let gy_lo = unsafe { vget_low_s16(gy) };
+      let gx_hi_half = unsafe { vget_high_s16(gx) };
+      let gy_hi_half = unsafe { vget_high_s16(gy) };
+
+      let sq_lo = unsafe {
+        vaddq_s32(vmull_s16(gx_lo, gx_lo), vmull_s16(gy_lo, gy_lo))
+      };
+      let sq_hi = unsafe {
+        vaddq_s32(vmull_s16(gx_hi_half, gx_hi_half), vmull_s16(gy_hi_half, gy_hi_half))
+      };
+
+      // Pair-add the i32x4 vectors into the i64x2 accumulator.
+      acc = unsafe { vpadalq_s32(acc, sq_lo) };
+      acc = unsafe { vpadalq_s32(acc, sq_hi) };
+
+      x += LANES;
+    }
+
+    // Scalar tail for the row.
+    while x < w - 1 {
+      let p = |dy: isize, dx: isize| -> i32 {
+        luma[((y as isize + dy) as usize) * s + ((x as isize + dx) as usize)] as i32
+      };
+      let tl = p(-1, -1);
+      let t = p(-1, 0);
+      let tr = p(-1, 1);
+      let l = p(0, -1);
+      let r = p(0, 1);
+      let bl = p(1, -1);
+      let b = p(1, 0);
+      let br = p(1, 1);
+      let gx = -tl - 2 * l - bl + tr + 2 * r + br;
+      let gy = -tl - 2 * t - tr + bl + 2 * b + br;
+      let sq = (gx * gx + gy * gy) as i64;
+      // Fold the tail into the same i64x2 accumulator by adding to
+      // lane 0.
+      let tail = unsafe { vsetq_lane_s64::<0>(sq, vdupq_n_s64(0)) };
+      acc = unsafe { vaddq_s64(acc, tail) };
+      x += 1;
+    }
+  }
+
+  // Horizontal reduce i64x2 → i64.
+  let lo = unsafe { vgetq_lane_s64::<0>(acc) };
+  let hi = unsafe { vgetq_lane_s64::<1>(acc) };
+  let total = lo + hi;
+  ((total as f64) / (interior as f64)) as f32
+}
+
+/// NEON single-pass `(mean, variance)` on a u8 plane. Per 16-byte
+/// chunk: horizontal-add-long u8×16 → u16 for `sum_x` via
+/// `vaddlvq_u8`; squared sum via `vmull_u8` (low half) + `vmull_high_u8`
+/// (high half) producing two u16×8 vectors whose lane max is 255² =
+/// 65025, combined via `vaddlvq_u16` × 2 into u32 scalars and added
+/// to a u64 accumulator.
+///
+/// # Safety
+///
+/// Caller must ensure NEON is available (always true on aarch64).
+#[target_feature(enable = "neon")]
+#[allow(unused_unsafe)]
+pub(super) unsafe fn plane_mean_variance(
+  plane: &[u8],
+  w: usize,
+  h: usize,
+  s: usize,
+) -> (f32, f32) {
+  const LANES: usize = 16;
+  let n = w.saturating_mul(h);
+  if n == 0 {
+    return (0.0, 0.0);
+  }
+  let whole = w / LANES * LANES;
+
+  let mut sum: u64 = 0;
+  let mut sum_sq: u64 = 0;
+
+  for y in 0..h {
+    let row_base = y * s;
+
+    let mut x = 0;
+    while x < whole {
+      let v = unsafe { vld1q_u8(plane.as_ptr().add(row_base + x)) };
+      sum += unsafe { vaddlvq_u8(v) } as u64;
+
+      // Per-lane u8² via widening multiply. Max per lane 255² = 65025.
+      let sq_lo = unsafe { vmull_u8(vget_low_u8(v), vget_low_u8(v)) };
+      let sq_hi = unsafe { vmull_high_u8(v, v) };
+      sum_sq +=
+        (unsafe { vaddlvq_u16(sq_lo) } as u64) + (unsafe { vaddlvq_u16(sq_hi) } as u64);
+
+      x += LANES;
+    }
+
+    // Scalar tail.
+    while x < w {
+      let v = plane[row_base + x] as u64;
+      sum += v;
+      sum_sq += v * v;
+      x += 1;
+    }
+  }
+
+  let n_f = n as f64;
+  let mean = (sum as f64) / n_f;
+  let mean_sq = (sum_sq as f64) / n_f;
+  let variance = (mean_sq - mean * mean).max(0.0);
+  (mean as f32, variance as f32)
+}

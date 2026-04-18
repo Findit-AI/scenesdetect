@@ -36,8 +36,8 @@ harness = false
 
 [features]
 default = ["std"]
-alloc = ["libm"]
-std = ["thiserror/default"]
+alloc = ["libm", "fast_image_resize/no_std"]
+std = ["thiserror/default", "fast_image_resize/std"]
 
 serde = ["dep:serde", "dep:humantime-serde"]
 
@@ -48,6 +48,8 @@ thiserror = { version = "2", default-features = false }
 mediatime = { version = "0.1", default-features = false }
 
 libm = { version = "0.2", optional = true, default-features = false }
+
+fast_image_resize = { version = "6", default-features = false }
 
 serde = { version = "1", default-features = false, features = [
   "derive",

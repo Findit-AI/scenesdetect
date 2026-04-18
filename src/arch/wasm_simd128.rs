@@ -393,3 +393,391 @@ pub(super) unsafe fn sobel(input: &[u8], mag: &mut [i32], dir: &mut [u8], w: usi
     }
   }
 }
+
+/// wasm simd128 BGR → BT.601 luma: `Y = (77·R + 150·G + 29·B) >> 8`.
+/// Same 9-swizzle deinterleave as [`bgr_to_hsv_planes`] → three
+/// `u8x16` channel vectors; widened to `u16x8` halves via
+/// `u16x8_extend_low_u8x16` / `_high_` and combined with `i16x8_mul` +
+/// `i16x8_add`. Accumulator tops at 65280 in `[0, u16::MAX]` — no
+/// saturation. Tail handled scalar.
+///
+/// # Safety
+///
+/// Caller must ensure `simd128` target feature is enabled.
+#[target_feature(enable = "simd128")]
+#[allow(unused_unsafe)]
+pub(super) unsafe fn bgr_to_luma(
+  out: &mut [u8],
+  src: &[u8],
+  width: u32,
+  height: u32,
+  stride: u32,
+) {
+  const LANES: usize = 16;
+  let w = width as usize;
+  let h = height as usize;
+  let s = stride as usize;
+  let whole = w / LANES * LANES;
+
+  let m_b0 = unsafe { v128_load(BLK0_B.as_ptr() as *const v128) };
+  let m_g0 = unsafe { v128_load(BLK0_G.as_ptr() as *const v128) };
+  let m_r0 = unsafe { v128_load(BLK0_R.as_ptr() as *const v128) };
+  let m_b1 = unsafe { v128_load(BLK1_B.as_ptr() as *const v128) };
+  let m_g1 = unsafe { v128_load(BLK1_G.as_ptr() as *const v128) };
+  let m_r1 = unsafe { v128_load(BLK1_R.as_ptr() as *const v128) };
+  let m_b2 = unsafe { v128_load(BLK2_B.as_ptr() as *const v128) };
+  let m_g2 = unsafe { v128_load(BLK2_G.as_ptr() as *const v128) };
+  let m_r2 = unsafe { v128_load(BLK2_R.as_ptr() as *const v128) };
+
+  // Coefficient splats. i16x8 lanes; values fit in i16.
+  let k_b = i16x8_splat(29);
+  let k_g = i16x8_splat(150);
+  let k_r = i16x8_splat(77);
+
+  for y in 0..h {
+    let row_base = y * s;
+    let dst_off = y * w;
+
+    let mut x = 0;
+    while x < whole {
+      let p = unsafe { src.as_ptr().add(row_base + x * 3) };
+      let blk0 = unsafe { v128_load(p as *const v128) };
+      let blk1 = unsafe { v128_load(p.add(16) as *const v128) };
+      let blk2 = unsafe { v128_load(p.add(32) as *const v128) };
+
+      let b = v128_or(
+        v128_or(u8x16_swizzle(blk0, m_b0), u8x16_swizzle(blk1, m_b1)),
+        u8x16_swizzle(blk2, m_b2),
+      );
+      let g = v128_or(
+        v128_or(u8x16_swizzle(blk0, m_g0), u8x16_swizzle(blk1, m_g1)),
+        u8x16_swizzle(blk2, m_g2),
+      );
+      let r = v128_or(
+        v128_or(u8x16_swizzle(blk0, m_r0), u8x16_swizzle(blk1, m_r1)),
+        u8x16_swizzle(blk2, m_r2),
+      );
+
+      // Low 8 lanes.
+      let b_lo = u16x8_extend_low_u8x16(b);
+      let g_lo = u16x8_extend_low_u8x16(g);
+      let r_lo = u16x8_extend_low_u8x16(r);
+      let acc_lo = i16x8_add(
+        i16x8_add(i16x8_mul(b_lo, k_b), i16x8_mul(g_lo, k_g)),
+        i16x8_mul(r_lo, k_r),
+      );
+
+      // High 8 lanes.
+      let b_hi = u16x8_extend_high_u8x16(b);
+      let g_hi = u16x8_extend_high_u8x16(g);
+      let r_hi = u16x8_extend_high_u8x16(r);
+      let acc_hi = i16x8_add(
+        i16x8_add(i16x8_mul(b_hi, k_b), i16x8_mul(g_hi, k_g)),
+        i16x8_mul(r_hi, k_r),
+      );
+
+      // Logical >>8 on each half, then narrow-pack to u8×16. Pack is
+      // saturating-to-u8 from i16; our inputs are in [0, 255] post-
+      // shift so saturation is a no-op.
+      let y_lo = u16x8_shr(acc_lo, 8);
+      let y_hi = u16x8_shr(acc_hi, 8);
+      let packed = u8x16_narrow_i16x8(y_lo, y_hi);
+      unsafe {
+        v128_store(out.as_mut_ptr().add(dst_off + x) as *mut v128, packed);
+      }
+
+      x += LANES;
+    }
+
+    // Scalar tail.
+    while x < w {
+      let b = src[row_base + x * 3] as u32;
+      let g = src[row_base + x * 3 + 1] as u32;
+      let r = src[row_base + x * 3 + 2] as u32;
+      out[dst_off + x] = ((77 * r + 150 * g + 29 * b) >> 8) as u8;
+      x += 1;
+    }
+  }
+}
+
+/// wasm clipping-pixel count. Same 9-swizzle deinterleave as
+/// [`bgr_to_hsv_planes`] produces `u8x16` B/G/R; `u8x16_max`
+/// aggregates to `max(B, G, R)`; two compares (`u8x16_lt` against 5,
+/// `u8x16_gt` against 250) OR'd give a 0/0xFF mask; `i8x16_bitmask`
+/// returns a 16-bit popcount-ready word whose `count_ones` is the
+/// lane-count per iteration. Tail scalar.
+///
+/// # Safety
+///
+/// Caller must ensure `simd128` target feature is enabled.
+#[target_feature(enable = "simd128")]
+#[allow(unused_unsafe)]
+pub(super) unsafe fn clipping_count(
+  src: &[u8],
+  width: u32,
+  height: u32,
+  stride: u32,
+) -> u64 {
+  const LANES: usize = 16;
+  let w = width as usize;
+  let h = height as usize;
+  let s = stride as usize;
+  let whole = w / LANES * LANES;
+
+  let m_b0 = unsafe { v128_load(BLK0_B.as_ptr() as *const v128) };
+  let m_g0 = unsafe { v128_load(BLK0_G.as_ptr() as *const v128) };
+  let m_r0 = unsafe { v128_load(BLK0_R.as_ptr() as *const v128) };
+  let m_b1 = unsafe { v128_load(BLK1_B.as_ptr() as *const v128) };
+  let m_g1 = unsafe { v128_load(BLK1_G.as_ptr() as *const v128) };
+  let m_r1 = unsafe { v128_load(BLK1_R.as_ptr() as *const v128) };
+  let m_b2 = unsafe { v128_load(BLK2_B.as_ptr() as *const v128) };
+  let m_g2 = unsafe { v128_load(BLK2_G.as_ptr() as *const v128) };
+  let m_r2 = unsafe { v128_load(BLK2_R.as_ptr() as *const v128) };
+
+  let lo = u8x16_splat(5);
+  let hi = u8x16_splat(250);
+
+  let mut count: u64 = 0;
+  for y in 0..h {
+    let row_base = y * s;
+
+    let mut x = 0;
+    while x < whole {
+      let p = unsafe { src.as_ptr().add(row_base + x * 3) };
+      let blk0 = unsafe { v128_load(p as *const v128) };
+      let blk1 = unsafe { v128_load(p.add(16) as *const v128) };
+      let blk2 = unsafe { v128_load(p.add(32) as *const v128) };
+
+      let b = v128_or(
+        v128_or(u8x16_swizzle(blk0, m_b0), u8x16_swizzle(blk1, m_b1)),
+        u8x16_swizzle(blk2, m_b2),
+      );
+      let g = v128_or(
+        v128_or(u8x16_swizzle(blk0, m_g0), u8x16_swizzle(blk1, m_g1)),
+        u8x16_swizzle(blk2, m_g2),
+      );
+      let r = v128_or(
+        v128_or(u8x16_swizzle(blk0, m_r0), u8x16_swizzle(blk1, m_r1)),
+        u8x16_swizzle(blk2, m_r2),
+      );
+
+      let max = u8x16_max(b, u8x16_max(g, r));
+      let under = u8x16_lt(max, lo);
+      let over = u8x16_gt(max, hi);
+      let mask = v128_or(under, over);
+
+      // `i8x16_bitmask` returns an i32 whose low 16 bits each reflect
+      // one lane's sign bit. Since our mask lanes are 0x00 or 0xFF
+      // (i.e. sign bit = 0 or 1), `count_ones` on the bitmask gives
+      // the number of clipped pixels in this iteration.
+      count += i8x16_bitmask(mask).count_ones() as u64;
+
+      x += LANES;
+    }
+
+    // Scalar tail.
+    while x < w {
+      let b = src[row_base + x * 3];
+      let g = src[row_base + x * 3 + 1];
+      let r = src[row_base + x * 3 + 2];
+      let m = b.max(g).max(r);
+      if !(5..=250).contains(&m) {
+        count += 1;
+      }
+      x += 1;
+    }
+  }
+
+  count
+}
+
+/// wasm Tenengrad: 8 interior pixels per iteration, same structure as
+/// the SSSE3 backend. Loads u8×8 chunks via `v128_load64_zero`, widens
+/// to i16×8 via `u16x8_extend_low_u8x16`, computes gx/gy with
+/// `i16x8_add`/`_sub`/`_shl`, interleaves gx|gy and runs the wasm
+/// equivalent of PMADDWD (`i32x4_dot_i16x8`) for per-pixel
+/// `gx² + gy²`, widens to i64 and accumulates.
+///
+/// # Safety
+///
+/// Caller must ensure `simd128` target feature is enabled.
+#[target_feature(enable = "simd128")]
+#[allow(unused_unsafe)]
+pub(super) unsafe fn tenengrad(luma: &[u8], w: usize, h: usize, s: usize) -> f32 {
+  if w < 3 || h < 3 {
+    return 0.0;
+  }
+  let interior = (w - 2) * (h - 2);
+  if interior == 0 {
+    return 0.0;
+  }
+
+  const LANES: usize = 8;
+  let x_vec_end = if w >= 2 + LANES {
+    1 + ((w - 2) / LANES) * LANES
+  } else {
+    1
+  };
+
+  let mut acc = i64x2_splat(0);
+  let mut tail_acc: i64 = 0;
+
+  for y in 1..h - 1 {
+    let prev = &luma[(y - 1) * s..];
+    let curr = &luma[y * s..];
+    let next = &luma[(y + 1) * s..];
+
+    let mut x = 1;
+    while x < x_vec_end {
+      let load8 = |p: *const u8| -> v128 {
+        unsafe { v128_load64_zero(p as *const u64) }
+      };
+
+      let tl = load8(unsafe { prev.as_ptr().add(x - 1) });
+      let t = load8(unsafe { prev.as_ptr().add(x) });
+      let tr = load8(unsafe { prev.as_ptr().add(x + 1) });
+      let l = load8(unsafe { curr.as_ptr().add(x - 1) });
+      let r = load8(unsafe { curr.as_ptr().add(x + 1) });
+      let bl = load8(unsafe { next.as_ptr().add(x - 1) });
+      let b = load8(unsafe { next.as_ptr().add(x) });
+      let br = load8(unsafe { next.as_ptr().add(x + 1) });
+
+      // Zero-extend u8 → i16×8.
+      let tl = u16x8_extend_low_u8x16(tl);
+      let t = u16x8_extend_low_u8x16(t);
+      let tr = u16x8_extend_low_u8x16(tr);
+      let l = u16x8_extend_low_u8x16(l);
+      let r = u16x8_extend_low_u8x16(r);
+      let bl = u16x8_extend_low_u8x16(bl);
+      let b = u16x8_extend_low_u8x16(b);
+      let br = u16x8_extend_low_u8x16(br);
+
+      let two_l = i16x8_shl(l, 1);
+      let two_r = i16x8_shl(r, 1);
+      let pos_x = i16x8_add(i16x8_add(tr, two_r), br);
+      let neg_x = i16x8_add(i16x8_add(tl, two_l), bl);
+      let gx = i16x8_sub(pos_x, neg_x);
+
+      let two_t = i16x8_shl(t, 1);
+      let two_b = i16x8_shl(b, 1);
+      let pos_y = i16x8_add(i16x8_add(bl, two_b), br);
+      let neg_y = i16x8_add(i16x8_add(tl, two_t), tr);
+      let gy = i16x8_sub(pos_y, neg_y);
+
+      // `i32x4_dot_i16x8(a, b)` computes `a[i]*b[i] + a[i+1]*b[i+1]`
+      // per i32 lane — the same semantic as x86's PMADDWD.
+      //
+      // To get `gx² + gy²` per pixel, interleave gx and gy at i16
+      // granularity, then dot with itself.
+      let lo_pair = u16x8_shuffle::<0, 8, 1, 9, 2, 10, 3, 11>(gx, gy);
+      let hi_pair = u16x8_shuffle::<4, 12, 5, 13, 6, 14, 7, 15>(gx, gy);
+      let sq_lo = i32x4_dot_i16x8(lo_pair, lo_pair); // pixels 0..4
+      let sq_hi = i32x4_dot_i16x8(hi_pair, hi_pair); // pixels 4..8
+      let sum32 = i32x4_add(sq_lo, sq_hi);
+
+      // Widen i32×4 → i64×4 via sign-extend (values are non-negative
+      // squared sums; any extend works).
+      let sum64_a = i64x2_extend_low_i32x4(sum32);
+      let sum64_b = i64x2_extend_high_i32x4(sum32);
+      acc = i64x2_add(acc, sum64_a);
+      acc = i64x2_add(acc, sum64_b);
+
+      x += LANES;
+    }
+
+    // Scalar tail.
+    while x < w - 1 {
+      let p = |dy: isize, dx: isize| -> i32 {
+        luma[((y as isize + dy) as usize) * s + ((x as isize + dx) as usize)] as i32
+      };
+      let tl = p(-1, -1);
+      let t = p(-1, 0);
+      let tr = p(-1, 1);
+      let l = p(0, -1);
+      let r = p(0, 1);
+      let bl = p(1, -1);
+      let b = p(1, 0);
+      let br = p(1, 1);
+      let gx = -tl - 2 * l - bl + tr + 2 * r + br;
+      let gy = -tl - 2 * t - tr + bl + 2 * b + br;
+      tail_acc += (gx * gx + gy * gy) as i64;
+      x += 1;
+    }
+  }
+
+  let vec_sum = i64x2_extract_lane::<0>(acc) + i64x2_extract_lane::<1>(acc);
+  (((vec_sum + tail_acc) as f64) / (interior as f64)) as f32
+}
+
+/// wasm single-pass `(mean, variance)` on a u8 plane.
+/// Per iter: u8 horizontal sum via `u16x8_extadd_pairwise_u8x16` ×
+/// several stages into i64 lanes. Squared sum: widen u8×16 → u16×8
+/// halves, per-lane `i16x8_mul` for u8², then the same pairwise-add
+/// chain to u64.
+///
+/// # Safety
+///
+/// Caller must ensure `simd128` target feature is enabled.
+#[target_feature(enable = "simd128")]
+#[allow(unused_unsafe)]
+pub(super) unsafe fn plane_mean_variance(
+  plane: &[u8],
+  w: usize,
+  h: usize,
+  s: usize,
+) -> (f32, f32) {
+  const LANES: usize = 16;
+  let n = w.saturating_mul(h);
+  if n == 0 {
+    return (0.0, 0.0);
+  }
+  let whole = w / LANES * LANES;
+
+  let mut sum: u64 = 0;
+  let mut sum_sq: u64 = 0;
+
+  for y in 0..h {
+    let row_base = y * s;
+
+    let mut x = 0;
+    while x < whole {
+      let v = unsafe { v128_load(plane.as_ptr().add(row_base + x) as *const v128) };
+
+      // Sum: u8×16 → u16×8 (pair-add) → u32×4 (pair-add) → extract and sum.
+      let s16 = u16x8_extadd_pairwise_u8x16(v);
+      let s32 = u32x4_extadd_pairwise_u16x8(s16);
+      sum += (u32x4_extract_lane::<0>(s32) as u64)
+        + (u32x4_extract_lane::<1>(s32) as u64)
+        + (u32x4_extract_lane::<2>(s32) as u64)
+        + (u32x4_extract_lane::<3>(s32) as u64);
+
+      // Squared sum: widen to u16 halves, square, then fold to u32 and extract.
+      let v_lo = u16x8_extend_low_u8x16(v);
+      let v_hi = u16x8_extend_high_u8x16(v);
+      let sq_lo = i16x8_mul(v_lo, v_lo); // per-lane u8² ≤ 65025, fits in u16
+      let sq_hi = i16x8_mul(v_hi, v_hi);
+      let sq_sum_lo = u32x4_extadd_pairwise_u16x8(sq_lo);
+      let sq_sum_hi = u32x4_extadd_pairwise_u16x8(sq_hi);
+      let sq_sum = i32x4_add(sq_sum_lo, sq_sum_hi);
+      sum_sq += (u32x4_extract_lane::<0>(sq_sum) as u64)
+        + (u32x4_extract_lane::<1>(sq_sum) as u64)
+        + (u32x4_extract_lane::<2>(sq_sum) as u64)
+        + (u32x4_extract_lane::<3>(sq_sum) as u64);
+
+      x += LANES;
+    }
+
+    while x < w {
+      let vv = plane[row_base + x] as u64;
+      sum += vv;
+      sum_sq += vv * vv;
+      x += 1;
+    }
+  }
+
+  let n_f = n as f64;
+  let mean = (sum as f64) / n_f;
+  let mean_sq = (sum_sq as f64) / n_f;
+  let variance = (mean_sq - mean * mean).max(0.0);
+  (mean as f32, variance as f32)
+}
