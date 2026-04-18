@@ -43,14 +43,14 @@
 //! VLMs downstream benefit more from regular temporal sampling than from
 //! the occasional missing keyframe.
 
-use core::cmp::Ordering;
-use core::time::Duration;
+use core::{cmp::Ordering, time::Duration};
 
-use std::collections::VecDeque;
-use std::vec::Vec;
+use std::{collections::VecDeque, vec::Vec};
 
-use crate::frame::{TimeRange, Timestamp};
-use crate::keyframe::score::FrameScore;
+use crate::{
+  frame::{TimeRange, Timestamp},
+  keyframe::score::FrameScore,
+};
 
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
@@ -859,7 +859,10 @@ mod tests {
     let mut det = Detector::new(Options::default());
     det.observe(ts(5_000_000), good_score(100.0));
     let out = det.finalize_remaining(ts(1_000_000));
-    assert!(out.is_empty(), "eos before earliest buffered ts should no-op");
+    assert!(
+      out.is_empty(),
+      "eos before earliest buffered ts should no-op"
+    );
   }
 
   #[test]

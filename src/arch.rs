@@ -649,13 +649,7 @@ mod scalar {
     // On aarch64 the NEON path wins; keep this as the correctness
     // reference for tests and the fallback elsewhere.
     #[cfg_attr(target_arch = "aarch64", allow(dead_code))]
-    pub(super) fn bgr_to_luma(
-      out: &mut [u8],
-      src: &[u8],
-      width: u32,
-      height: u32,
-      stride: u32,
-    ) {
+    pub(super) fn bgr_to_luma(out: &mut [u8], src: &[u8], width: u32, height: u32, stride: u32) {
       let w = width as usize;
       let h = height as usize;
       let s = stride as usize;
@@ -703,12 +697,7 @@ mod scalar {
     /// stride.
     // On aarch64 the NEON path wins; keep this as the correctness reference.
     #[cfg_attr(target_arch = "aarch64", allow(dead_code))]
-    pub(super) fn plane_mean_variance(
-      plane: &[u8],
-      w: usize,
-      h: usize,
-      s: usize,
-    ) -> (f32, f32) {
+    pub(super) fn plane_mean_variance(plane: &[u8], w: usize, h: usize, s: usize) -> (f32, f32) {
       let n = w.saturating_mul(h);
       if n == 0 {
         return (0.0, 0.0);
@@ -1095,7 +1084,10 @@ mod tests {
     }
     let scalar_out = scalar::Scalar::clipping_count(&src, w as u32, h as u32, stride as u32);
     let simd_out = backend(&src, w as u32, h as u32, stride as u32);
-    assert_eq!(simd_out, scalar_out, "SIMD clipping count disagrees with scalar");
+    assert_eq!(
+      simd_out, scalar_out,
+      "SIMD clipping count disagrees with scalar"
+    );
   }
 
   #[cfg(target_arch = "aarch64")]

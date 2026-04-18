@@ -445,13 +445,7 @@ pub(super) unsafe fn sobel(input: &[u8], mag: &mut [i32], dir: &mut [u8], w: usi
 /// Caller must ensure SSSE3 is available.
 #[target_feature(enable = "ssse3")]
 #[allow(unused_unsafe)]
-pub(super) unsafe fn bgr_to_luma(
-  out: &mut [u8],
-  src: &[u8],
-  width: u32,
-  height: u32,
-  stride: u32,
-) {
+pub(super) unsafe fn bgr_to_luma(out: &mut [u8], src: &[u8], width: u32, height: u32, stride: u32) {
   const LANES: usize = 16;
   let w = width as usize;
   let h = height as usize;
@@ -563,12 +557,7 @@ pub(super) unsafe fn bgr_to_luma(
 /// Caller must ensure SSSE3 is available.
 #[target_feature(enable = "ssse3")]
 #[allow(unused_unsafe)]
-pub(super) unsafe fn clipping_count(
-  src: &[u8],
-  width: u32,
-  height: u32,
-  stride: u32,
-) -> u64 {
+pub(super) unsafe fn clipping_count(src: &[u8], width: u32, height: u32, stride: u32) -> u64 {
   const LANES: usize = 16;
   let w = width as usize;
   let h = height as usize;
@@ -721,9 +710,7 @@ pub(super) unsafe fn tenengrad(luma: &[u8], w: usize, h: usize, s: usize) -> f32
     let mut x = 1;
     while x < x_vec_end {
       // Load u8×8 chunks (8 bytes), lifted into __m128i with the low 8 bytes valid.
-      let load8 = |p: *const u8| -> __m128i {
-        unsafe { _mm_loadl_epi64(p as *const __m128i) }
-      };
+      let load8 = |p: *const u8| -> __m128i { unsafe { _mm_loadl_epi64(p as *const __m128i) } };
 
       let tl = load8(unsafe { prev.as_ptr().add(x - 1) });
       let t = load8(unsafe { prev.as_ptr().add(x) });
@@ -829,12 +816,7 @@ pub(super) unsafe fn tenengrad(luma: &[u8], w: usize, h: usize, s: usize) -> f32
 /// Caller must ensure SSSE3 is available.
 #[target_feature(enable = "ssse3")]
 #[allow(unused_unsafe)]
-pub(super) unsafe fn plane_mean_variance(
-  plane: &[u8],
-  w: usize,
-  h: usize,
-  s: usize,
-) -> (f32, f32) {
+pub(super) unsafe fn plane_mean_variance(plane: &[u8], w: usize, h: usize, s: usize) -> (f32, f32) {
   const LANES: usize = 16;
   let n = w.saturating_mul(h);
   if n == 0 {

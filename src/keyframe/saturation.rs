@@ -193,7 +193,8 @@ fn plane_variance_scalar(
   stride: usize,
   use_simd: bool,
 ) -> f32 {
-  let (_mean, variance) = super::reduce::plane_mean_variance(plane, width, height, stride, use_simd);
+  let (_mean, variance) =
+    super::reduce::plane_mean_variance(plane, width, height, stride, use_simd);
   variance
 }
 
@@ -212,13 +213,7 @@ mod tests {
     Timestamp::new(77, Timebase::new(1, nz(1000)))
   }
 
-  fn tight_hsv<'a>(
-    h: &'a [u8],
-    s: &'a [u8],
-    v: &'a [u8],
-    w: u32,
-    ht: u32,
-  ) -> HsvFrame<'a> {
+  fn tight_hsv<'a>(h: &'a [u8], s: &'a [u8], v: &'a [u8], w: u32, ht: u32) -> HsvFrame<'a> {
     HsvFrame::new(h, s, v, w, ht, w, timestamp())
   }
 

@@ -349,13 +349,7 @@ pub(super) unsafe fn sobel(input: &[u8], mag: &mut [i32], dir: &mut [u8], w: usi
 /// Caller must ensure NEON is available (always true on aarch64).
 #[target_feature(enable = "neon")]
 #[allow(unused_unsafe)]
-pub(super) unsafe fn bgr_to_luma(
-  out: &mut [u8],
-  src: &[u8],
-  width: u32,
-  height: u32,
-  stride: u32,
-) {
+pub(super) unsafe fn bgr_to_luma(out: &mut [u8], src: &[u8], width: u32, height: u32, stride: u32) {
   const LANES: usize = 16;
   let w = width as usize;
   let h = height as usize;
@@ -425,12 +419,7 @@ pub(super) unsafe fn bgr_to_luma(
 /// Caller must ensure NEON is available (always true on aarch64).
 #[target_feature(enable = "neon")]
 #[allow(unused_unsafe)]
-pub(super) unsafe fn clipping_count(
-  src: &[u8],
-  width: u32,
-  height: u32,
-  stride: u32,
-) -> u64 {
+pub(super) unsafe fn clipping_count(src: &[u8], width: u32, height: u32, stride: u32) -> u64 {
   const LANES: usize = 16;
   let w = width as usize;
   let h = height as usize;
@@ -564,11 +553,12 @@ pub(super) unsafe fn tenengrad(luma: &[u8], w: usize, h: usize, s: usize) -> f32
       let gx_hi_half = unsafe { vget_high_s16(gx) };
       let gy_hi_half = unsafe { vget_high_s16(gy) };
 
-      let sq_lo = unsafe {
-        vaddq_s32(vmull_s16(gx_lo, gx_lo), vmull_s16(gy_lo, gy_lo))
-      };
+      let sq_lo = unsafe { vaddq_s32(vmull_s16(gx_lo, gx_lo), vmull_s16(gy_lo, gy_lo)) };
       let sq_hi = unsafe {
-        vaddq_s32(vmull_s16(gx_hi_half, gx_hi_half), vmull_s16(gy_hi_half, gy_hi_half))
+        vaddq_s32(
+          vmull_s16(gx_hi_half, gx_hi_half),
+          vmull_s16(gy_hi_half, gy_hi_half),
+        )
       };
 
       // Pair-add the i32x4 vectors into the i64x2 accumulator.
@@ -621,12 +611,7 @@ pub(super) unsafe fn tenengrad(luma: &[u8], w: usize, h: usize, s: usize) -> f32
 /// Caller must ensure NEON is available (always true on aarch64).
 #[target_feature(enable = "neon")]
 #[allow(unused_unsafe)]
-pub(super) unsafe fn plane_mean_variance(
-  plane: &[u8],
-  w: usize,
-  h: usize,
-  s: usize,
-) -> (f32, f32) {
+pub(super) unsafe fn plane_mean_variance(plane: &[u8], w: usize, h: usize, s: usize) -> (f32, f32) {
   const LANES: usize = 16;
   let n = w.saturating_mul(h);
   if n == 0 {
@@ -648,8 +633,7 @@ pub(super) unsafe fn plane_mean_variance(
       // Per-lane u8² via widening multiply. Max per lane 255² = 65025.
       let sq_lo = unsafe { vmull_u8(vget_low_u8(v), vget_low_u8(v)) };
       let sq_hi = unsafe { vmull_high_u8(v, v) };
-      sum_sq +=
-        (unsafe { vaddlvq_u16(sq_lo) } as u64) + (unsafe { vaddlvq_u16(sq_hi) } as u64);
+      sum_sq += (unsafe { vaddlvq_u16(sq_lo) } as u64) + (unsafe { vaddlvq_u16(sq_hi) } as u64);
 
       x += LANES;
     }

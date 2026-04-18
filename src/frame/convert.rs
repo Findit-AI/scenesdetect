@@ -129,7 +129,10 @@ mod tests {
     let src = vec![0u8; w * h * 3];
     let mut out = vec![255u8; w * h];
     bgr_to_luma(&mut out, &src, w as u32, h as u32, (w * 3) as u32, false);
-    assert!(out.iter().all(|&y| y == 0), "black frame should be all zero");
+    assert!(
+      out.iter().all(|&y| y == 0),
+      "black frame should be all zero"
+    );
   }
 
   #[test]

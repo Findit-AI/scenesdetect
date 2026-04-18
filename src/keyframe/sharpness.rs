@@ -140,13 +140,7 @@ impl Detector {
   ///
   /// In debug builds: if `gx.len() < width * height` or
   /// `gy.len() < width * height`. Release builds trust the caller.
-  pub fn observe_sobel(
-    &mut self,
-    gx: &[i16],
-    gy: &[i16],
-    width: usize,
-    height: usize,
-  ) -> f32 {
+  pub fn observe_sobel(&mut self, gx: &[i16], gy: &[i16], width: usize, height: usize) -> f32 {
     tenengrad_from_gradients(gx, gy, width, height)
   }
 }

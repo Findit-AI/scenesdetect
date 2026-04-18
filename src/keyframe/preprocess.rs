@@ -139,8 +139,7 @@ impl Downscaler {
       for y in 0..h as usize {
         let soff = y * src_stride;
         let doff = y * row_bytes;
-        self.src_tight[doff..doff + row_bytes]
-          .copy_from_slice(&src_data[soff..soff + row_bytes]);
+        self.src_tight[doff..doff + row_bytes].copy_from_slice(&src_data[soff..soff + row_bytes]);
       }
       &self.src_tight[..src_tight_size]
     };
