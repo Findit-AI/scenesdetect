@@ -106,6 +106,15 @@ impl Downscaler {
     let h = src.height();
     let target = self.target_dim.get();
 
+    // Preserve degenerate empty frames as-is. `RgbFrame` allows
+    // `width == 0` or `height == 0`; without this short-circuit
+    // `compute_resize_dims` would clamp the zero axis up to 1 and the
+    // resizer would fabricate up to `target` pixels of synthetic
+    // content from an empty source.
+    if w == 0 || h == 0 {
+      return src;
+    }
+
     // Input already small enough — nothing to do.
     if w.max(h) <= target {
       return src;
@@ -453,6 +462,32 @@ mod tests {
     // No reallocation between runs of the same size.
     assert_eq!(dn.dst.as_ptr(), ptr_after_first);
     assert_eq!(dn.dst.len(), len_after_first);
+  }
+
+  #[test]
+  fn downscaler_preserves_zero_width_frame() {
+    // 0×400 input with target 256 must NOT fabricate a 1×256 output.
+    // The earlier short-circuit had `w.max(h) > target` for this
+    // shape (400 > 256), so without the explicit zero-axis guard
+    // `compute_resize_dims` would clamp the zero axis up to 1.
+    let src = vec![0u8; 0];
+    let frame = RgbFrame::new(&src, 0, 400, 0, timestamp());
+    let mut dn = Downscaler::new(nz(256));
+    let out = dn.run(frame);
+    assert_eq!(out.width(), 0, "zero-width input must stay zero-width");
+    assert_eq!(out.height(), 400);
+    assert_eq!(out.data().as_ptr(), frame.data().as_ptr());
+  }
+
+  #[test]
+  fn downscaler_preserves_zero_height_frame() {
+    let src = vec![0u8; 0];
+    let frame = RgbFrame::new(&src, 400, 0, 400 * 3, timestamp());
+    let mut dn = Downscaler::new(nz(256));
+    let out = dn.run(frame);
+    assert_eq!(out.height(), 0, "zero-height input must stay zero-height");
+    assert_eq!(out.width(), 400);
+    assert_eq!(out.data().as_ptr(), frame.data().as_ptr());
   }
 
   // ----- LumaConverter --------------------------------------------------------

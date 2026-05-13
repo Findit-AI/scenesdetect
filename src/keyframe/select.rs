@@ -110,13 +110,25 @@ const fn sanitise_norm(norm: f32, default: f32) -> f32 {
   }
 }
 
-// Private deserialization shim for [`CompositeWeights`]. Routes the
-// three normaliser fields through [`sanitise_norm`] so a serialized
-// configuration with invalid (zero, negative, NaN, or infinite) norms
-// cannot reach [`composite_quality`] and silently corrupt the
-// strict-pass argmax. The struct mirrors [`CompositeWeights`]'s field
-// shape exactly — adding a normaliser field on [`CompositeWeights`]
-// requires updating both this struct and the [`From`] impl below.
+/// Returns `weight` when it is finite (positive, zero, or negative all
+/// allowed — only non-finite values are filtered). Non-finite weights
+/// collapse to `0.0` so the term contributes nothing rather than
+/// propagating `Inf`/`NaN` through [`composite_quality`]. Negative
+/// weights are preserved: a user can deliberately invert a term's
+/// sense (e.g. rewarding clipping for an unusual workload).
+#[inline]
+const fn sanitise_weight(weight: f32) -> f32 {
+  if weight.is_finite() { weight } else { 0.0 }
+}
+
+// Private deserialization shim for [`CompositeWeights`]. Routes every
+// weight through [`sanitise_weight`] and every normaliser through
+// [`sanitise_norm`] so a serialized configuration with invalid
+// (`NaN`/`Inf` weights, or zero/negative/`NaN`/`Inf` norms) cannot
+// reach [`composite_quality`] and silently corrupt the strict-pass
+// argmax. The struct mirrors [`CompositeWeights`]'s field shape
+// exactly — adding a field on [`CompositeWeights`] requires updating
+// both this struct and the [`From`] impl below.
 #[cfg(feature = "serde")]
 #[derive(Deserialize)]
 struct CompositeWeightsRaw {
@@ -135,14 +147,14 @@ impl From<CompositeWeightsRaw> for CompositeWeights {
   #[inline]
   fn from(r: CompositeWeightsRaw) -> Self {
     Self {
-      sharpness: r.sharpness,
+      sharpness: sanitise_weight(r.sharpness),
       sharpness_norm: sanitise_norm(r.sharpness_norm, DEFAULT_SHARPNESS_NORM),
-      noise: r.noise,
+      noise: sanitise_weight(r.noise),
       noise_norm: sanitise_norm(r.noise_norm, DEFAULT_NOISE_NORM),
-      colorfulness: r.colorfulness,
+      colorfulness: sanitise_weight(r.colorfulness),
       colorfulness_norm: sanitise_norm(r.colorfulness_norm, DEFAULT_COLORFULNESS_NORM),
-      clipping: r.clipping,
-      motion_blur: r.motion_blur,
+      clipping: sanitise_weight(r.clipping),
+      motion_blur: sanitise_weight(r.motion_blur),
     }
   }
 }
@@ -177,7 +189,7 @@ impl CompositeWeights {
   /// is the right way to disable a term.
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn with_sharpness(mut self, weight: f32, norm: f32) -> Self {
-    self.sharpness = weight;
+    self.sharpness = sanitise_weight(weight);
     self.sharpness_norm = sanitise_norm(norm, DEFAULT_SHARPNESS_NORM);
     self
   }
@@ -189,7 +201,7 @@ impl CompositeWeights {
   /// [`Self::with_sharpness`] for the rationale.
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn with_noise(mut self, weight: f32, norm: f32) -> Self {
-    self.noise = weight;
+    self.noise = sanitise_weight(weight);
     self.noise_norm = sanitise_norm(norm, DEFAULT_NOISE_NORM);
     self
   }
@@ -200,7 +212,7 @@ impl CompositeWeights {
   /// [`Self::with_sharpness`] for the rationale.
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn with_colorfulness(mut self, weight: f32, norm: f32) -> Self {
-    self.colorfulness = weight;
+    self.colorfulness = sanitise_weight(weight);
     self.colorfulness_norm = sanitise_norm(norm, DEFAULT_COLORFULNESS_NORM);
     self
   }
@@ -208,14 +220,14 @@ impl CompositeWeights {
   /// — no normaliser.
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn with_clipping(mut self, weight: f32) -> Self {
-    self.clipping = weight;
+    self.clipping = sanitise_weight(weight);
     self
   }
   /// Sets the motion-blur-penalty weight. Anisotropy is already in
   /// `[0, 1]` — no normaliser. Defaults to 0 (off).
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn with_motion_blur(mut self, weight: f32) -> Self {
-    self.motion_blur = weight;
+    self.motion_blur = sanitise_weight(weight);
     self
   }
 
@@ -1312,47 +1324,50 @@ mod tests {
 
   #[cfg(feature = "serde")]
   #[test]
-  fn composite_weights_deserialize_clamps_invalid_norms() {
+  fn composite_weights_deserialize_clamps_invalid_norms_and_weights() {
     // Deserialization (via `#[serde(from = "CompositeWeightsRaw")]`)
-    // routes the three normaliser fields through `sanitise_norm` so a
-    // serialized config with invalid norms cannot reach
+    // routes every weight through `sanitise_weight` and every
+    // normaliser through `sanitise_norm` so a serialized config
+    // carrying NaN/Inf weights or zero/NaN/Inf norms cannot reach
     // composite_quality and silently corrupt the strict-pass argmax.
     // We exercise the conversion through `From<CompositeWeightsRaw>`
     // directly — that is the exact same code path serde-derive uses
     // after parsing the raw struct, and it doesn't pull in a
     // text-format crate for the test.
     let raw = CompositeWeightsRaw {
-      sharpness: 1.0,
-      sharpness_norm: 0.0, // invalid — zero
-      noise: 0.3,
-      noise_norm: f32::NAN, // invalid — NaN
-      colorfulness: 0.2,
-      colorfulness_norm: f32::INFINITY, // invalid — +Inf
-      clipping: 0.5,
-      motion_blur: 0.0,
+      sharpness: f32::NAN,              // invalid weight
+      sharpness_norm: 0.0,              // invalid norm — zero
+      noise: f32::INFINITY,             // invalid weight
+      noise_norm: f32::NAN,             // invalid norm — NaN
+      colorfulness: f32::NEG_INFINITY,  // invalid weight
+      colorfulness_norm: f32::INFINITY, // invalid norm — +Inf
+      clipping: f32::NAN,               // invalid weight
+      motion_blur: f32::INFINITY,       // invalid weight
     };
     let w: CompositeWeights = raw.into();
     let defaults = CompositeWeights::new();
+    // Norms fall back to spec defaults.
     assert_eq!(w.sharpness_norm(), defaults.sharpness_norm());
     assert_eq!(w.noise_norm(), defaults.noise_norm());
     assert_eq!(w.colorfulness_norm(), defaults.colorfulness_norm());
-    // Weights themselves are preserved verbatim — clamp is on `norm`
-    // only.
-    assert_eq!(w.sharpness(), 1.0);
-    assert_eq!(w.noise(), 0.3);
-    assert_eq!(w.colorfulness(), 0.2);
-    assert_eq!(w.clipping(), 0.5);
+    // Weights clamp to 0 so each term contributes nothing.
+    assert_eq!(w.sharpness(), 0.0);
+    assert_eq!(w.noise(), 0.0);
+    assert_eq!(w.colorfulness(), 0.0);
+    assert_eq!(w.clipping(), 0.0);
     assert_eq!(w.motion_blur(), 0.0);
 
-    // composite_quality on a normal frame stays finite under the
-    // clamped norms — same end-to-end guard as the builder-path test.
+    // composite_quality on a normal frame stays finite — every term
+    // collapses to 0 because weights are 0.
     let m = FrameMetrics::new()
       .with_sharpness(500.0)
       .with_noise(5.0)
       .with_colorfulness(40.0)
-      .with_clipping(0.0)
-      .with_motion_blur(0.0);
-    assert!(composite_quality(&m, &w).is_finite());
+      .with_clipping(0.5)
+      .with_motion_blur(0.5);
+    let q = composite_quality(&m, &w);
+    assert!(q.is_finite());
+    assert_eq!(q, 0.0);
   }
 
   #[cfg(feature = "serde")]
@@ -1672,6 +1687,71 @@ mod tests {
       q.is_finite(),
       "composite_quality must stay finite under clamped invalid norms; got {q}"
     );
+  }
+
+  #[test]
+  fn composite_weights_invalid_weights_clamp_to_zero() {
+    // Every flavour of non-finite weight on every builder must clamp
+    // to 0.0, so the term contributes nothing rather than poisoning
+    // composite_quality with `Inf`/`NaN`.
+    for &bad in &[f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+      let w = CompositeWeights::new()
+        .with_sharpness(bad, 1000.0)
+        .with_noise(bad, 20.0)
+        .with_colorfulness(bad, 50.0)
+        .with_clipping(bad)
+        .with_motion_blur(bad);
+      assert_eq!(w.sharpness(), 0.0, "sharpness should clamp invalid {bad}");
+      assert_eq!(w.noise(), 0.0, "noise should clamp invalid {bad}");
+      assert_eq!(
+        w.colorfulness(),
+        0.0,
+        "colorfulness should clamp invalid {bad}"
+      );
+      assert_eq!(w.clipping(), 0.0, "clipping should clamp invalid {bad}");
+      assert_eq!(
+        w.motion_blur(),
+        0.0,
+        "motion_blur should clamp invalid {bad}"
+      );
+    }
+  }
+
+  #[test]
+  fn composite_weights_finite_negative_weight_passes_through() {
+    // Negative weights are well-defined (a user can invert a term's
+    // sense deliberately). Only non-finite weights are filtered.
+    let w = CompositeWeights::new()
+      .with_sharpness(-1.0, 1000.0)
+      .with_clipping(-0.5);
+    assert_eq!(w.sharpness(), -1.0);
+    assert_eq!(w.clipping(), -0.5);
+  }
+
+  #[test]
+  fn composite_quality_stays_finite_under_invalid_weights() {
+    // End-to-end guard: non-finite weights on every term + a normal
+    // frame must still produce a finite composite. Catches any future
+    // builder that forgets to route a weight through sanitise_weight.
+    let weights = CompositeWeights::new()
+      .with_sharpness(f32::NAN, 1000.0)
+      .with_noise(f32::INFINITY, 20.0)
+      .with_colorfulness(f32::NEG_INFINITY, 50.0)
+      .with_clipping(f32::NAN)
+      .with_motion_blur(f32::INFINITY);
+    let m = FrameMetrics::new()
+      .with_sharpness(500.0)
+      .with_noise(5.0)
+      .with_colorfulness(40.0)
+      .with_clipping(0.5)
+      .with_motion_blur(0.5);
+    let q = composite_quality(&m, &weights);
+    assert!(
+      q.is_finite(),
+      "composite_quality must stay finite under clamped invalid weights; got {q}"
+    );
+    // Every term clamped to weight=0 → q == 0.
+    assert_eq!(q, 0.0);
   }
 
   #[test]
