@@ -96,6 +96,23 @@ const DEFAULT_SHARPNESS_NORM: f32 = 1000.0;
 const DEFAULT_NOISE_NORM: f32 = 20.0;
 const DEFAULT_COLORFULNESS_NORM: f32 = 50.0;
 
+// Default values for the un-range-checked f32 thresholds in
+// [`Options`]. Mirrors [`Options::default`] so the builder clamps
+// can fall back to a known-good value when handed `NaN`/`Inf` —
+// see the `Options::with_*_threshold` doc-comments for rationale.
+const DEFAULT_MIN_SHARPNESS: f32 = 100.0;
+const DEFAULT_LUMA_VARIANCE_THRESHOLD: f32 = 5.0;
+const DEFAULT_SAT_VARIANCE_THRESHOLD: f32 = 3.0;
+
+/// Returns `v` when it is finite, otherwise `default`. Used by the
+/// f32 threshold builders that have no documented range but must
+/// still produce a value that `hard_gate`'s `<`/`>` comparisons
+/// don't silently fail open on (`metric < NaN` is `false`).
+#[inline]
+const fn finite_or(v: f32, default: f32) -> f32 {
+  if v.is_finite() { v } else { default }
+}
+
 /// Returns `norm` when it is strictly positive and finite, otherwise
 /// returns `default`. Invalid normalisers would feed `Inf`/`NaN` into
 /// [`composite_quality`] and silently corrupt the strict-pass argmax
@@ -389,24 +406,16 @@ impl From<OptionsRaw> for Options {
       // a `NaN` threshold would make every metric "less than NaN"
       // evaluate to false in IEEE 754, silently disabling the gate.
       // Clamp non-finite values to the spec defaults so the gate
-      // never reads an `Inf`/`NaN` opt-side threshold.
-      min_sharpness: if r.min_sharpness.is_finite() {
-        r.min_sharpness
-      } else {
-        defaults.min_sharpness
-      },
+      // never reads an `Inf`/`NaN` opt-side threshold. Routes
+      // through the same `finite_or` helper as the builder path.
+      min_sharpness: finite_or(r.min_sharpness, DEFAULT_MIN_SHARPNESS),
       black_mean_threshold: r.black_mean_threshold,
       bright_mean_threshold: r.bright_mean_threshold,
-      luma_variance_threshold: if r.luma_variance_threshold.is_finite() {
-        r.luma_variance_threshold
-      } else {
-        defaults.luma_variance_threshold
-      },
-      sat_variance_threshold: if r.sat_variance_threshold.is_finite() {
-        r.sat_variance_threshold
-      } else {
-        defaults.sat_variance_threshold
-      },
+      luma_variance_threshold: finite_or(
+        r.luma_variance_threshold,
+        DEFAULT_LUMA_VARIANCE_THRESHOLD,
+      ),
+      sat_variance_threshold: finite_or(r.sat_variance_threshold, DEFAULT_SAT_VARIANCE_THRESHOLD),
       // max_clipping must lie in [0.0, 1.0].
       max_clipping: if r.max_clipping.is_finite() && (0.0..=1.0).contains(&r.max_clipping) {
         r.max_clipping
@@ -484,9 +493,18 @@ impl Options {
   }
 
   /// Minimum Tenengrad sharpness for the strict pass.
+  ///
+  /// Non-finite values (`NaN`, `Inf`, `-Inf`) silently clamp to the
+  /// spec default (`100.0`). `hard_gate` and the strict-floor
+  /// comparison both rely on this being a finite real number —
+  /// `metric >= NEG_INFINITY` is always `true`, which would
+  /// effectively disable the floor, and `metric >= NaN` is always
+  /// `false`, which would reject every frame. Finite negative
+  /// values are allowed (a caller can deliberately disable the
+  /// floor by passing `f32::MIN`).
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn with_min_sharpness(mut self, s: f32) -> Self {
-    self.min_sharpness = s;
+    self.min_sharpness = finite_or(s, DEFAULT_MIN_SHARPNESS);
     self
   }
 
@@ -506,17 +524,23 @@ impl Options {
 
   /// Luma-variance floor. AND-gated with
   /// [`Self::with_sat_variance_threshold`].
+  ///
+  /// Non-finite values clamp to the spec default (`5.0`). See
+  /// [`Self::with_min_sharpness`] for the underlying NaN-as-`<`
+  /// comparison rationale.
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn with_luma_variance_threshold(mut self, t: f32) -> Self {
-    self.luma_variance_threshold = t;
+    self.luma_variance_threshold = finite_or(t, DEFAULT_LUMA_VARIANCE_THRESHOLD);
     self
   }
 
   /// Saturation-variance floor. AND-gated with
   /// [`Self::with_luma_variance_threshold`].
+  ///
+  /// Non-finite values clamp to the spec default (`3.0`).
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn with_sat_variance_threshold(mut self, t: f32) -> Self {
-    self.sat_variance_threshold = t;
+    self.sat_variance_threshold = finite_or(t, DEFAULT_SAT_VARIANCE_THRESHOLD);
     self
   }
 
@@ -959,7 +983,16 @@ fn compute_effective_floor(
   if !opts.adaptive_floor() {
     return opts.min_sharpness();
   }
-  // Collect in-range sharpness values.
+  // Collect in-range sharpness values, filtered to finite,
+  // non-negative samples. Tenengrad is non-negative by construction,
+  // so a negative value is corrupt (likely from a malformed
+  // `FrameMetrics::set_sharpness(...)` call or a corrupt detector
+  // output); `f32::NEG_INFINITY` would in particular drive the
+  // computed percentile to `-Inf` and disable the strict floor for
+  // every subsequent frame. NaNs sort as "Equal" under
+  // `partial_cmp`, which would scatter them through the sorted
+  // vector and pollute the percentile lookup. Filtering up front
+  // keeps both pathologies out of the percentile pool.
   let mut sharps: Vec<f32> = buffer
     .iter()
     .filter(|(ts, _)| {
@@ -967,9 +1000,11 @@ fn compute_effective_floor(
         && ts.cmp_semantic(&range.end()) == Ordering::Less
     })
     .map(|(_, m)| m.sharpness())
+    .filter(|s| s.is_finite() && *s >= 0.0)
     .collect();
   // `min_samples == 0` (a valid user setting meaning "adapt regardless
-  // of sample count") combined with an empty in-range shot would skip
+  // of sample count") combined with an empty in-range shot — or a
+  // shot whose every sample was filtered as non-finite — would skip
   // the threshold check and then index an empty slice. Treat
   // `sharps.is_empty()` as "no data to derive a percentile from" and
   // fall back to the absolute floor.
@@ -1275,6 +1310,116 @@ mod tests {
     // over (sharpness is finite), still emits one timestamp — but
     // via the "least bad" fallback, NOT the strict path.
     assert_eq!(out, vec![ts(500_000)]);
+  }
+
+  // ---- Builder-path threshold clamps (iter-11 regression) -----------------
+
+  #[test]
+  fn with_min_sharpness_clamps_non_finite_to_default() {
+    for &bad in &[f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+      let o = Options::new().with_min_sharpness(bad);
+      assert_eq!(
+        o.min_sharpness(),
+        Options::default().min_sharpness(),
+        "min_sharpness should clamp {bad:?} to default"
+      );
+    }
+  }
+
+  #[test]
+  fn with_min_sharpness_preserves_finite_negative() {
+    // Finite negatives are a deliberate knob — disabling the floor.
+    let o = Options::new().with_min_sharpness(-1.0);
+    assert_eq!(o.min_sharpness(), -1.0);
+  }
+
+  #[test]
+  fn with_luma_variance_threshold_clamps_non_finite_to_default() {
+    for &bad in &[f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+      let o = Options::new().with_luma_variance_threshold(bad);
+      assert_eq!(
+        o.luma_variance_threshold(),
+        Options::default().luma_variance_threshold()
+      );
+    }
+  }
+
+  #[test]
+  fn with_sat_variance_threshold_clamps_non_finite_to_default() {
+    for &bad in &[f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+      let o = Options::new().with_sat_variance_threshold(bad);
+      assert_eq!(
+        o.sat_variance_threshold(),
+        Options::default().sat_variance_threshold()
+      );
+    }
+  }
+
+  #[test]
+  fn builder_neg_inf_min_sharpness_doesnt_admit_every_frame() {
+    // Pre-fix: with_min_sharpness(NEG_INFINITY) → effective floor = -Inf
+    // → every finite sharpness >= -Inf → strict path admits any frame.
+    // Fix: builder clamps NEG_INFINITY to the spec default (100.0).
+    let opts = Options::new()
+      .with_min_sharpness(f32::NEG_INFINITY)
+      .with_margin_ratio(0.0);
+    let mut det = Detector::new(opts);
+    // A finite-but-low sharpness that should fail the absolute floor.
+    let low = good_metrics(50.0);
+    det.observe(ts(500_000), low);
+    let out = det.finalize_shot(tr(0, 2_000_000));
+    // Low frame fails the strict floor (now 100.0) → fallback emits
+    // the single candidate. The important property is that the
+    // builder didn't silently lower the floor to -Inf.
+    assert_eq!(out, vec![ts(500_000)]);
+    // Sanity-check the clamp itself: the floor is the default value.
+    assert_eq!(det.options().min_sharpness(), 100.0);
+  }
+
+  // ---- Adaptive floor: filter non-finite samples (iter-11 regression) ----
+
+  #[test]
+  fn adaptive_floor_filters_non_finite_sharpness_samples() {
+    // 20 finite-but-low frames + 5 corrupt -Inf frames in the same
+    // shot. Pre-fix: the -Inf samples pulled p25 down to -Inf and
+    // disabled the effective strict floor. Post-fix: the filter
+    // drops them; p25 is computed on the 20 finite samples; the
+    // strict floor stays sensible.
+    let opts = Options::default()
+      .with_margin_ratio(0.0)
+      .with_target_interval(Duration::from_secs(60))
+      .with_adaptive_floor_min_samples(15);
+    let mut det = Detector::new(opts);
+    // 20 finite frames at sharpness ~50 (well below absolute 100).
+    for i in 0..20 {
+      let s = 40.0 + (i as f32) * 1.0; // 40..59
+      det.observe(ts((i as i64) * 100_000), good_metrics(s));
+    }
+    // 5 corrupt frames with -Inf sharpness, sprinkled later.
+    for i in 0..5 {
+      let m = FrameMetrics::new()
+        .with_sharpness(f32::NEG_INFINITY)
+        .with_brightness(128.0)
+        .with_luma_variance(200.0)
+        .with_saturation_variance(100.0)
+        .with_clipping(0.0);
+      det.observe(ts(2_100_000 + (i as i64) * 100_000), m);
+    }
+    let out = det.finalize_shot(tr(0, 30_000_000));
+    // With -Inf filtered out, p25 of [40..59] is ~44, effective
+    // floor = min(100, 44) = 44. Some finite frame at sharpness
+    // >= 44 wins the strict path. The non-finite frames cannot
+    // win either path (their sharpness is filtered from the
+    // adaptive percentile AND fails the strict/fallback `is_finite`
+    // guard added earlier).
+    assert_eq!(out.len(), 1, "expected one strict winner");
+    // The strict winner must be a finite-sharpness frame, NOT one
+    // of the corrupt -Inf frames at ts >= 2_100_000.
+    let winner_ts = out[0].pts();
+    assert!(
+      winner_ts < 2_100_000,
+      "strict winner pts {winner_ts} should be in the finite-sample range (<2_100_000)"
+    );
   }
 
   // ----- Detector ------------------------------------------------------------
