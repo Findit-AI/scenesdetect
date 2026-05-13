@@ -1091,15 +1091,19 @@ fn compute_effective_floor(
   if !opts.adaptive_floor() {
     return opts.min_sharpness();
   }
-  // Two-pass stride-sample over the emission-eligible window.
+  // Two-pass rank-based sampling over the emission-eligible window.
   //
   // Pass 1 counts eligible in-domain samples without allocating.
-  // Pass 2 takes every `stride`-th sample to fill the percentile
-  // pool, capped at `MAX_ADAPTIVE_FLOOR_SAMPLES`. The stride is
-  // chosen so the pool spans the FULL eligible window — a
-  // `.take(N)` prefix cap would bias the percentile toward
-  // early-shot samples and silently disable adaptive flooring
-  // whenever `adaptive_floor_min_samples > N`.
+  // Pass 2 fills the percentile pool by picking the first index
+  // in each of `target` evenly-sized rank buckets, where
+  // `target = min(total, MAX_ADAPTIVE_FLOOR_SAMPLES)`. A
+  // modulo-residue stride (`i % stride == 0`) can lock onto a
+  // single periodic subset when `total` is just over the cap
+  // (e.g. 4097 → stride 2, keeping only 2049 even-i samples and
+  // silently dropping every odd-i frame); rank bucketing instead
+  // keeps exactly `target` samples and spans the FULL window with
+  // a varying integer stride that does not align with period-2
+  // patterns in the metric stream.
   //
   // Both passes use `skip_while`/`take_while` instead of a plain
   // `.filter` on timestamps, exploiting the buffer's documented
@@ -1121,21 +1125,26 @@ fn compute_effective_floor(
   if total == 0 || total < opts.adaptive_floor_min_samples() {
     return opts.min_sharpness();
   }
-  let stride = total.div_ceil(MAX_ADAPTIVE_FLOOR_SAMPLES).max(1);
-  let mut sharps: Vec<f32> = eligible_iter()
-    .enumerate()
-    .filter_map(|(i, (_, m))| {
-      if i % stride == 0 {
-        Some(m.sharpness())
-      } else {
-        None
-      }
-    })
-    .collect();
+  let target = total.min(MAX_ADAPTIVE_FLOOR_SAMPLES);
+  // `u128` widens both factors so `i * target` (≤ usize::MAX *
+  // 4096) never overflows on 32-bit targets. `total > 0` is
+  // guaranteed by the early-return above, so the divisor is
+  // non-zero.
+  let rank = |i: usize| -> u128 { (i as u128).saturating_mul(target as u128) / (total as u128) };
+  let mut sharps: Vec<f32> = Vec::with_capacity(target);
+  let mut last_rank: Option<u128> = None;
+  for (i, (_, m)) in eligible_iter().enumerate() {
+    let r = rank(i);
+    if last_rank.is_none_or(|prev| r > prev) {
+      sharps.push(m.sharpness());
+      last_rank = Some(r);
+    }
+  }
   if sharps.is_empty() {
-    // Defensive: total > 0 guarantees at least one stride hit,
-    // but a future refactor could break that. Fall back rather
-    // than index an empty slice.
+    // Defensive: total > 0 guarantees at least one rank-bucket
+    // hit (the first iteration with `last_rank == None` always
+    // pushes), but a future refactor could break that. Fall back
+    // rather than index an empty slice.
     return opts.min_sharpness();
   }
   sharps.sort_by(|a, b| a.partial_cmp(b).unwrap_or(Ordering::Equal));
@@ -2080,6 +2089,67 @@ mod tests {
     assert!(
       (0..4_000_000).contains(&winner_pts),
       "winner pts {winner_pts} should be a sharp frame from the first half (0..4_000_000)"
+    );
+  }
+
+  #[test]
+  fn adaptive_floor_uses_rank_buckets_not_modulo_stride() {
+    // Iter-20 regression: a modulo-residue stride
+    // (`i % stride == 0`) can lock onto a single periodic subset
+    // of the eligible window when `total` is just over the cap.
+    // For `total = 4097`, `stride = ceil(4097/4096) = 2`, which
+    // keeps only the even-i samples — silently dropping every
+    // odd-i frame from the percentile pool. Rank-based bucketing
+    // instead keeps exactly `min(total, MAX_ADAPTIVE_FLOOR_SAMPLES)`
+    // samples drawn from both phases of any period-2 pattern.
+    //
+    // Setup: 4097 frames with metrics alternating by index parity.
+    // Even-i frames are sharp-but-bland (sharpness=200,
+    // colorfulness=0); odd-i frames are dim-but-colorful
+    // (sharpness=50, colorfulness=500). With the default
+    // composite weights, the colourful term scores ~10× higher
+    // than the sharp term, so an odd-i frame wins the composite
+    // argmax whenever the hard gate admits it.
+    //
+    // Under the buggy modulo stride: every kept sample has
+    // sharpness=200, p25 = 200, the floor stays at
+    // min(100, 200) = 100, and odd-i frames (sharpness=50) fail
+    // the strict gate's `sharpness >= floor` check. The strict
+    // winner is forced to be an even-i frame, so `winner_pts %
+    // 2000 == 0`.
+    //
+    // Under rank-based sampling: both halves contribute, p25 ≈
+    // 50, the floor lowers to min(100, 50) = 50, all 4097 frames
+    // clear the gate, and the first odd-i frame (ts = 1000)
+    // wins the strict composite argmax (ties broken by first
+    // encounter via `sharper`'s strict-greater semantics).
+    let opts = Options::default()
+      .with_margin_ratio(0.0)
+      .with_target_interval(Duration::from_secs(60 * 60)) // 1 bucket
+      .with_adaptive_floor_min_samples(10);
+    let mut det = Detector::new(opts);
+    for i in 0..4097 {
+      let m = if i % 2 == 0 {
+        good_metrics(200.0)
+      } else {
+        FrameMetrics::new()
+          .with_sharpness(50.0)
+          .with_brightness(128.0)
+          .with_luma_variance(200.0)
+          .with_saturation_variance(100.0)
+          .with_clipping(0.0)
+          .with_colorfulness(500.0)
+      };
+      det.observe(ts(i as i64 * 1000), m);
+    }
+    let out = det.finalize_shot(tr(0, 5_000_000));
+    assert_eq!(out.len(), 1);
+    let winner_pts = out[0].pts();
+    assert_eq!(
+      winner_pts % 2000,
+      1000,
+      "winner pts {winner_pts} must be from an odd-i (high-colorfulness) frame; \
+       a modulo-stride floor would force an even-i / sharp-only winner"
     );
   }
 
