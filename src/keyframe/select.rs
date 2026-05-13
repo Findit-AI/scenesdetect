@@ -985,9 +985,15 @@ fn compute_n_buckets(duration: Duration, opts: &Options) -> usize {
 }
 
 /// Returns the `(effective_start, effective_end)` timestamp of each
-/// bucket, margin applied to the first and last. When the margin eats
-/// the whole bucket (degenerate configuration), falls back to the
-/// un-shrunk bucket so the bucket still has a chance to contribute.
+/// bucket, margin applied to the first and last. When the margin
+/// shrink eats the whole bucket — either in fractional space
+/// (`eff_t1 <= eff_t0`) OR after interpolation truncates fractional
+/// PTS down to the same tick (e.g. a 1-tick shot with non-zero
+/// margin) — falls back to the un-shrunk bucket so the bucket still
+/// has a chance to contribute. Without the post-interpolation
+/// check, a short shot with the default margin can collapse to an
+/// empty `[start, start)` bucket and silently drain every buffered
+/// frame without scoring it.
 fn compute_bucket_ranges(
   range: &TimeRange,
   n: usize,
@@ -1000,12 +1006,23 @@ fn compute_bucket_ranges(
     let t1 = ((b + 1) as f64) / n_f;
     let eff_t0 = if b == 0 { t0 + margin_ratio } else { t0 };
     let eff_t1 = if b == n - 1 { t1 - margin_ratio } else { t1 };
-    let (use_t0, use_t1) = if eff_t1 > eff_t0 {
+    // First fractional-space check: would the shrink even be valid?
+    let (try_t0, try_t1) = if eff_t1 > eff_t0 {
       (eff_t0, eff_t1)
     } else {
-      (t0, t1) // un-shrunk fallback
+      (t0, t1) // un-shrunk fallback (margin too large)
     };
-    out.push((range.interpolate(use_t0), range.interpolate(use_t1)));
+    let shrunk_start = range.interpolate(try_t0);
+    let shrunk_end = range.interpolate(try_t1);
+    // Second check, after the discrete-time interpolation: did
+    // truncation collapse the bucket? Fall back to the un-shrunk
+    // bucket if so.
+    let (use_start, use_end) = if shrunk_end.cmp_semantic(&shrunk_start) == Ordering::Greater {
+      (shrunk_start, shrunk_end)
+    } else {
+      (range.interpolate(t0), range.interpolate(t1))
+    };
+    out.push((use_start, use_end));
   }
   out
 }
@@ -2023,6 +2040,39 @@ mod tests {
 
     let out = det.finalize_shot(tr(0, 10_000_000));
     assert_eq!(out, vec![ts(5_000_000)]);
+  }
+
+  #[test]
+  fn finalize_one_tick_shot_with_default_margin_does_not_collapse() {
+    // Iter-16 regression: a 1-tick shot like `tr(0, 1)` with the
+    // default `margin_ratio = 0.02` produces fractional effective
+    // bounds [0.02, 0.98], both of which interpolate to the same
+    // discrete PTS (rounding to 0). Pre-fix, the bucket walker saw
+    // an empty `[start, start)` bucket and silently drained the
+    // single buffered frame without scoring. Post-fix, the
+    // discrete-time collapse triggers the un-shrunk fallback so
+    // the bucket still emits.
+    let opts = Options::default(); // default margin_ratio = 0.02
+    let mut det = Detector::new(opts);
+    det.observe(ts(0), good_metrics(500.0));
+    let out = det.finalize_shot(tr(0, 1));
+    assert_eq!(out, vec![ts(0)]);
+  }
+
+  #[test]
+  fn finalize_two_tick_shot_with_default_margin_does_not_collapse() {
+    // Same pattern with `tr(0, 2)`: fractional effective bounds
+    // [0.04, 1.96] truncate to discrete PTS [0, 1], not collapsed,
+    // so the shrunk bucket still works. Sanity-check we kept the
+    // non-collapsing case as-is.
+    let opts = Options::default(); // default margin_ratio = 0.02
+    let mut det = Detector::new(opts);
+    det.observe(ts(0), good_metrics(500.0));
+    det.observe(ts(1), good_metrics(400.0));
+    let out = det.finalize_shot(tr(0, 2));
+    // The shrunk bucket [0, 1) catches `ts(0)`; `ts(1)` is in the
+    // post-margin zone and is dropped.
+    assert_eq!(out, vec![ts(0)]);
   }
 
   #[test]
