@@ -511,6 +511,24 @@ pub(crate) fn gradient_anisotropy(
   scalar::Scalar::gradient_anisotropy(mag, dir, width, height)
 }
 
+/// Hasler-Süßstrunk colourfulness metric on packed 24-bit BGR.
+/// See the scalar kernel for the formula. Dispatches to scalar
+/// today; signature preserved for future SIMD backends.
+#[cfg_attr(not(tarpaulin), inline(always))]
+#[allow(unreachable_code)]
+pub(crate) fn colorfulness(
+  bgr: &[u8],
+  width: usize,
+  height: usize,
+  stride: usize,
+  use_simd: bool,
+) -> f32 {
+  if !use_simd {
+    return scalar::Scalar::colorfulness(bgr, width, height, stride);
+  }
+  scalar::Scalar::colorfulness(bgr, width, height, stride)
+}
+
 /// Population mean and variance of a single-plane `u8` image. Honours
 /// row stride. Uses a single-pass `E[X²] - E[X]²` formulation —
 /// numerically safe for `u8` inputs evaluated in `f64` (variance tops
@@ -884,6 +902,55 @@ mod scalar {
       let frac = max_bin / total_f;
       // Normalise so [0.25, 1.0] maps to [0.0, 1.0]; clamp below.
       ((frac - 0.25).max(0.0) / 0.75) as f32
+    }
+
+    /// Hasler-Süßstrunk colourfulness metric on packed 24-bit BGR.
+    /// Single pass, streaming moments on `rg = R - G` and
+    /// `yb = 0.5(R + G) - B`. Returns
+    /// `σ_rgyb + 0.3·μ_rgyb` where
+    /// `σ_rgyb = √(σ²_rg + σ²_yb)` and `μ_rgyb = √(μ²_rg + μ²_yb)`.
+    /// Empty inputs return 0.
+    pub(super) fn colorfulness(bgr: &[u8], w: usize, h: usize, stride: usize) -> f32 {
+      let n = w.saturating_mul(h);
+      if n == 0 {
+        return 0.0;
+      }
+      let n_f = n as f64;
+
+      // Welford-style streaming mean/M2 on rg and yb concurrently.
+      let mut mean_rg: f64 = 0.0;
+      let mut m2_rg: f64 = 0.0;
+      let mut mean_yb: f64 = 0.0;
+      let mut m2_yb: f64 = 0.0;
+      let mut k: u64 = 0;
+
+      for y in 0..h {
+        let row = &bgr[y * stride..y * stride + w * 3];
+        // BGR packed: row[3i] = B, row[3i+1] = G, row[3i+2] = R.
+        for i in 0..w {
+          let b = row[3 * i] as f64;
+          let g = row[3 * i + 1] as f64;
+          let r = row[3 * i + 2] as f64;
+          let rg = r - g;
+          let yb = 0.5 * (r + g) - b;
+          k += 1;
+          let kf = k as f64;
+          let d_rg = rg - mean_rg;
+          mean_rg += d_rg / kf;
+          m2_rg += d_rg * (rg - mean_rg);
+          let d_yb = yb - mean_yb;
+          mean_yb += d_yb / kf;
+          m2_yb += d_yb * (yb - mean_yb);
+        }
+      }
+
+      // Population variance (use k, not k-1) so an all-identical frame
+      // gives σ = 0.
+      let var_rg = (m2_rg / n_f).max(0.0);
+      let var_yb = (m2_yb / n_f).max(0.0);
+      let sigma_rgyb = (var_rg + var_yb).sqrt();
+      let mu_rgyb = (mean_rg * mean_rg + mean_yb * mean_yb).sqrt();
+      (sigma_rgyb + 0.3 * mu_rgyb) as f32
     }
   }
 }
@@ -1366,6 +1433,58 @@ mod tests {
     assert!(a.abs() < 1e-6, "expected ~0.0 for uniform directions, got {a}");
     // Sanity-check the construction wrote nonzero magnitudes.
     assert!(mag.iter().any(|&v| v != 0));
+  }
+
+  #[test]
+  fn scalar_colorfulness_uniform_gray_is_zero() {
+    let w = 16usize;
+    let h = 16usize;
+    let data = vec![128u8; w * h * 3];
+    let c = scalar::Scalar::colorfulness(&data, w, h, w * 3);
+    assert!(c.abs() < 1e-3, "expected ~0.0, got {c}");
+  }
+
+  #[test]
+  fn scalar_colorfulness_pure_red_has_nonzero_score() {
+    // Pure red: B=0, G=0, R=255 → rg = 255, yb = 127.5.
+    // Constant per pixel, so var_rg = var_yb = 0, σ = 0, μ_rgyb =
+    // sqrt(255² + 127.5²) ≈ 285.06.  C = 0 + 0.3 · 285.06 ≈ 85.5.
+    let w = 8usize;
+    let h = 8usize;
+    let mut data = vec![0u8; w * h * 3];
+    for i in 0..(w * h) {
+      data[i * 3 + 2] = 255;
+    }
+    let c = scalar::Scalar::colorfulness(&data, w, h, w * 3);
+    let expected = 0.3_f64 * (255.0_f64.powi(2) + 127.5_f64.powi(2)).sqrt();
+    assert!(
+      ((c as f64) - expected).abs() < 1e-2,
+      "expected ~{expected}, got {c}"
+    );
+  }
+
+  #[test]
+  fn scalar_colorfulness_stride_padding_is_ignored() {
+    let w = 4usize;
+    let h = 4usize;
+    let stride = 32usize; // > 4 * 3 = 12
+    let mut data = vec![200u8; stride * h]; // padding is "color-y"
+    // pixel area: uniform gray
+    for y in 0..h {
+      for x in 0..w {
+        data[y * stride + x * 3] = 128;
+        data[y * stride + x * 3 + 1] = 128;
+        data[y * stride + x * 3 + 2] = 128;
+      }
+    }
+    let c = scalar::Scalar::colorfulness(&data, w, h, stride);
+    assert!(c.abs() < 1e-3, "padding leaked into reduction, got {c}");
+  }
+
+  #[test]
+  fn scalar_colorfulness_empty_frame_is_zero() {
+    let data = vec![0u8];
+    assert_eq!(scalar::Scalar::colorfulness(&data, 0, 0, 0), 0.0);
   }
 
   #[test]

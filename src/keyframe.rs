@@ -26,6 +26,7 @@
 //!   timestamps on shot-boundary events.
 
 pub mod clipping;
+pub mod colorfulness;
 pub mod luma;
 pub mod metrics;
 pub mod motion_blur;
