@@ -207,6 +207,9 @@ pub struct Options {
   sat_variance_threshold: f32,
   max_clipping: f32,
   weights: CompositeWeights,
+  adaptive_floor: bool,
+  adaptive_floor_percentile: f32,
+  adaptive_floor_min_samples: usize,
 }
 
 impl Default for Options {
@@ -223,6 +226,9 @@ impl Default for Options {
       sat_variance_threshold: 3.0,
       max_clipping: 0.5,
       weights: CompositeWeights::new(),
+      adaptive_floor: true,
+      adaptive_floor_percentile: 0.25,
+      adaptive_floor_min_samples: 20,
     }
   }
 }
@@ -329,6 +335,55 @@ impl Options {
   pub const fn with_composite_weights(mut self, w: CompositeWeights) -> Self {
     self.weights = w;
     self
+  }
+
+  /// Enables or disables the adaptive per-shot sharpness floor. When
+  /// enabled (the default), the effective strict-gate sharpness floor
+  /// becomes `min(min_sharpness, p_in_shot)` for shots that meet
+  /// [`Self::adaptive_floor_min_samples`] — the absolute floor is
+  /// only **lowered**, never raised.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn with_adaptive_floor(mut self, on: bool) -> Self {
+    self.adaptive_floor = on;
+    self
+  }
+
+  /// Sets the percentile (in `[0.0, 1.0]`) used by the adaptive floor.
+  ///
+  /// # Panics
+  /// When outside `[0.0, 1.0]`.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub fn with_adaptive_floor_percentile(mut self, p: f32) -> Self {
+    assert!(
+      (0.0..=1.0).contains(&p),
+      "adaptive_floor_percentile must be in [0.0, 1.0]"
+    );
+    self.adaptive_floor_percentile = p;
+    self
+  }
+
+  /// Sets the minimum in-shot sample count required to activate the
+  /// adaptive floor. Below this, the absolute floor is used unchanged.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn with_adaptive_floor_min_samples(mut self, n: usize) -> Self {
+    self.adaptive_floor_min_samples = n;
+    self
+  }
+
+  /// Whether the adaptive per-shot sharpness floor is enabled (read-only accessor).
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn adaptive_floor(&self) -> bool {
+    self.adaptive_floor
+  }
+  /// Adaptive floor percentile (read-only accessor).
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn adaptive_floor_percentile(&self) -> f32 {
+    self.adaptive_floor_percentile
+  }
+  /// Adaptive floor minimum-samples threshold (read-only accessor).
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn adaptive_floor_min_samples(&self) -> usize {
+    self.adaptive_floor_min_samples
   }
 
   /// Composite-quality weights and normalisers (read-only accessor).
@@ -471,6 +526,19 @@ impl Detector {
       _ => return Vec::new(),
     };
 
+    // 2.5. Compute the effective strict-gate sharpness floor for this
+    // shot. If adaptive_floor is enabled and the shot has at least
+    // `adaptive_floor_min_samples` buffered in-range entries, set the
+    // floor to `min(absolute_floor, p_percentile)` — never raising the
+    // floor. This lets legitimate low-detail shots (fog, night
+    // interiors) produce strict winners instead of always degrading
+    // to fallback selection.
+    let effective_min_sharpness = compute_effective_floor(
+      &self.buffer,
+      &range,
+      &self.opts,
+    );
+
     // 3. Compute bucket count and precompute per-bucket effective
     //    [start, end) timestamps (with first-/last-bucket margin shrink).
     let n = compute_n_buckets(duration, &self.opts);
@@ -530,7 +598,7 @@ impl Detector {
       // Strict path: composite-quality ranking among gate-passing
       // frames.
       if !hard_gate(&metrics, &opts)
-        && metrics.sharpness() >= opts.min_sharpness
+        && metrics.sharpness() >= effective_min_sharpness
       {
         let q = composite_quality(&metrics, opts.composite_weights());
         if best_strict.is_none_or(|(_, s)| sharper(q, s)) {
@@ -625,6 +693,37 @@ fn compute_bucket_ranges(
     out.push((range.interpolate(use_t0), range.interpolate(use_t1)));
   }
   out
+}
+
+/// Returns the effective strict-gate sharpness floor for the shot
+/// described by `range`, given the entries currently buffered and the
+/// adaptive-floor options. Never raises the floor above
+/// [`Options::min_sharpness`]; only lowers it.
+fn compute_effective_floor(
+  buffer: &VecDeque<(Timestamp, FrameMetrics)>,
+  range: &TimeRange,
+  opts: &Options,
+) -> f32 {
+  if !opts.adaptive_floor() {
+    return opts.min_sharpness();
+  }
+  // Collect in-range sharpness values.
+  let mut sharps: Vec<f32> = buffer
+    .iter()
+    .filter(|(ts, _)| {
+      ts.cmp_semantic(&range.start()) != Ordering::Less
+        && ts.cmp_semantic(&range.end()) == Ordering::Less
+    })
+    .map(|(_, m)| m.sharpness())
+    .collect();
+  if sharps.len() < opts.adaptive_floor_min_samples() {
+    return opts.min_sharpness();
+  }
+  sharps.sort_by(|a, b| a.partial_cmp(b).unwrap_or(Ordering::Equal));
+  let idx = ((sharps.len() as f32 * opts.adaptive_floor_percentile()) as usize)
+    .min(sharps.len().saturating_sub(1));
+  let p = sharps[idx];
+  opts.min_sharpness().min(p) // never raise the floor
 }
 
 /// Weighted composite of [`FrameMetrics`] used as the strict-pass
@@ -1148,5 +1247,91 @@ mod tests {
 
     let out = det.finalize_shot(tr(0, 2_000_000));
     assert_eq!(out, vec![ts(500_000)]);
+  }
+
+  #[test]
+  fn adaptive_floor_recovers_strict_winner_in_low_detail_shot() {
+    // 25 frames, all with sharpness in [20, 80] — well below the
+    // absolute floor of 100. With adaptive_floor enabled, p25 ≈ 35,
+    // so the strict gate passes any frame ≥ 35. The sharpest among
+    // those becomes the strict winner instead of falling back.
+    let opts = Options::default()
+      .with_margin_ratio(0.0)
+      .with_target_interval(Duration::from_secs(60));
+    let mut det = Detector::new(opts);
+    // 25 frames evenly spaced 0..25 seconds, sharpness ramping 20..80.
+    for i in 0..25 {
+      let s = 20.0 + (i as f32) * 2.5; // 20.0, 22.5, ..., 80.0
+      det.observe(ts((i as i64) * 1_000_000), good_metrics(s));
+    }
+    // Composite-quality argmax with default weights → highest
+    // composite wins. Since brightness/clipping/noise/etc are
+    // identical, the highest-sharpness frame wins.
+    let out = det.finalize_shot(tr(0, 30_000_000));
+    assert_eq!(out, vec![ts(24_000_000)]); // last frame, sharpness 80
+  }
+
+  #[test]
+  fn adaptive_floor_disabled_falls_back_to_absolute_floor() {
+    // 25 frames all below the absolute floor of 100. With adaptive
+    // floor explicitly disabled, the strict gate rejects every frame
+    // and we drop to fallback (pure sharpness). The result should
+    // still be the sharpest frame — but via the fallback path.
+    let weights = CompositeWeights::new()
+      .with_noise(10.0, 1.0); // huge noise penalty
+    let opts = Options::default()
+      .with_margin_ratio(0.0)
+      .with_target_interval(Duration::from_secs(60))
+      .with_adaptive_floor(false)
+      .with_composite_weights(weights);
+    let mut det = Detector::new(opts);
+    let sharpest_with_noise = FrameMetrics::new()
+      .with_sharpness(80.0)
+      .with_brightness(128.0)
+      .with_luma_variance(200.0)
+      .with_saturation_variance(100.0)
+      .with_clipping(0.0)
+      .with_noise(1.0);
+    for i in 0..24 {
+      let s = 20.0 + (i as f32) * 2.5;
+      det.observe(ts((i as i64) * 1_000_000), good_metrics(s));
+    }
+    det.observe(ts(24_000_000), sharpest_with_noise);
+    let out = det.finalize_shot(tr(0, 30_000_000));
+    assert_eq!(out, vec![ts(24_000_000)]);
+  }
+
+  #[test]
+  fn adaptive_floor_does_not_raise_floor_in_high_sharpness_shot() {
+    // All frames at sharpness 500 — p25 = 500, well above the
+    // absolute floor of 100. Effective floor must remain 100 (not
+    // jump up to 500), so any frame with sharpness >= 100 still
+    // passes.
+    let opts = Options::default()
+      .with_margin_ratio(0.0)
+      .with_target_interval(Duration::from_secs(60));
+    let mut det = Detector::new(opts);
+    for i in 0..25 {
+      det.observe(ts((i as i64) * 1_000_000), good_metrics(500.0));
+    }
+    let out = det.finalize_shot(tr(0, 30_000_000));
+    assert_eq!(out.len(), 1, "exactly one winner expected");
+  }
+
+  #[test]
+  fn adaptive_floor_uses_absolute_below_min_samples() {
+    // Only 5 frames in the shot — below the default min_samples=20.
+    // Adaptive floor must NOT activate; absolute floor applies.
+    let opts = Options::default()
+      .with_margin_ratio(0.0)
+      .with_target_interval(Duration::from_secs(60));
+    let mut det = Detector::new(opts);
+    for i in 0..5 {
+      det.observe(ts((i as i64) * 1_000_000), good_metrics(50.0)); // < 100
+    }
+    let out = det.finalize_shot(tr(0, 10_000_000));
+    // No frame passes the absolute floor → fallback picks the only
+    // candidate (all tied at 50.0).
+    assert_eq!(out.len(), 1);
   }
 }
