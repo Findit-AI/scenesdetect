@@ -158,6 +158,27 @@ const MAX_FRAMES_PER_SHOT_CAP: u32 = 4_096;
 // degradation given the unbounded-OOM alternative.
 const MAX_ADAPTIVE_FLOOR_SAMPLES: usize = 4_096;
 
+// Hard upper bound on the number of `(Timestamp, FrameMetrics)`
+// entries [`Detector::observe`] retains in `self.buffer` before
+// the next [`Detector::finalize_shot`] drains them. Without this
+// cap, the buffer grows unbounded for any workload that streams
+// past a missed scene cut, never finalises a shot, or contains
+// a genuinely long-running shot — eventually exhausting the
+// process's memory. Cap at `65_536`: at ~80 bytes per entry
+// (`Timestamp + FrameMetrics + VecDeque slot overhead`), that's
+// ~5 MB max, well above the `~few-hundred-frames-per-shot`
+// realistic workload while still bounded for any adversarial
+// input.
+//
+// Eviction policy is FIFO (drop the oldest entry on overflow):
+// the buffer is monotonically PTS-ordered, so dropping the
+// front preserves the recent-window selection context. A
+// drop-new policy would silently freeze the buffer at its first
+// `MAX_BUFFER_FRAMES` observations and starve every later
+// bucket of candidates; drop-old at least gives the trailing
+// edge of an over-long shot a chance to win.
+const MAX_BUFFER_FRAMES: usize = 65_536;
+
 /// Returns `v` when it is finite, otherwise `default`. Used by the
 /// f32 threshold builders that have no documented range but must
 /// still produce a value that `hard_gate`'s `<`/`>` comparisons
@@ -818,6 +839,15 @@ impl Detector {
   /// tolerate minor ordering slop over aborting mid-stream — but if
   /// you care about catching decoder bugs, run with debug assertions
   /// enabled.
+  ///
+  /// The buffer is bounded at `MAX_BUFFER_FRAMES = 65_536` entries. A
+  /// caller that streams indefinitely without finalising shots (or
+  /// finalises a single genuinely-long shot) will silently evict the
+  /// OLDEST buffered entry on each subsequent `observe`, keeping the
+  /// most-recent `MAX_BUFFER_FRAMES` observations. This is a defence
+  /// against unbounded growth (process OOM, latency spikes); under
+  /// realistic workloads — `target_interval = 4 s` at 30 fps gives
+  /// ~120 frames per shot — the cap never binds.
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub fn observe(&mut self, ts: Timestamp, metrics: FrameMetrics) {
     debug_assert!(
@@ -827,6 +857,9 @@ impl Detector {
         .is_none_or(|(prev, _)| prev.cmp_semantic(&ts) != Ordering::Greater),
       "observe() frames must arrive in non-decreasing PTS order"
     );
+    if self.buffer.len() >= MAX_BUFFER_FRAMES {
+      self.buffer.pop_front();
+    }
     self.buffer.push_back((ts, metrics));
   }
 
@@ -2300,6 +2333,62 @@ mod tests {
     det.observe(ts(0), good_metrics(100.0));
     det.observe(ts(1_000), good_metrics(200.0));
     assert_eq!(det.buffered(), 2);
+  }
+
+  #[test]
+  fn observe_evicts_oldest_at_buffer_cap() {
+    // Iter-21 regression: pre-fix, `observe` had no cap on the
+    // internal buffer. A caller that streamed past a missed scene
+    // cut, never finalised a shot, or pushed a genuinely-long
+    // single shot would accumulate `(Timestamp, FrameMetrics)`
+    // entries indefinitely — OOM/latency before selection ever
+    // ran. Post-fix the buffer is bounded at `MAX_BUFFER_FRAMES`
+    // and the OLDEST entry is evicted on each subsequent
+    // `observe` (drop-front sliding window; preserves the
+    // recent-context selection invariant).
+    //
+    // Push `cap + N` distinct frames and verify:
+    //   1. `buffered()` saturates at the cap (no unbounded
+    //      growth).
+    //   2. The first N timestamps were evicted (drop-front, not
+    //      drop-back — a `Detector` that froze at the first
+    //      `cap` observations would starve every later bucket of
+    //      candidates).
+    //   3. The most-recent `cap` frames are still in the buffer
+    //      in PTS order and `finalize_shot` can score them.
+    let mut det = Detector::new(Options::default());
+    const N: usize = 64;
+    for i in 0..MAX_BUFFER_FRAMES + N {
+      det.observe(ts(i as i64 * 1_000), good_metrics(100.0));
+    }
+    assert_eq!(
+      det.buffered(),
+      MAX_BUFFER_FRAMES,
+      "buffer must saturate at MAX_BUFFER_FRAMES"
+    );
+    // Drain through finalize_shot over the FULL observation range
+    // and confirm the surviving timestamps are the *trailing*
+    // window, not the leading one.
+    let total = (MAX_BUFFER_FRAMES + N) as i64;
+    let opts = Options::default()
+      .with_margin_ratio(0.0)
+      .with_target_interval(Duration::from_secs(60 * 60));
+    let mut probe = Detector::new(opts);
+    for i in 0..MAX_BUFFER_FRAMES + N {
+      probe.observe(ts(i as i64 * 1_000), good_metrics(100.0));
+    }
+    // 1 bucket; the strict path runs but every frame's composite
+    // is identical → first surviving frame wins. The first
+    // surviving timestamp is `N * 1_000` (the leading `N` were
+    // evicted).
+    let out = probe.finalize_shot(tr(0, total * 1_000 + 1));
+    assert_eq!(out.len(), 1);
+    assert_eq!(
+      out[0].pts(),
+      N as i64 * 1_000,
+      "oldest surviving frame must be the (N+1)th observation; \
+       drop-back would have kept ts=0"
+    );
   }
 
   #[test]
