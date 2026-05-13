@@ -47,6 +47,9 @@ use core::{cmp::Ordering, time::Duration};
 
 use std::{collections::VecDeque, vec::Vec};
 
+use derive_more::IsVariant;
+use thiserror::Error;
+
 use crate::{
   frame::{TimeRange, Timestamp},
   keyframe::metrics::FrameMetrics,
@@ -170,13 +173,14 @@ const MAX_ADAPTIVE_FLOOR_SAMPLES: usize = 4_096;
 // realistic workload while still bounded for any adversarial
 // input.
 //
-// Eviction policy is FIFO (drop the oldest entry on overflow):
-// the buffer is monotonically PTS-ordered, so dropping the
-// front preserves the recent-window selection context. A
-// drop-new policy would silently freeze the buffer at its first
-// `MAX_BUFFER_FRAMES` observations and starve every later
-// bucket of candidates; drop-old at least gives the trailing
-// edge of an over-long shot a chance to win.
+// Overflow policy is **refuse-and-surface**: `observe` returns
+// [`ObserveError::BufferFull`] and does not push the new entry.
+// Silently evicting on overflow (drop-old or drop-new) would
+// hand the caller a `Vec<Timestamp>` from a truncated buffer
+// with no signal that coverage is incomplete; the explicit
+// error forces callers to drain (via [`Detector::finalize_shot`]
+// or [`Detector::clear`]) or back off before the gap reaches
+// downstream extraction.
 const MAX_BUFFER_FRAMES: usize = 65_536;
 
 /// Returns `v` when it is finite, otherwise `default`. Used by the
@@ -798,6 +802,43 @@ impl Options {
 
 // ---- Detector --------------------------------------------------------------
 
+/// Reason [`Detector::observe`] rejected a frame.
+///
+/// Returning an error instead of silently swallowing the frame
+/// is deliberate: both failure modes break the selector's
+/// non-decreasing-PTS / bounded-buffer invariants, so a caller
+/// that wants temporally-complete keyframe coverage MUST know
+/// when a frame was dropped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, IsVariant, Error)]
+#[non_exhaustive]
+pub enum ObserveError {
+  /// The internal buffer has reached its capacity of 65,536
+  /// `(Timestamp, FrameMetrics)` entries. The new frame was
+  /// **not** added; call [`Detector::finalize_shot`] to drain
+  /// the buffer or [`Detector::clear`] to reset it before
+  /// observing more frames.
+  ///
+  /// Hitting this error usually means a scene cut was missed
+  /// upstream (or no scene boundary exists in the input): the
+  /// caller is feeding frames faster than they can be finalised
+  /// into shots. Selection coverage will be incomplete for the
+  /// trailing frames until the buffer is drained.
+  #[error("Detector::observe buffer at capacity (65_536 entries)")]
+  BufferFull,
+
+  /// The new frame's PTS is strictly less than the most-recently
+  /// buffered frame's PTS, violating the non-decreasing-PTS
+  /// invariant the bucket walker and adaptive-floor scan
+  /// require. The new frame was **not** added.
+  ///
+  /// Hitting this error means the upstream decoder emitted
+  /// frames out of presentation order (or a B-frame's PTS was
+  /// computed incorrectly). Either fix the source ordering or
+  /// drop / re-order the offending frame before observing.
+  #[error("Detector::observe called with a frame whose PTS is less than the previous observation")]
+  OutOfOrder,
+}
+
 /// The keyframe selection state machine.
 #[derive(Debug, Clone)]
 pub struct Detector {
@@ -827,40 +868,51 @@ impl Detector {
     self.buffer.len()
   }
 
-  /// Appends a scored frame to the buffer. Callers must feed frames in
-  /// non-decreasing PTS order.
+  /// Appends a scored frame to the buffer. Returns
+  /// `Err(`[`ObserveError`]`)` when the frame cannot be accepted;
+  /// in every error case the new frame is **not** added to the
+  /// buffer.
   ///
-  /// In debug builds, an out-of-order call panics via `debug_assert!`.
-  /// In release builds the precondition is not checked; an out-of-order
-  /// entry reaches the bucket-walker in [`Self::finalize_shot`] and is
-  /// silently dropped (either because it predates the cursor's current
-  /// bucket start, or because it lands in a gap between buckets). This
-  /// is the intended failure mode — keyframe selection prefers to
-  /// tolerate minor ordering slop over aborting mid-stream — but if
-  /// you care about catching decoder bugs, run with debug assertions
-  /// enabled.
+  /// Two invariants must hold:
   ///
-  /// The buffer is bounded at `MAX_BUFFER_FRAMES = 65_536` entries. A
-  /// caller that streams indefinitely without finalising shots (or
-  /// finalises a single genuinely-long shot) will silently evict the
-  /// OLDEST buffered entry on each subsequent `observe`, keeping the
-  /// most-recent `MAX_BUFFER_FRAMES` observations. This is a defence
-  /// against unbounded growth (process OOM, latency spikes); under
-  /// realistic workloads — `target_interval = 4 s` at 30 fps gives
-  /// ~120 frames per shot — the cap never binds.
+  /// 1. **Non-decreasing PTS.** Frames must arrive in
+  ///    presentation order; the bucket walker in
+  ///    [`Self::finalize_shot`] and the adaptive-floor scan both
+  ///    rely on this. A call with `ts <` the previous
+  ///    observation's PTS returns
+  ///    [`ObserveError::OutOfOrder`]; the new frame is dropped
+  ///    rather than corrupting downstream selection silently.
+  ///
+  /// 2. **Bounded buffer.** The detector retains at most 65,536
+  ///    `(Timestamp, FrameMetrics)` entries between
+  ///    [`Self::finalize_shot`] / [`Self::clear`] calls. Once
+  ///    the cap is hit, every further `observe` returns
+  ///    [`ObserveError::BufferFull`] until the buffer is
+  ///    drained. The cap exists to prevent unbounded growth
+  ///    (process OOM, latency spikes) on long-running shots or
+  ///    callers that miss scene boundaries; under realistic
+  ///    workloads — `target_interval = 4 s` at 30 fps gives
+  ///    ~120 frames per shot — it never binds.
+  ///
+  /// Callers that want temporally-complete keyframe coverage
+  /// MUST propagate the error: a silent drop on overflow or
+  /// out-of-order PTS could leave entire buckets unrepresented
+  /// in the emitted [`Vec<Timestamp>`] without any indication
+  /// to downstream consumers.
   #[cfg_attr(not(tarpaulin), inline(always))]
-  pub fn observe(&mut self, ts: Timestamp, metrics: FrameMetrics) {
-    debug_assert!(
-      self
-        .buffer
-        .back()
-        .is_none_or(|(prev, _)| prev.cmp_semantic(&ts) != Ordering::Greater),
-      "observe() frames must arrive in non-decreasing PTS order"
-    );
+  pub fn observe(&mut self, ts: Timestamp, metrics: FrameMetrics) -> Result<(), ObserveError> {
+    if self
+      .buffer
+      .back()
+      .is_some_and(|(prev, _)| prev.cmp_semantic(&ts) == Ordering::Greater)
+    {
+      return Err(ObserveError::OutOfOrder);
+    }
     if self.buffer.len() >= MAX_BUFFER_FRAMES {
-      self.buffer.pop_front();
+      return Err(ObserveError::BufferFull);
     }
     self.buffer.push_back((ts, metrics));
+    Ok(())
   }
 
   /// A shot boundary has been confirmed. Drains every buffered entry
@@ -1658,8 +1710,8 @@ mod tests {
       .with_clipping(-1.0) // negative penalty → bonus pre-fix
       .with_noise(-1000.0) // negative penalty → huge bonus pre-fix
       .with_motion_blur(-1.0);
-    det.observe(ts(500_000), malformed);
-    det.observe(ts(1_500_000), clean);
+    det.observe(ts(500_000), malformed).unwrap();
+    det.observe(ts(1_500_000), clean).unwrap();
     let out = det.finalize_shot(tr(0, 2_000_000));
     // The malformed frame is rejected by hard_gate → strict path
     // skips it. Fallback path also skips it on sharpness domain
@@ -1689,8 +1741,8 @@ mod tests {
       .with_luma_variance(200.0)
       .with_saturation_variance(100.0)
       .with_clipping(0.0);
-    det.observe(ts(500_000), corrupt);
-    det.observe(ts(1_500_000), valid);
+    det.observe(ts(500_000), corrupt).unwrap();
+    det.observe(ts(1_500_000), valid).unwrap();
     let out = det.finalize_shot(tr(0, 2_000_000));
     // Fallback selects `valid` (sharpness=50, in-domain), not
     // `corrupt` (sharpness=-100, filtered).
@@ -1756,8 +1808,8 @@ mod tests {
       .with_luma_variance(200.0)
       .with_saturation_variance(100.0)
       .with_clipping(0.0);
-    det.observe(ts(500_000), impossible);
-    det.observe(ts(1_500_000), valid);
+    det.observe(ts(500_000), impossible).unwrap();
+    det.observe(ts(1_500_000), valid).unwrap();
     let out = det.finalize_shot(tr(0, 2_000_000));
     assert_eq!(out, vec![ts(1_500_000)]);
   }
@@ -1783,8 +1835,8 @@ mod tests {
       .with_luma_variance(200.0)
       .with_saturation_variance(100.0)
       .with_clipping(0.0);
-    det.observe(ts(500_000), above_phys);
-    det.observe(ts(1_500_000), valid);
+    det.observe(ts(500_000), above_phys).unwrap();
+    det.observe(ts(1_500_000), valid).unwrap();
     let out = det.finalize_shot(tr(0, 2_000_000));
     assert_eq!(out, vec![ts(1_500_000)]);
   }
@@ -1809,8 +1861,8 @@ mod tests {
       .with_luma_variance(200.0)
       .with_saturation_variance(100.0)
       .with_clipping(0.0);
-    det.observe(ts(500_000), above_phys);
-    det.observe(ts(1_500_000), valid);
+    det.observe(ts(500_000), above_phys).unwrap();
+    det.observe(ts(1_500_000), valid).unwrap();
     let out = det.finalize_shot(tr(0, 2_000_000));
     assert_eq!(out, vec![ts(1_500_000)]);
   }
@@ -1843,8 +1895,8 @@ mod tests {
       .with_luma_variance(200.0)
       .with_saturation_variance(100.0)
       .with_clipping(0.0);
-    det.observe(ts(500_000), corrupt);
-    det.observe(ts(1_500_000), valid);
+    det.observe(ts(500_000), corrupt).unwrap();
+    det.observe(ts(1_500_000), valid).unwrap();
     let out = det.finalize_shot(tr(0, 2_000_000));
     // Post-fix: `corrupt` is filtered from fallback (out-of-domain
     // noise), so `valid` wins despite lower sharpness.
@@ -1866,7 +1918,7 @@ mod tests {
       .with_luma_variance(200.0)
       .with_saturation_variance(100.0)
       .with_clipping(0.0);
-    det.observe(ts(500_000), m);
+    det.observe(ts(500_000), m).unwrap();
     let out = det.finalize_shot(tr(0, 2_000_000));
     assert!(out.is_empty(), "fully-corrupt frame must not emit");
   }
@@ -1925,7 +1977,7 @@ mod tests {
     let mut det = Detector::new(opts);
     // A finite-but-low sharpness that should fail the absolute floor.
     let low = good_metrics(50.0);
-    det.observe(ts(500_000), low);
+    det.observe(ts(500_000), low).unwrap();
     let out = det.finalize_shot(tr(0, 2_000_000));
     // Low frame fails the strict floor (now 100.0) → fallback emits
     // the single candidate. The important property is that the
@@ -1952,7 +2004,9 @@ mod tests {
     // 20 finite frames at sharpness ~50 (well below absolute 100).
     for i in 0..20 {
       let s = 40.0 + (i as f32) * 1.0; // 40..59
-      det.observe(ts((i as i64) * 100_000), good_metrics(s));
+      det
+        .observe(ts((i as i64) * 100_000), good_metrics(s))
+        .unwrap();
     }
     // 5 corrupt frames with -Inf sharpness, sprinkled later.
     for i in 0..5 {
@@ -1962,7 +2016,9 @@ mod tests {
         .with_luma_variance(200.0)
         .with_saturation_variance(100.0)
         .with_clipping(0.0);
-      det.observe(ts(2_100_000 + (i as i64) * 100_000), m);
+      det
+        .observe(ts(2_100_000 + (i as i64) * 100_000), m)
+        .unwrap();
     }
     let out = det.finalize_shot(tr(0, 30_000_000));
     // With -Inf filtered out, p25 of [40..59] is ~44, effective
@@ -2006,10 +2062,12 @@ mod tests {
         .with_luma_variance(200.0)
         .with_saturation_variance(100.0)
         .with_clipping(-0.5); // out of domain → corrupt
-      det.observe(ts((i as i64) * 100_000), m);
+      det.observe(ts((i as i64) * 100_000), m).unwrap();
     }
     for i in 0..5 {
-      det.observe(ts(2_100_000 + (i as i64) * 100_000), good_metrics(50.0));
+      det
+        .observe(ts(2_100_000 + (i as i64) * 100_000), good_metrics(50.0))
+        .unwrap();
     }
     let out = det.finalize_shot(tr(0, 30_000_000));
     // Corrupt frames are filtered from the percentile pool, so p25
@@ -2051,10 +2109,10 @@ mod tests {
     let mut det = Detector::new(opts);
     // High-sharpness frame in the pre-margin zone (would lift p25
     // if it counted).
-    det.observe(ts(500_000), good_metrics(5_000.0));
+    det.observe(ts(500_000), good_metrics(5_000.0)).unwrap();
     // Valid interior frames, below absolute floor of 100.
-    det.observe(ts(2_000_000), good_metrics(40.0));
-    det.observe(ts(5_000_000), good_metrics(60.0));
+    det.observe(ts(2_000_000), good_metrics(40.0)).unwrap();
+    det.observe(ts(5_000_000), good_metrics(60.0)).unwrap();
     let out = det.finalize_shot(tr(0, 10_000_000));
     // Post-fix: pre-margin frame excluded from the floor pool,
     // adaptive floor recovers a strict winner among the interior
@@ -2087,7 +2145,9 @@ mod tests {
       // All frames at sharpness 50 (below absolute floor of 100).
       // Adaptive should lower the floor to ~50 and emit a strict
       // winner.
-      det.observe(ts(i as i64 * 1000), good_metrics(50.0));
+      det
+        .observe(ts(i as i64 * 1000), good_metrics(50.0))
+        .unwrap();
     }
     let out = det.finalize_shot(tr(0, 20_000_000));
     // A strict winner emerges (adaptive floor lowered to 50).
@@ -2112,11 +2172,15 @@ mod tests {
     let mut det = Detector::new(opts);
     // First 4000 sharp frames.
     for i in 0..4000 {
-      det.observe(ts(i as i64 * 1000), good_metrics(5_000.0));
+      det
+        .observe(ts(i as i64 * 1000), good_metrics(5_000.0))
+        .unwrap();
     }
     // Last 2000 dim frames, well below absolute floor 100.
     for i in 4000..6000 {
-      det.observe(ts(i as i64 * 1000), good_metrics(50.0));
+      det
+        .observe(ts(i as i64 * 1000), good_metrics(50.0))
+        .unwrap();
     }
     let out = det.finalize_shot(tr(0, 7_000_000));
     // Adaptive floor with stride sampling sees both halves; p25
@@ -2183,7 +2247,7 @@ mod tests {
           .with_clipping(0.0)
           .with_colorfulness(500.0)
       };
-      det.observe(ts(i as i64 * 1000), m);
+      det.observe(ts(i as i64 * 1000), m).unwrap();
     }
     let out = det.finalize_shot(tr(0, 5_000_000));
     assert_eq!(out.len(), 1);
@@ -2240,7 +2304,7 @@ mod tests {
         .with_luma_variance(200.0)
         .with_saturation_variance(100.0)
         .with_clipping(0.0);
-      det.observe(ts(i as i64 * 1000), dark);
+      det.observe(ts(i as i64 * 1000), dark).unwrap();
     }
     let mediocre = FrameMetrics::new()
       .with_sharpness(50.0)
@@ -2249,9 +2313,11 @@ mod tests {
       .with_saturation_variance(100.0)
       .with_clipping(0.0)
       .with_colorfulness(500.0);
-    det.observe(ts(100_000), mediocre);
+    det.observe(ts(100_000), mediocre).unwrap();
     for i in 0..9 {
-      det.observe(ts(101_000 + i as i64 * 1000), good_metrics(200.0));
+      det
+        .observe(ts(101_000 + i as i64 * 1000), good_metrics(200.0))
+        .unwrap();
     }
     let out = det.finalize_shot(tr(0, 200_000));
     assert_eq!(out.len(), 1);
@@ -2279,7 +2345,9 @@ mod tests {
     // 5000 dim frames (below absolute floor of 100). True count
     // exceeds min_samples; adaptive must engage.
     for i in 0..5000 {
-      det.observe(ts(i as i64 * 1000), good_metrics(50.0));
+      det
+        .observe(ts(i as i64 * 1000), good_metrics(50.0))
+        .unwrap();
     }
     let out = det.finalize_shot(tr(0, 6_000_000));
     // Adaptive floor lowers to ~50 → a strict winner emerges.
@@ -2310,12 +2378,14 @@ mod tests {
       .with_adaptive_floor_min_samples(2);
     let mut det = Detector::new(opts);
     // Two in-window frames at sharpness 200 (above absolute floor 100).
-    det.observe(ts(100_000), good_metrics(200.0));
-    det.observe(ts(500_000), good_metrics(250.0));
+    det.observe(ts(100_000), good_metrics(200.0)).unwrap();
+    det.observe(ts(500_000), good_metrics(250.0)).unwrap();
     // 5_000 future-shot frames at sharpness 10 (would drag p25 down
     // pre-fix). Range cut-off is at 1_000_000; these are AFTER.
     for i in 0..5_000 {
-      det.observe(ts(2_000_000 + (i as i64) * 1000), good_metrics(10.0));
+      det
+        .observe(ts(2_000_000 + (i as i64) * 1000), good_metrics(10.0))
+        .unwrap();
     }
     let out = det.finalize_shot(tr(0, 1_000_000));
     // In-window frames win strict; the future frames don't pollute
@@ -2330,71 +2400,122 @@ mod tests {
   #[test]
   fn observe_and_buffered() {
     let mut det = Detector::new(Options::default());
-    det.observe(ts(0), good_metrics(100.0));
-    det.observe(ts(1_000), good_metrics(200.0));
+    det.observe(ts(0), good_metrics(100.0)).unwrap();
+    det.observe(ts(1_000), good_metrics(200.0)).unwrap();
     assert_eq!(det.buffered(), 2);
   }
 
   #[test]
-  fn observe_evicts_oldest_at_buffer_cap() {
-    // Iter-21 regression: pre-fix, `observe` had no cap on the
-    // internal buffer. A caller that streamed past a missed scene
-    // cut, never finalised a shot, or pushed a genuinely-long
-    // single shot would accumulate `(Timestamp, FrameMetrics)`
-    // entries indefinitely — OOM/latency before selection ever
-    // ran. Post-fix the buffer is bounded at `MAX_BUFFER_FRAMES`
-    // and the OLDEST entry is evicted on each subsequent
-    // `observe` (drop-front sliding window; preserves the
-    // recent-context selection invariant).
+  fn observe_refuses_at_buffer_cap_and_signals_overflow() {
+    // Iter-22 regression: pre-fix, `observe` returned `()` and
+    // either (a) accepted every frame unboundedly, OOMing the
+    // process on long shots, or (b) silently evicted the oldest
+    // entry on overflow — handing the caller a truncated buffer
+    // with no signal that coverage was incomplete.
     //
-    // Push `cap + N` distinct frames and verify:
-    //   1. `buffered()` saturates at the cap (no unbounded
-    //      growth).
-    //   2. The first N timestamps were evicted (drop-front, not
-    //      drop-back — a `Detector` that froze at the first
-    //      `cap` observations would starve every later bucket of
-    //      candidates).
-    //   3. The most-recent `cap` frames are still in the buffer
-    //      in PTS order and `finalize_shot` can score them.
+    // Post-fix `observe` returns `Result<(), ObserveError>` and
+    // the buffer is refuse-and-surface bounded at
+    // `MAX_BUFFER_FRAMES`. The first `MAX_BUFFER_FRAMES` calls
+    // succeed; every further call returns
+    // `Err(ObserveError::BufferFull)` and does NOT push the new
+    // frame. `buffered()` stays at the cap, and the frames that
+    // are in the buffer are exactly the FIRST
+    // `MAX_BUFFER_FRAMES` observations (drop-new — preserves
+    // strict PTS-monotonicity for the bucket walker by never
+    // mutating already-buffered entries).
     let mut det = Detector::new(Options::default());
-    const N: usize = 64;
-    for i in 0..MAX_BUFFER_FRAMES + N {
-      det.observe(ts(i as i64 * 1_000), good_metrics(100.0));
+    for i in 0..MAX_BUFFER_FRAMES {
+      det
+        .observe(ts(i as i64 * 1_000), good_metrics(100.0))
+        .unwrap();
     }
     assert_eq!(
       det.buffered(),
       MAX_BUFFER_FRAMES,
-      "buffer must saturate at MAX_BUFFER_FRAMES"
+      "first MAX_BUFFER_FRAMES observations must all be accepted"
     );
-    // Drain through finalize_shot over the FULL observation range
-    // and confirm the surviving timestamps are the *trailing*
-    // window, not the leading one.
-    let total = (MAX_BUFFER_FRAMES + N) as i64;
+    // The next 64 observations must all fail with `BufferFull`
+    // and must NOT change `buffered()`.
+    for i in MAX_BUFFER_FRAMES..MAX_BUFFER_FRAMES + 64 {
+      let err = det
+        .observe(ts(i as i64 * 1_000), good_metrics(100.0))
+        .expect_err("observe past cap must return Err");
+      assert_eq!(err, ObserveError::BufferFull);
+      assert_eq!(
+        det.buffered(),
+        MAX_BUFFER_FRAMES,
+        "buffered() must not change after BufferFull"
+      );
+    }
+    // Drain via finalize_shot over the LEADING window; the
+    // first observation (ts=0) must still be there to win the
+    // single-bucket strict argmax. (Drop-new keeps the head;
+    // drop-old would have evicted ts=0 and the winner would be
+    // a later frame.)
+    let total = MAX_BUFFER_FRAMES as i64 * 1_000;
     let opts = Options::default()
       .with_margin_ratio(0.0)
       .with_target_interval(Duration::from_secs(60 * 60));
     let mut probe = Detector::new(opts);
-    for i in 0..MAX_BUFFER_FRAMES + N {
-      probe.observe(ts(i as i64 * 1_000), good_metrics(100.0));
+    for i in 0..MAX_BUFFER_FRAMES {
+      probe
+        .observe(ts(i as i64 * 1_000), good_metrics(100.0))
+        .unwrap();
     }
-    // 1 bucket; the strict path runs but every frame's composite
-    // is identical → first surviving frame wins. The first
-    // surviving timestamp is `N * 1_000` (the leading `N` were
-    // evicted).
-    let out = probe.finalize_shot(tr(0, total * 1_000 + 1));
+    for i in MAX_BUFFER_FRAMES..MAX_BUFFER_FRAMES + 64 {
+      let _ = probe.observe(ts(i as i64 * 1_000), good_metrics(100.0));
+    }
+    let out = probe.finalize_shot(tr(0, total + 1));
     assert_eq!(out.len(), 1);
     assert_eq!(
       out[0].pts(),
-      N as i64 * 1_000,
-      "oldest surviving frame must be the (N+1)th observation; \
-       drop-back would have kept ts=0"
+      0,
+      "ts=0 (first observation) must still be in the buffer; \
+       a drop-old eviction policy would have removed it"
     );
+  }
+
+  #[test]
+  fn observe_rejects_out_of_order_pts() {
+    // Iter-22 regression: pre-fix, only a `debug_assert!`
+    // checked the non-decreasing-PTS invariant — release builds
+    // silently appended out-of-order frames, which then
+    // misbucketed (the bucket walker uses ordered `skip_while`
+    // / `take_while` and the adaptive-floor pool relies on the
+    // monotonic-PTS guarantee for its terminator). Post-fix,
+    // `observe` rejects the violating frame at runtime in
+    // every build flavour with `Err(ObserveError::OutOfOrder)`
+    // and the buffer is left unchanged.
+    let mut det = Detector::new(Options::default());
+    det.observe(ts(1_000), good_metrics(100.0)).unwrap();
+    det.observe(ts(2_000), good_metrics(150.0)).unwrap();
+    // Equal PTS to the previous observation is still accepted —
+    // the invariant is *non-decreasing*, not strictly
+    // increasing (variable-frame-rate sources can legitimately
+    // emit two frames at the same presentation timestamp).
+    det.observe(ts(2_000), good_metrics(125.0)).unwrap();
+    assert_eq!(det.buffered(), 3);
+    // A frame whose PTS is strictly less than the most-recently
+    // buffered PTS must be rejected.
+    let err = det
+      .observe(ts(1_500), good_metrics(200.0))
+      .expect_err("strictly-less PTS must return Err");
+    assert_eq!(err, ObserveError::OutOfOrder);
+    assert_eq!(
+      det.buffered(),
+      3,
+      "rejected frame must not be added to the buffer"
+    );
+    // After the rejection, subsequent in-order observations
+    // must continue to succeed.
+    det.observe(ts(3_000), good_metrics(300.0)).unwrap();
+    assert_eq!(det.buffered(), 4);
   }
 
   #[test]
   fn clear_empties_buffer() {
     let mut det = Detector::new(Options::default());
-    det.observe(ts(0), good_metrics(100.0));
+    det.observe(ts(0), good_metrics(100.0)).unwrap();
     det.clear();
     assert_eq!(det.buffered(), 0);
   }
@@ -2404,9 +2525,9 @@ mod tests {
     // 2-second shot with target_interval=4s → 1 bucket.
     let opts = Options::default().with_margin_ratio(0.0); // disable margin
     let mut det = Detector::new(opts);
-    det.observe(ts(0), good_metrics(100.0));
-    det.observe(ts(500_000), good_metrics(500.0)); // sharpest
-    det.observe(ts(1_500_000), good_metrics(200.0));
+    det.observe(ts(0), good_metrics(100.0)).unwrap();
+    det.observe(ts(500_000), good_metrics(500.0)).unwrap(); // sharpest
+    det.observe(ts(1_500_000), good_metrics(200.0)).unwrap();
 
     let out = det.finalize_shot(tr(0, 2_000_000));
     assert_eq!(out, vec![ts(500_000)]);
@@ -2420,17 +2541,17 @@ mod tests {
     let mut det = Detector::new(opts);
 
     // Bucket 0: [0, 4s). Best at 1s.
-    det.observe(ts(500_000), good_metrics(100.0));
-    det.observe(ts(1_000_000), good_metrics(300.0));
-    det.observe(ts(3_500_000), good_metrics(150.0));
+    det.observe(ts(500_000), good_metrics(100.0)).unwrap();
+    det.observe(ts(1_000_000), good_metrics(300.0)).unwrap();
+    det.observe(ts(3_500_000), good_metrics(150.0)).unwrap();
     // Bucket 1: [4s, 8s). Best at 5s.
-    det.observe(ts(4_500_000), good_metrics(200.0));
-    det.observe(ts(5_000_000), good_metrics(500.0));
-    det.observe(ts(7_500_000), good_metrics(100.0));
+    det.observe(ts(4_500_000), good_metrics(200.0)).unwrap();
+    det.observe(ts(5_000_000), good_metrics(500.0)).unwrap();
+    det.observe(ts(7_500_000), good_metrics(100.0)).unwrap();
     // Bucket 2: [8s, 12s). Best at 10s.
-    det.observe(ts(9_000_000), good_metrics(150.0));
-    det.observe(ts(10_000_000), good_metrics(450.0));
-    det.observe(ts(11_500_000), good_metrics(200.0));
+    det.observe(ts(9_000_000), good_metrics(150.0)).unwrap();
+    det.observe(ts(10_000_000), good_metrics(450.0)).unwrap();
+    det.observe(ts(11_500_000), good_metrics(200.0)).unwrap();
 
     let out = det.finalize_shot(tr(0, 12_000_000));
     assert_eq!(out, vec![ts(1_000_000), ts(5_000_000), ts(10_000_000)]);
@@ -2450,9 +2571,9 @@ mod tests {
         .with_saturation_variance(100.0)
         .with_clipping(0.0)
     };
-    det.observe(ts(0), bad(100.0));
-    det.observe(ts(1_000_000), bad(400.0)); // sharpest among bad
-    det.observe(ts(3_000_000), bad(200.0));
+    det.observe(ts(0), bad(100.0)).unwrap();
+    det.observe(ts(1_000_000), bad(400.0)).unwrap(); // sharpest among bad
+    det.observe(ts(3_000_000), bad(200.0)).unwrap();
 
     let out = det.finalize_shot(tr(0, 4_000_000));
     assert_eq!(out, vec![ts(1_000_000)]);
@@ -2463,9 +2584,9 @@ mod tests {
     // 3-bucket shot; middle bucket has no observations.
     let opts = Options::default().with_margin_ratio(0.0);
     let mut det = Detector::new(opts);
-    det.observe(ts(1_000_000), good_metrics(300.0));
+    det.observe(ts(1_000_000), good_metrics(300.0)).unwrap();
     // 4..8 s: nothing
-    det.observe(ts(9_000_000), good_metrics(400.0));
+    det.observe(ts(9_000_000), good_metrics(400.0)).unwrap();
 
     let out = det.finalize_shot(tr(0, 12_000_000));
     assert_eq!(out, vec![ts(1_000_000), ts(9_000_000)]);
@@ -2475,8 +2596,8 @@ mod tests {
   fn finalize_drops_stale_entries_from_earlier_shots() {
     let opts = Options::default().with_margin_ratio(0.0);
     let mut det = Detector::new(opts);
-    det.observe(ts(100), good_metrics(500.0)); // pre-shot, should be dropped
-    det.observe(ts(500_000), good_metrics(200.0));
+    det.observe(ts(100), good_metrics(500.0)).unwrap(); // pre-shot, should be dropped
+    det.observe(ts(500_000), good_metrics(200.0)).unwrap();
 
     let out = det.finalize_shot(tr(200_000, 2_000_000));
     assert_eq!(out, vec![ts(500_000)]);
@@ -2487,8 +2608,8 @@ mod tests {
   fn finalize_retains_post_shot_entries_for_next_call() {
     let opts = Options::default().with_margin_ratio(0.0);
     let mut det = Detector::new(opts);
-    det.observe(ts(500_000), good_metrics(100.0));
-    det.observe(ts(5_000_000), good_metrics(900.0)); // belongs to next shot
+    det.observe(ts(500_000), good_metrics(100.0)).unwrap();
+    det.observe(ts(5_000_000), good_metrics(900.0)).unwrap(); // belongs to next shot
 
     let out = det.finalize_shot(tr(0, 2_000_000));
     assert_eq!(out, vec![ts(500_000)]);
@@ -2500,8 +2621,8 @@ mod tests {
   #[test]
   fn finalize_degenerate_range_returns_empty_and_drops_stale() {
     let mut det = Detector::new(Options::default());
-    det.observe(ts(100), good_metrics(100.0));
-    det.observe(ts(500_000), good_metrics(200.0));
+    det.observe(ts(100), good_metrics(100.0)).unwrap();
+    det.observe(ts(500_000), good_metrics(200.0)).unwrap();
 
     // end == start → zero duration, no emits. Stale (pts < 200_000)
     // entries still dropped.
@@ -2519,9 +2640,9 @@ mod tests {
       .with_target_interval(Duration::from_secs(20)) // force 1 bucket
       .with_margin_ratio(0.1);
     let mut det = Detector::new(opts);
-    det.observe(ts(500_000), good_metrics(900.0)); // pre-margin
-    det.observe(ts(5_000_000), good_metrics(300.0)); // in-bucket
-    det.observe(ts(9_500_000), good_metrics(800.0)); // post-margin
+    det.observe(ts(500_000), good_metrics(900.0)).unwrap(); // pre-margin
+    det.observe(ts(5_000_000), good_metrics(300.0)).unwrap(); // in-bucket
+    det.observe(ts(9_500_000), good_metrics(800.0)).unwrap(); // post-margin
 
     let out = det.finalize_shot(tr(0, 10_000_000));
     assert_eq!(out, vec![ts(5_000_000)]);
@@ -2539,7 +2660,7 @@ mod tests {
     // the bucket still emits.
     let opts = Options::default(); // default margin_ratio = 0.02
     let mut det = Detector::new(opts);
-    det.observe(ts(0), good_metrics(500.0));
+    det.observe(ts(0), good_metrics(500.0)).unwrap();
     let out = det.finalize_shot(tr(0, 1));
     assert_eq!(out, vec![ts(0)]);
   }
@@ -2552,8 +2673,8 @@ mod tests {
     // non-collapsing case as-is.
     let opts = Options::default(); // default margin_ratio = 0.02
     let mut det = Detector::new(opts);
-    det.observe(ts(0), good_metrics(500.0));
-    det.observe(ts(1), good_metrics(400.0));
+    det.observe(ts(0), good_metrics(500.0)).unwrap();
+    det.observe(ts(1), good_metrics(400.0)).unwrap();
     let out = det.finalize_shot(tr(0, 2));
     // The shrunk bucket [0, 1) catches `ts(0)`; `ts(1)` is in the
     // post-margin zone and is dropped.
@@ -2564,9 +2685,9 @@ mod tests {
   fn finalize_emits_in_pts_order() {
     let opts = Options::default().with_margin_ratio(0.0);
     let mut det = Detector::new(opts);
-    det.observe(ts(1_000_000), good_metrics(100.0));
-    det.observe(ts(5_000_000), good_metrics(100.0));
-    det.observe(ts(9_000_000), good_metrics(100.0));
+    det.observe(ts(1_000_000), good_metrics(100.0)).unwrap();
+    det.observe(ts(5_000_000), good_metrics(100.0)).unwrap();
+    det.observe(ts(9_000_000), good_metrics(100.0)).unwrap();
     let out = det.finalize_shot(tr(0, 12_000_000));
     assert!(out.windows(2).all(|w| w[0].pts() < w[1].pts()));
   }
@@ -2575,8 +2696,8 @@ mod tests {
   fn finalize_can_be_called_multiple_times() {
     let opts = Options::default().with_margin_ratio(0.0);
     let mut det = Detector::new(opts);
-    det.observe(ts(500_000), good_metrics(100.0));
-    det.observe(ts(5_000_000), good_metrics(100.0));
+    det.observe(ts(500_000), good_metrics(100.0)).unwrap();
+    det.observe(ts(5_000_000), good_metrics(100.0)).unwrap();
     let out1 = det.finalize_shot(tr(0, 2_000_000));
     let out2 = det.finalize_shot(tr(2_000_000, 6_000_000));
     assert_eq!(out1.len(), 1);
@@ -2588,11 +2709,11 @@ mod tests {
     let opts = Options::default().with_margin_ratio(0.0);
     let mut det = Detector::new(opts);
     // First shot closed normally.
-    det.observe(ts(500_000), good_metrics(100.0));
+    det.observe(ts(500_000), good_metrics(100.0)).unwrap();
     let _ = det.finalize_shot(tr(0, 2_000_000));
     // Second shot opens but EOS arrives before a confirmed cut.
-    det.observe(ts(3_000_000), good_metrics(200.0));
-    det.observe(ts(4_500_000), good_metrics(400.0));
+    det.observe(ts(3_000_000), good_metrics(200.0)).unwrap();
+    det.observe(ts(4_500_000), good_metrics(400.0)).unwrap();
 
     let out = det.finalize_remaining(ts(6_000_000));
     assert_eq!(out, vec![ts(4_500_000)]);
@@ -2609,7 +2730,7 @@ mod tests {
   #[test]
   fn finalize_remaining_eos_before_buffer_start_returns_empty() {
     let mut det = Detector::new(Options::default());
-    det.observe(ts(5_000_000), good_metrics(100.0));
+    det.observe(ts(5_000_000), good_metrics(100.0)).unwrap();
     let out = det.finalize_remaining(ts(1_000_000));
     assert!(
       out.is_empty(),
@@ -2910,8 +3031,8 @@ mod tests {
       .with_clipping(0.0)
       .with_noise(3.0);
 
-    det.observe(ts(1_000_000), a);
-    det.observe(ts(2_000_000), b);
+    det.observe(ts(1_000_000), a).unwrap();
+    det.observe(ts(2_000_000), b).unwrap();
 
     let out = det.finalize_shot(tr(0, 4_000_000));
     assert_eq!(out, vec![ts(2_000_000)]);
@@ -2932,9 +3053,9 @@ mod tests {
     let mut det = Detector::new(opts);
 
     // Same fixture as the existing `finalize_single_bucket_picks_sharpest`.
-    det.observe(ts(0), good_metrics(100.0));
-    det.observe(ts(500_000), good_metrics(500.0)); // sharpest
-    det.observe(ts(1_500_000), good_metrics(200.0));
+    det.observe(ts(0), good_metrics(100.0)).unwrap();
+    det.observe(ts(500_000), good_metrics(500.0)).unwrap(); // sharpest
+    det.observe(ts(1_500_000), good_metrics(200.0)).unwrap();
 
     let out = det.finalize_shot(tr(0, 2_000_000));
     assert_eq!(out, vec![ts(500_000)]);
@@ -2953,7 +3074,9 @@ mod tests {
     // 25 frames evenly spaced 0..25 seconds, sharpness ramping 20..80.
     for i in 0..25 {
       let s = 20.0 + (i as f32) * 2.5; // 20.0, 22.5, ..., 80.0
-      det.observe(ts((i as i64) * 1_000_000), good_metrics(s));
+      det
+        .observe(ts((i as i64) * 1_000_000), good_metrics(s))
+        .unwrap();
     }
     // Composite-quality argmax with default weights → highest
     // composite wins. Since brightness/clipping/noise/etc are
@@ -2984,9 +3107,11 @@ mod tests {
       .with_noise(1.0);
     for i in 0..24 {
       let s = 20.0 + (i as f32) * 2.5;
-      det.observe(ts((i as i64) * 1_000_000), good_metrics(s));
+      det
+        .observe(ts((i as i64) * 1_000_000), good_metrics(s))
+        .unwrap();
     }
-    det.observe(ts(24_000_000), sharpest_with_noise);
+    det.observe(ts(24_000_000), sharpest_with_noise).unwrap();
     let out = det.finalize_shot(tr(0, 30_000_000));
     assert_eq!(out, vec![ts(24_000_000)]);
   }
@@ -3002,7 +3127,9 @@ mod tests {
       .with_target_interval(Duration::from_secs(60));
     let mut det = Detector::new(opts);
     for i in 0..25 {
-      det.observe(ts((i as i64) * 1_000_000), good_metrics(500.0));
+      det
+        .observe(ts((i as i64) * 1_000_000), good_metrics(500.0))
+        .unwrap();
     }
     let out = det.finalize_shot(tr(0, 30_000_000));
     assert_eq!(out.len(), 1, "exactly one winner expected");
@@ -3017,7 +3144,9 @@ mod tests {
       .with_target_interval(Duration::from_secs(60));
     let mut det = Detector::new(opts);
     for i in 0..5 {
-      det.observe(ts((i as i64) * 1_000_000), good_metrics(50.0)); // < 100
+      det
+        .observe(ts((i as i64) * 1_000_000), good_metrics(50.0))
+        .unwrap(); // < 100
     }
     let out = det.finalize_shot(tr(0, 10_000_000));
     // No frame passes the absolute floor → fallback picks the only
@@ -3038,7 +3167,7 @@ mod tests {
       .with_saturation_variance(100.0)
       .with_clipping(0.0)
       .with_motion_blur(0.9);
-    det.observe(ts(500_000), m);
+    det.observe(ts(500_000), m).unwrap();
     let out = det.finalize_shot(tr(0, 2_000_000));
     assert_eq!(out, vec![ts(500_000)]);
   }
@@ -3067,8 +3196,8 @@ mod tests {
       .with_saturation_variance(100.0)
       .with_clipping(0.0)
       .with_motion_blur(0.1);
-    det.observe(ts(500_000), bad);
-    det.observe(ts(1_500_000), good);
+    det.observe(ts(500_000), bad).unwrap();
+    det.observe(ts(1_500_000), good).unwrap();
     let out = det.finalize_shot(tr(0, 2_000_000));
     // Strict path: `good` wins (bad rejected by motion-blur gate).
     assert_eq!(out, vec![ts(1_500_000)]);
@@ -3233,8 +3362,8 @@ mod tests {
       .with_saturation_variance(100.0)
       .with_clipping(0.0);
     let normal = good_metrics(500.0);
-    det.observe(ts(500_000), poisoned);
-    det.observe(ts(1_500_000), normal);
+    det.observe(ts(500_000), poisoned).unwrap();
+    det.observe(ts(1_500_000), normal).unwrap();
     let out = det.finalize_shot(tr(0, 2_000_000));
     // The non-finite-composite frame is skipped from strict; the
     // normal frame wins.
@@ -3257,7 +3386,7 @@ mod tests {
       .with_luma_variance(200.0)
       .with_saturation_variance(100.0)
       .with_clipping(0.0);
-    det.observe(ts(500_000), m);
+    det.observe(ts(500_000), m).unwrap();
     let out = det.finalize_shot(tr(0, 2_000_000));
     assert!(out.is_empty(), "non-finite-only bucket must not emit");
   }
@@ -3283,8 +3412,8 @@ mod tests {
       .with_luma_variance(200.0)
       .with_saturation_variance(100.0)
       .with_clipping(0.0);
-    det.observe(ts(500_000), poisoned);
-    det.observe(ts(1_500_000), fallback_only);
+    det.observe(ts(500_000), poisoned).unwrap();
+    det.observe(ts(1_500_000), fallback_only).unwrap();
     let out = det.finalize_shot(tr(0, 2_000_000));
     assert_eq!(out, vec![ts(1_500_000)]);
   }
