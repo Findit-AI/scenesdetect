@@ -226,6 +226,13 @@ pub(crate) fn mean_abs_diff(a: &[u8], b: &[u8], n: usize, use_simd: bool) -> f64
 /// quantized gradient direction (0=horiz, 1=45°, 2=vert, 3=135°) into `dir`.
 /// Border pixels stay zero. Dispatches to SIMD for the magnitude computation;
 /// direction quantization is always scalar (branchy per pixel).
+///
+/// Frames narrower or shorter than 3 pixels have no interior, so the
+/// dispatcher short-circuits by zero-filling `mag`/`dir` and returning.
+/// This both matches the "no interior → all-zero output" contract every
+/// scalar/SIMD backend already implements and prevents the SIMD inner
+/// loops from running with `w - 1`/`h - 1` row bounds that can
+/// underflow `usize` for degenerate dimensions.
 #[cfg_attr(not(tarpaulin), inline(always))]
 #[allow(unreachable_code)]
 pub(crate) fn sobel(
@@ -236,6 +243,12 @@ pub(crate) fn sobel(
   h: usize,
   use_simd: bool,
 ) {
+  if w < 3 || h < 3 {
+    mag.fill(0);
+    dir.fill(0);
+    return;
+  }
+
   if use_simd {
     #[cfg(all(target_arch = "aarch64", not(miri)))]
     {
@@ -1032,6 +1045,51 @@ mod tests {
     let mut dir = vec![0u8; w * h];
     scalar::Scalar::sobel(&src, &mut mag, &mut dir, w, h);
     assert!(mag.iter().any(|&m| m > 0));
+  }
+
+  #[test]
+  fn sobel_dispatcher_short_circuits_on_zero_width() {
+    // The dispatcher must guard against w < 3 or h < 3 *before*
+    // routing to SIMD backends — the wasm path uses `w - 1` and `h - 1`
+    // for its row bounds, which underflows `usize` on zero dimensions
+    // and would drive aggressive unsafe loads.
+    let mut mag = vec![0xFFi32; 16];
+    let mut dir = vec![0xFFu8; 16];
+    super::sobel(&[], &mut mag, &mut dir, 0, 4, false);
+    // The dispatcher's contract: "no interior → all-zero output".
+    assert!(mag.iter().all(|&m| m == 0));
+    assert!(dir.iter().all(|&d| d == 0));
+  }
+
+  #[test]
+  fn sobel_dispatcher_short_circuits_on_zero_height() {
+    let mut mag = vec![0xFFi32; 16];
+    let mut dir = vec![0xFFu8; 16];
+    super::sobel(&[], &mut mag, &mut dir, 4, 0, false);
+    assert!(mag.iter().all(|&m| m == 0));
+    assert!(dir.iter().all(|&d| d == 0));
+  }
+
+  #[test]
+  fn sobel_dispatcher_short_circuits_on_too_small() {
+    // 2x2 also has no interior.
+    let src = vec![0u8; 4];
+    let mut mag = vec![0xFFi32; 4];
+    let mut dir = vec![0xFFu8; 4];
+    super::sobel(&src, &mut mag, &mut dir, 2, 2, false);
+    assert!(mag.iter().all(|&m| m == 0));
+    assert!(dir.iter().all(|&d| d == 0));
+  }
+
+  #[cfg(target_arch = "aarch64")]
+  #[test]
+  fn sobel_dispatcher_short_circuits_with_simd_enabled_on_zero_dims() {
+    // Same guard must run even when SIMD is on.
+    let mut mag = vec![0xFFi32; 16];
+    let mut dir = vec![0xFFu8; 16];
+    super::sobel(&[], &mut mag, &mut dir, 0, 8, true);
+    assert!(mag.iter().all(|&m| m == 0));
+    assert!(dir.iter().all(|&d| d == 0));
   }
 
   // x86: call SSSE3 bgr_to_hsv_planes directly (bypasses AVX2 dispatch).

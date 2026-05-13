@@ -724,10 +724,18 @@ impl Detector {
         best_any = Some((ts, metrics.sharpness()));
       }
       // Strict path: composite-quality ranking among gate-passing
-      // frames.
+      // frames. Non-finite composites are skipped — a NaN incumbent
+      // would lock out every later finite candidate because
+      // `sharper(finite, NaN) == false`. Weights and norms are already
+      // sanitised at the [`CompositeWeights`] boundary, but
+      // [`FrameMetrics`] setters accept arbitrary `f32` values and
+      // detector kernels could conceivably produce `Inf` on
+      // pathological inputs (e.g. an integer accumulator that
+      // saturated). Filtering here is the one safety net the argmax
+      // needs.
       if !hard_gate(&metrics, &opts) && metrics.sharpness() >= effective_min_sharpness {
         let q = composite_quality(&metrics, opts.composite_weights());
-        if best_strict.is_none_or(|(_, s)| sharper(q, s)) {
+        if q.is_finite() && best_strict.is_none_or(|(_, s)| sharper(q, s)) {
           best_strict = Some((ts, q));
         }
       }
@@ -1752,6 +1760,52 @@ mod tests {
     );
     // Every term clamped to weight=0 → q == 0.
     assert_eq!(q, 0.0);
+  }
+
+  #[test]
+  fn strict_argmax_skips_non_finite_composite() {
+    // FrameMetrics setters accept any f32, including non-finite values
+    // — a corrupt detector output or a malformed caller could push
+    // NaN/Inf through. The strict-pass argmax must NOT lock onto a
+    // non-finite composite (which would prevent later finite candidates
+    // from unseating it). Two frames: the first has a NaN sharpness;
+    // the second is a normal in-bucket frame. The strict winner must
+    // be the second.
+    let opts = Options::default().with_margin_ratio(0.0);
+    let mut det = Detector::new(opts);
+    let poisoned = FrameMetrics::new()
+      .with_sharpness(f32::NAN) // poisons composite_quality via division-by-norm
+      .with_brightness(128.0)
+      .with_luma_variance(200.0)
+      .with_saturation_variance(100.0)
+      .with_clipping(0.0);
+    let normal = good_metrics(500.0);
+    det.observe(ts(500_000), poisoned);
+    det.observe(ts(1_500_000), normal);
+    let out = det.finalize_shot(tr(0, 2_000_000));
+    // The non-finite-composite frame is skipped from strict; the
+    // normal frame wins.
+    assert_eq!(out, vec![ts(1_500_000)]);
+  }
+
+  #[test]
+  fn strict_argmax_falls_back_when_only_candidate_is_non_finite() {
+    // Single frame with a NaN sharpness fails the strict path → drops
+    // into the fallback (raw-sharpness) path, which still selects it
+    // as the "least bad" candidate. Verifies that the guard doesn't
+    // accidentally swallow the only candidate.
+    let opts = Options::default().with_margin_ratio(0.0);
+    let mut det = Detector::new(opts);
+    let m = FrameMetrics::new()
+      .with_sharpness(f32::NAN)
+      .with_brightness(128.0)
+      .with_luma_variance(200.0)
+      .with_saturation_variance(100.0)
+      .with_clipping(0.0);
+    det.observe(ts(500_000), m);
+    let out = det.finalize_shot(tr(0, 2_000_000));
+    // Fallback path emits one timestamp.
+    assert_eq!(out, vec![ts(500_000)]);
   }
 
   #[test]
