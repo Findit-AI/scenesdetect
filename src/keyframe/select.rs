@@ -69,6 +69,7 @@ use serde::{Deserialize, Serialize};
 /// the field-name getters for read access.
 #[derive(Debug, Clone, Copy, PartialEq)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "serde", serde(from = "CompositeWeightsRaw"))]
 pub struct CompositeWeights {
   sharpness: f32,
   sharpness_norm: f32,
@@ -106,6 +107,43 @@ const fn sanitise_norm(norm: f32, default: f32) -> f32 {
     norm
   } else {
     default
+  }
+}
+
+// Private deserialization shim for [`CompositeWeights`]. Routes the
+// three normaliser fields through [`sanitise_norm`] so a serialized
+// configuration with invalid (zero, negative, NaN, or infinite) norms
+// cannot reach [`composite_quality`] and silently corrupt the
+// strict-pass argmax. The struct mirrors [`CompositeWeights`]'s field
+// shape exactly — adding a normaliser field on [`CompositeWeights`]
+// requires updating both this struct and the [`From`] impl below.
+#[cfg(feature = "serde")]
+#[derive(Deserialize)]
+struct CompositeWeightsRaw {
+  sharpness: f32,
+  sharpness_norm: f32,
+  noise: f32,
+  noise_norm: f32,
+  colorfulness: f32,
+  colorfulness_norm: f32,
+  clipping: f32,
+  motion_blur: f32,
+}
+
+#[cfg(feature = "serde")]
+impl From<CompositeWeightsRaw> for CompositeWeights {
+  #[inline]
+  fn from(r: CompositeWeightsRaw) -> Self {
+    Self {
+      sharpness: r.sharpness,
+      sharpness_norm: sanitise_norm(r.sharpness_norm, DEFAULT_SHARPNESS_NORM),
+      noise: r.noise,
+      noise_norm: sanitise_norm(r.noise_norm, DEFAULT_NOISE_NORM),
+      colorfulness: r.colorfulness,
+      colorfulness_norm: sanitise_norm(r.colorfulness_norm, DEFAULT_COLORFULNESS_NORM),
+      clipping: r.clipping,
+      motion_blur: r.motion_blur,
+    }
   }
 }
 
@@ -1270,6 +1308,70 @@ mod tests {
   fn composite_weights_new_is_const_context_usable() {
     const W: CompositeWeights = CompositeWeights::new().with_motion_blur(0.5);
     assert_eq!(W.motion_blur(), 0.5);
+  }
+
+  #[cfg(feature = "serde")]
+  #[test]
+  fn composite_weights_deserialize_clamps_invalid_norms() {
+    // Deserialization (via `#[serde(from = "CompositeWeightsRaw")]`)
+    // routes the three normaliser fields through `sanitise_norm` so a
+    // serialized config with invalid norms cannot reach
+    // composite_quality and silently corrupt the strict-pass argmax.
+    // We exercise the conversion through `From<CompositeWeightsRaw>`
+    // directly — that is the exact same code path serde-derive uses
+    // after parsing the raw struct, and it doesn't pull in a
+    // text-format crate for the test.
+    let raw = CompositeWeightsRaw {
+      sharpness: 1.0,
+      sharpness_norm: 0.0, // invalid — zero
+      noise: 0.3,
+      noise_norm: f32::NAN, // invalid — NaN
+      colorfulness: 0.2,
+      colorfulness_norm: f32::INFINITY, // invalid — +Inf
+      clipping: 0.5,
+      motion_blur: 0.0,
+    };
+    let w: CompositeWeights = raw.into();
+    let defaults = CompositeWeights::new();
+    assert_eq!(w.sharpness_norm(), defaults.sharpness_norm());
+    assert_eq!(w.noise_norm(), defaults.noise_norm());
+    assert_eq!(w.colorfulness_norm(), defaults.colorfulness_norm());
+    // Weights themselves are preserved verbatim — clamp is on `norm`
+    // only.
+    assert_eq!(w.sharpness(), 1.0);
+    assert_eq!(w.noise(), 0.3);
+    assert_eq!(w.colorfulness(), 0.2);
+    assert_eq!(w.clipping(), 0.5);
+    assert_eq!(w.motion_blur(), 0.0);
+
+    // composite_quality on a normal frame stays finite under the
+    // clamped norms — same end-to-end guard as the builder-path test.
+    let m = FrameMetrics::new()
+      .with_sharpness(500.0)
+      .with_noise(5.0)
+      .with_colorfulness(40.0)
+      .with_clipping(0.0)
+      .with_motion_blur(0.0);
+    assert!(composite_quality(&m, &w).is_finite());
+  }
+
+  #[cfg(feature = "serde")]
+  #[test]
+  fn composite_weights_deserialize_valid_norms_pass_through() {
+    let raw = CompositeWeightsRaw {
+      sharpness: 0.5,
+      sharpness_norm: 250.0,
+      noise: 0.1,
+      noise_norm: 5.0,
+      colorfulness: 0.4,
+      colorfulness_norm: 200.0,
+      clipping: 0.25,
+      motion_blur: 0.6,
+    };
+    let w: CompositeWeights = raw.into();
+    assert_eq!(w.sharpness_norm(), 250.0);
+    assert_eq!(w.noise_norm(), 5.0);
+    assert_eq!(w.colorfulness_norm(), 200.0);
   }
 
   #[test]
