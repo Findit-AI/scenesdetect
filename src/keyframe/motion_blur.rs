@@ -4,7 +4,7 @@
 //! that concentrate along the orientation perpendicular to θ; a
 //! sharp, scene-rich frame has a more uniform distribution of
 //! gradient directions. The detector runs a 3×3 Sobel on the luma
-//! plane (via [`crate::arch::sobel`]), builds a 4-bin magnitude-
+//! plane (via the `Sobel` kernel), builds a 4-bin magnitude-
 //! weighted histogram of the quantized direction, and reports
 //! `max((max_bin / total) - 0.25, 0) / 0.75`. The output is in
 //! `[0, 1]` with 0 = isotropic and 1 = concentrated in a single

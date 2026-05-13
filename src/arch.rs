@@ -1430,7 +1430,10 @@ mod tests {
       }
     }
     let a = scalar::Scalar::gradient_anisotropy(&mag, &dir, w, h);
-    assert!(a.abs() < 1e-6, "expected ~0.0 for uniform directions, got {a}");
+    assert!(
+      a.abs() < 1e-6,
+      "expected ~0.0 for uniform directions, got {a}"
+    );
     // Sanity-check the construction wrote nonzero magnitudes.
     assert!(mag.iter().any(|&v| v != 0));
   }

@@ -58,7 +58,7 @@ use serde::{Deserialize, Serialize};
 // ---- CompositeWeights ------------------------------------------------------
 
 /// Weights and per-metric normalisers consumed by
-/// [`composite_quality`] when ranking frames inside a bucket.
+/// `composite_quality` when ranking frames inside a bucket.
 ///
 /// Defaults are tuned so a "good" baseline frame (sharp, mid-luma,
 /// not noisy, mildly colorful) scores ≈ 1.0. Zeroing every term
