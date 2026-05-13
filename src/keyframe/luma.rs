@@ -23,8 +23,8 @@
 //! # let tb = Timebase::new(1, NonZeroU32::new(1_000_000).unwrap());
 //! # let luma = LumaFrame::new(&bytes, 256, 144, 256, Timestamp::new(0, tb));
 //! let stats = det.observe_luma(luma);
-//! assert!((stats.mean - 128.0).abs() < 1e-3);
-//! assert!(stats.variance < 1e-3); // uniform frame
+//! assert!((stats.mean() - 128.0).abs() < 1e-3);
+//! assert!(stats.variance() < 1e-3); // uniform frame
 //! ```
 
 use crate::frame::LumaFrame;
@@ -33,13 +33,73 @@ use crate::frame::LumaFrame;
 use serde::{Deserialize, Serialize};
 
 /// Mean and population variance of a luma plane in 0-255 space.
-#[derive(Debug, Clone, Copy, PartialEq, Default)]
+///
+/// Fields are private; use [`mean`](Self::mean) /
+/// [`variance`](Self::variance) for reads, [`with_mean`](Self::with_mean)
+/// / [`with_variance`](Self::with_variance) for `const fn` builders,
+/// and [`set_mean`](Self::set_mean) / [`set_variance`](Self::set_variance)
+/// for in-place mutation.
+#[derive(Debug, Clone, Copy, PartialEq)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct LumaStats {
+  mean: f32,
+  variance: f32,
+}
+
+impl Default for LumaStats {
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  fn default() -> Self {
+    Self::new()
+  }
+}
+
+impl LumaStats {
+  /// Creates an all-zero [`LumaStats`] (same value as
+  /// [`LumaStats::default`], usable in `const` contexts).
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn new() -> Self {
+    Self {
+      mean: 0.0,
+      variance: 0.0,
+    }
+  }
+
   /// Arithmetic mean of all sampled luma pixels.
-  pub mean: f32,
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn mean(&self) -> f32 {
+    self.mean
+  }
   /// Population variance of the sampled luma pixels.
-  pub variance: f32,
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn variance(&self) -> f32 {
+    self.variance
+  }
+
+  /// Returns `self` with [`mean`](Self::mean) set to `v`.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn with_mean(mut self, v: f32) -> Self {
+    self.mean = v;
+    self
+  }
+  /// Returns `self` with [`variance`](Self::variance) set to `v`.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn with_variance(mut self, v: f32) -> Self {
+    self.variance = v;
+    self
+  }
+
+  /// In-place setter for [`mean`](Self::mean). Returns `&mut Self` for chaining.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub fn set_mean(&mut self, v: f32) -> &mut Self {
+    self.mean = v;
+    self
+  }
+  /// In-place setter for [`variance`](Self::variance).
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub fn set_variance(&mut self, v: f32) -> &mut Self {
+    self.variance = v;
+    self
+  }
 }
 
 /// Options for the luma detector.
@@ -125,7 +185,7 @@ fn luma_stats_scalar(luma: &LumaFrame<'_>, use_simd: bool) -> LumaStats {
     luma.stride() as usize,
     use_simd,
   );
-  LumaStats { mean, variance }
+  LumaStats::new().with_mean(mean).with_variance(variance)
 }
 
 #[cfg(all(test, feature = "std"))]
@@ -162,8 +222,8 @@ mod tests {
     let f = LumaFrame::new(&data, 64, 48, 64, timestamp());
     let mut det = Detector::new(Options::default());
     let stats = det.observe_luma(f);
-    assert_eq!(stats.mean, 0.0);
-    assert_eq!(stats.variance, 0.0);
+    assert_eq!(stats.mean(), 0.0);
+    assert_eq!(stats.variance(), 0.0);
   }
 
   #[test]
@@ -172,8 +232,8 @@ mod tests {
     let f = LumaFrame::new(&data, 64, 48, 64, timestamp());
     let mut det = Detector::new(Options::default());
     let stats = det.observe_luma(f);
-    assert!((stats.mean - 128.0).abs() < 1e-3);
-    assert!(stats.variance < 1e-3);
+    assert!((stats.mean() - 128.0).abs() < 1e-3);
+    assert!(stats.variance() < 1e-3);
   }
 
   #[test]
@@ -182,8 +242,8 @@ mod tests {
     let f = LumaFrame::new(&data, 32, 32, 32, timestamp());
     let mut det = Detector::new(Options::default());
     let stats = det.observe_luma(f);
-    assert!((stats.mean - 255.0).abs() < 1e-3);
-    assert!(stats.variance < 1e-3);
+    assert!((stats.mean() - 255.0).abs() < 1e-3);
+    assert!(stats.variance() < 1e-3);
   }
 
   #[test]
@@ -198,8 +258,8 @@ mod tests {
     let f = LumaFrame::new(&data, 32, 32, 32, timestamp());
     let mut det = Detector::new(Options::default());
     let stats = det.observe_luma(f);
-    assert!((stats.mean - 127.5).abs() < 1e-3);
-    assert!((stats.variance - 127.5_f32 * 127.5).abs() < 1.0);
+    assert!((stats.mean() - 127.5).abs() < 1e-3);
+    assert!((stats.variance() - 127.5_f32 * 127.5).abs() < 1.0);
   }
 
   #[test]
@@ -218,8 +278,8 @@ mod tests {
     let f = LumaFrame::new(&data, w as u32, h as u32, stride as u32, timestamp());
     let mut det = Detector::new(Options::default());
     let stats = det.observe_luma(f);
-    assert_eq!(stats.mean, 0.0, "padding bytes leaked into mean");
-    assert_eq!(stats.variance, 0.0, "padding bytes leaked into variance");
+    assert_eq!(stats.mean(), 0.0, "padding bytes leaked into mean");
+    assert_eq!(stats.variance(), 0.0, "padding bytes leaked into variance");
   }
 
   #[test]
@@ -230,6 +290,25 @@ mod tests {
     let data = vec![100u8; 16 * 16];
     let f = LumaFrame::new(&data, 16, 16, 16, timestamp());
     let stats = det.observe_luma(f);
-    assert!((stats.mean - 100.0).abs() < 1e-3);
+    assert!((stats.mean() - 100.0).abs() < 1e-3);
+  }
+
+  #[test]
+  fn lumastats_builders_and_setters_roundtrip() {
+    let s = LumaStats::new().with_mean(120.0).with_variance(500.0);
+    assert_eq!(s.mean(), 120.0);
+    assert_eq!(s.variance(), 500.0);
+
+    let mut s = LumaStats::new();
+    s.set_mean(7.0).set_variance(8.0);
+    assert_eq!(s.mean(), 7.0);
+    assert_eq!(s.variance(), 8.0);
+  }
+
+  #[test]
+  fn lumastats_new_is_const_context_usable() {
+    const S: LumaStats = LumaStats::new().with_mean(3.0).with_variance(4.0);
+    assert_eq!(S.mean(), 3.0);
+    assert_eq!(S.variance(), 4.0);
   }
 }
