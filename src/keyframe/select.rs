@@ -142,6 +142,22 @@ const MAX_COLORFULNESS: f32 = 500.0;
 // 4 s`, that's a 4.5-hour shot before the cap could even bind.
 const MAX_FRAMES_PER_SHOT_CAP: u32 = 4_096;
 
+// Hard upper bound on the number of sharpness samples
+// [`compute_effective_floor`] collects from the buffered frames
+// before sorting. Without this cap, the per-shot allocation and
+// sort grow with buffered-frame count rather than with
+// `MAX_FRAMES_PER_SHOT_CAP`: a long shot, a missed cut, or a
+// caller that never finalises observes the buffer accumulating
+// indefinitely, so the next `finalize_shot` allocates and sorts a
+// `Vec<f32>` proportional to every buffered frame. Cap at 4096
+// (one f32 = 4 bytes → 16 KB max allocation) — far above the
+// `min_samples = 20` typical workload while still bounded for any
+// adversarial input. The collection truncates at the cap, biasing
+// the percentile slightly toward earlier samples in
+// disproportionately long buffers; that's an acceptable
+// degradation given the unbounded-OOM alternative.
+const MAX_ADAPTIVE_FLOOR_SAMPLES: usize = 4_096;
+
 /// Returns `v` when it is finite, otherwise `default`. Used by the
 /// f32 threshold builders that have no documented range but must
 /// still produce a value that `hard_gate`'s `<`/`>` comparisons
@@ -1079,7 +1095,10 @@ fn compute_effective_floor(
   // emission-eligible window whose full metric set is in domain.
   // The domain filter (the second predicate) is the same one
   // applied to both ranking paths, so the floor only reflects
-  // samples that could plausibly win one of them.
+  // samples that could plausibly win one of them. The `take()` cap
+  // bounds the allocation/sort cost at `MAX_ADAPTIVE_FLOOR_SAMPLES`
+  // regardless of buffered-frame count — see the constant's doc
+  // for the OOM-prevention rationale.
   let mut sharps: Vec<f32> = buffer
     .iter()
     .filter(|(ts, _)| {
@@ -1088,6 +1107,7 @@ fn compute_effective_floor(
     })
     .filter(|(_, m)| metrics_in_domain(m))
     .map(|(_, m)| m.sharpness())
+    .take(MAX_ADAPTIVE_FLOOR_SAMPLES)
     .collect();
   // `min_samples == 0` (a valid user setting meaning "adapt regardless
   // of sample count") combined with an empty in-range shot — or a
@@ -1968,6 +1988,40 @@ mod tests {
     // adaptive floor recovers a strict winner among the interior
     // frames. The sharpest (sharpness=60, ts=5s) wins.
     assert_eq!(out, vec![ts(5_000_000)]);
+  }
+
+  #[test]
+  fn adaptive_floor_allocation_bounded_for_long_shots() {
+    // Iter-18 regression: `compute_effective_floor` previously
+    // allocated a `Vec<f32>` proportional to buffered-frame count
+    // (unbounded for long shots / missed cuts / never-finalised
+    // streams). Cap at `MAX_ADAPTIVE_FLOOR_SAMPLES = 4096` keeps
+    // the allocation and sort O(cap), regardless of buffer size.
+    //
+    // Push 20_000 frames into a single shot. The test asserts:
+    //   1. `finalize_shot` returns without OOM/timeout.
+    //   2. The adaptive-floor mechanism still produces a sensible
+    //      result on the truncated sample.
+    //
+    // A `Vec<f32>` of 20_000 entries would be 80 KB — small enough
+    // not to OOM the test runner — but in production a stream can
+    // run for hours; the cap is a safety net there.
+    let opts = Options::default()
+      .with_margin_ratio(0.0)
+      .with_target_interval(Duration::from_secs(60 * 60)) // single bucket
+      .with_adaptive_floor_min_samples(10);
+    let mut det = Detector::new(opts);
+    for i in 0..20_000 {
+      // All frames at sharpness 50 (below absolute floor of 100).
+      // Adaptive should lower the floor to ~50 and emit a strict
+      // winner.
+      det.observe(ts(i as i64 * 1000), good_metrics(50.0));
+    }
+    let out = det.finalize_shot(tr(0, 20_000_000));
+    // A strict winner emerges (adaptive floor lowered to 50).
+    // Exact-timestamp assertion would be brittle to tie-break
+    // details under the truncated sample; just verify one emit.
+    assert_eq!(out.len(), 1, "expected one strict winner");
   }
 
   // ----- Detector ------------------------------------------------------------
