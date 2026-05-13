@@ -1093,10 +1093,10 @@ fn compute_effective_floor(
   }
   // Two-pass rank-based sampling over the emission-eligible window.
   //
-  // Pass 1 counts eligible in-domain samples without allocating.
-  // Pass 2 fills the percentile pool by picking the first index
-  // in each of `target` evenly-sized rank buckets, where
-  // `target = min(total, MAX_ADAPTIVE_FLOOR_SAMPLES)`. A
+  // Pass 1 counts eligible hard-gate-passing samples without
+  // allocating. Pass 2 fills the percentile pool by picking the
+  // first index in each of `target` evenly-sized rank buckets,
+  // where `target = min(total, MAX_ADAPTIVE_FLOOR_SAMPLES)`. A
   // modulo-residue stride (`i % stride == 0`) can lock onto a
   // single periodic subset when `total` is just over the cap
   // (e.g. 4097 → stride 2, keeping only 2049 even-i samples and
@@ -1104,6 +1104,16 @@ fn compute_effective_floor(
   // keeps exactly `target` samples and spans the FULL window with
   // a varying integer stride that does not align with period-2
   // patterns in the metric stream.
+  //
+  // Both passes filter by `!hard_gate` (mirrors the strict path
+  // minus the sharpness-floor check, which `hard_gate` does not
+  // perform). A pure `metrics_in_domain` filter let frames that
+  // fail the brightness / variance / clipping / motion-blur gates
+  // drag the percentile down — and since those frames can never
+  // win the strict path, their contribution was pure noise: a
+  // long black/flat/clipped run could lower the floor below an
+  // otherwise-mediocre frame's sharpness, flipping the strict
+  // winner to a frame the absolute floor would have rejected.
   //
   // Both passes use `skip_while`/`take_while` instead of a plain
   // `.filter` on timestamps, exploiting the buffer's documented
@@ -1115,7 +1125,7 @@ fn compute_effective_floor(
       .iter()
       .skip_while(|(ts, _)| ts.cmp_semantic(eligible_start) == Ordering::Less)
       .take_while(|(ts, _)| ts.cmp_semantic(eligible_end) == Ordering::Less)
-      .filter(|(_, m)| metrics_in_domain(m))
+      .filter(|(_, m)| !hard_gate(m, opts))
   };
   let total = eligible_iter().count();
   // `min_samples` is checked against the *true* eligible count
@@ -2150,6 +2160,75 @@ mod tests {
       1000,
       "winner pts {winner_pts} must be from an odd-i (high-colorfulness) frame; \
        a modulo-stride floor would force an even-i / sharp-only winner"
+    );
+  }
+
+  #[test]
+  fn adaptive_floor_excludes_hard_gate_failures_from_percentile() {
+    // Iter-21 regression: pre-fix, `compute_effective_floor`
+    // filtered the percentile pool by `metrics_in_domain` only.
+    // Frames that pass the domain check but fail one of the
+    // brightness / variance / clipping / motion-blur gates can
+    // never win the strict path — yet their sharpness still
+    // counted toward the p25, dragging the floor down so that
+    // mediocre (gate-passing, low-sharpness) frames suddenly
+    // cleared the floor. The cap on the floor (`min(absolute,
+    // p25)`) meant a long degraded run could re-route the strict
+    // winner to a frame the absolute floor would have rejected.
+    //
+    // Setup: 100 dark frames (brightness=5 → fails the
+    // black-mean gate at 15), one mediocre frame (sharpness=50,
+    // colorfulness=500 — high composite if it clears the floor),
+    // and nine high-sharp / no-colour frames (sharpness=200,
+    // colorfulness=0). With default composite weights the
+    // mediocre composite (~2.05) outscores the high-sharp
+    // composite (~0.2) — but ONLY if the mediocre frame survives
+    // the floor.
+    //
+    // Pre-fix: dark frames in the pool drove p25 to ~10, floor =
+    // min(100, 10) = 10, mediocre (sharp=50 ≥ 10) cleared the
+    // floor, and its colour-driven composite beat every high-
+    // sharp candidate. Strict winner = the mediocre frame at
+    // ts=100_000.
+    //
+    // Post-fix: `!hard_gate` excludes the dark frames; the pool
+    // is the 10 gate-passing frames, p25 = sharps[2] = 200, floor
+    // = min(100, 200) = 100, mediocre (sharp=50 < 100) is
+    // rejected, and a high-sharp frame wins on its 0.2 composite.
+    let opts = Options::default()
+      .with_margin_ratio(0.0)
+      .with_target_interval(Duration::from_secs(60 * 60))
+      .with_adaptive_floor_min_samples(10);
+    let mut det = Detector::new(opts);
+    for i in 0..100 {
+      let dark = FrameMetrics::new()
+        .with_sharpness(10.0)
+        .with_brightness(5.0) // below black_mean_threshold = 15
+        .with_luma_variance(200.0)
+        .with_saturation_variance(100.0)
+        .with_clipping(0.0);
+      det.observe(ts(i as i64 * 1000), dark);
+    }
+    let mediocre = FrameMetrics::new()
+      .with_sharpness(50.0)
+      .with_brightness(128.0)
+      .with_luma_variance(200.0)
+      .with_saturation_variance(100.0)
+      .with_clipping(0.0)
+      .with_colorfulness(500.0);
+    det.observe(ts(100_000), mediocre);
+    for i in 0..9 {
+      det.observe(ts(101_000 + i as i64 * 1000), good_metrics(200.0));
+    }
+    let out = det.finalize_shot(tr(0, 200_000));
+    assert_eq!(out.len(), 1);
+    let winner_pts = out[0].pts();
+    assert!(
+      (101_000..=109_000).contains(&winner_pts),
+      "winner pts {winner_pts} must be one of the high-sharp \
+       frames in [101_000, 109_000]; pre-fix the mediocre frame \
+       at 100_000 would have won via its composite-boosting \
+       colorfulness once dark frames pulled the floor below 50"
     );
   }
 
