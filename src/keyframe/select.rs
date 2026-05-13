@@ -104,6 +104,25 @@ const DEFAULT_MIN_SHARPNESS: f32 = 100.0;
 const DEFAULT_LUMA_VARIANCE_THRESHOLD: f32 = 5.0;
 const DEFAULT_SAT_VARIANCE_THRESHOLD: f32 = 3.0;
 
+// Conservative upper bounds for [`FrameMetrics`] fields whose
+// detectors run on 8-bit u8 sources. The values here are loose
+// (3-5× the theoretical maxima) — the goal is to reject `f32::MAX`
+// and other absurdly-large finite values that a malformed caller
+// or corrupt detector could push through `FrameMetrics::set_*`,
+// not to enforce tight semantic bounds. See [`metrics_in_domain`]
+// for the consumer.
+//
+// Tenengrad: max per-pixel `gx² + gy²` is `2 × 1020² ≈ 2.08e6`.
+const MAX_SHARPNESS: f32 = 1.0e7;
+// Population variance of u8 is bounded by `(255/2)² ≈ 16_256.25`;
+// `u16::MAX` is a comfortable headroom.
+const MAX_VARIANCE: f32 = 65_535.0;
+// Immerkaer σₙ: bounded by `√(π/2)/6 · 4080 ≈ 852`.
+const MAX_NOISE: f32 = 5_000.0;
+// Hasler-Süßstrunk: bounded by `σ_rgyb + 0.3·μ_rgyb ≈ 500` on
+// 8-bit inputs.
+const MAX_COLORFULNESS: f32 = 5_000.0;
+
 /// Returns `v` when it is finite, otherwise `default`. Used by the
 /// f32 threshold builders that have no documented range but must
 /// still produce a value that `hard_gate`'s `<`/`>` comparisons
@@ -989,24 +1008,24 @@ fn compute_effective_floor(
   if !opts.adaptive_floor() {
     return opts.min_sharpness();
   }
-  // Collect in-range sharpness values, filtered to finite,
-  // non-negative samples. Tenengrad is non-negative by construction,
-  // so a negative value is corrupt (likely from a malformed
-  // `FrameMetrics::set_sharpness(...)` call or a corrupt detector
-  // output); `f32::NEG_INFINITY` would in particular drive the
-  // computed percentile to `-Inf` and disable the strict floor for
-  // every subsequent frame. NaNs sort as "Equal" under
-  // `partial_cmp`, which would scatter them through the sorted
-  // vector and pollute the percentile lookup. Filtering up front
-  // keeps both pathologies out of the percentile pool.
+  // Collect in-range sharpness values from frames whose full metric
+  // set is in domain. Filtering only on `sharpness` was not enough:
+  // a frame with finite-positive sharpness but corrupt
+  // non-sharpness metrics (e.g. negative noise) is rejected from
+  // both ranking paths via [`metrics_in_domain`], so letting it
+  // contribute to the per-shot percentile would change the strict
+  // floor for otherwise-valid later frames without that frame ever
+  // having a chance to be emitted. Use the same domain predicate
+  // here so the floor only reflects samples that could plausibly
+  // win.
   let mut sharps: Vec<f32> = buffer
     .iter()
     .filter(|(ts, _)| {
       ts.cmp_semantic(&range.start()) != Ordering::Less
         && ts.cmp_semantic(&range.end()) == Ordering::Less
     })
+    .filter(|(_, m)| metrics_in_domain(m))
     .map(|(_, m)| m.sharpness())
-    .filter(|s| s.is_finite() && *s >= 0.0)
     .collect();
   // `min_samples == 0` (a valid user setting meaning "adapt regardless
   // of sample count") combined with an empty in-range shot — or a
@@ -1077,6 +1096,10 @@ fn sharper(a: f32, b: f32) -> bool {
 /// reject out-of-domain frames at this single boundary.
 #[inline]
 fn metrics_in_domain(m: &FrameMetrics) -> bool {
+  // `is_finite()` is implied by the closed-range upper bounds — a
+  // `NaN`/`Inf` value will fail `<= MAX_*`. Keep the explicit
+  // `is_finite` checks anyway as a defence-in-depth and to make
+  // the intent obvious at read-time.
   m.brightness().is_finite()
     && m.luma_variance().is_finite()
     && m.saturation_variance().is_finite()
@@ -1085,14 +1108,18 @@ fn metrics_in_domain(m: &FrameMetrics) -> bool {
     && m.sharpness().is_finite()
     && m.noise().is_finite()
     && m.colorfulness().is_finite()
+    // Closed-range bounds for the unit-interval / fraction fields.
     && (0.0..=255.0).contains(&m.brightness())
-    && m.luma_variance() >= 0.0
-    && m.saturation_variance() >= 0.0
     && (0.0..=1.0).contains(&m.clipping())
     && (0.0..=1.0).contains(&m.motion_blur())
-    && m.sharpness() >= 0.0
-    && m.noise() >= 0.0
-    && m.colorfulness() >= 0.0
+    // Half-open lower bounds for non-negative-by-construction fields,
+    // capped to conservative finite physical maxima so that an
+    // attacker-controlled `f32::MAX` cannot win either argmax.
+    && (0.0..=MAX_VARIANCE).contains(&m.luma_variance())
+    && (0.0..=MAX_VARIANCE).contains(&m.saturation_variance())
+    && (0.0..=MAX_SHARPNESS).contains(&m.sharpness())
+    && (0.0..=MAX_NOISE).contains(&m.noise())
+    && (0.0..=MAX_COLORFULNESS).contains(&m.colorfulness())
 }
 
 /// Any-one-trips hard gate matching the Python reference's flat /
@@ -1468,6 +1495,71 @@ mod tests {
   }
 
   #[test]
+  fn hard_gate_rejects_impossible_finite_sharpness() {
+    // Iter-14 regression: Tenengrad on 8-bit luma can reach
+    // ~2.08e6 at most. `f32::MAX` is finite and non-negative but
+    // physically impossible; the iter-13 predicate accepted it.
+    let o = Options::default();
+    let mut m = good_metrics(200.0);
+    m.set_sharpness(f32::MAX);
+    assert!(hard_gate(&m, &o));
+  }
+
+  #[test]
+  fn hard_gate_rejects_impossible_finite_noise() {
+    let o = Options::default();
+    let mut m = good_metrics(200.0);
+    m.set_noise(f32::MAX);
+    assert!(hard_gate(&m, &o));
+  }
+
+  #[test]
+  fn hard_gate_rejects_impossible_finite_variance() {
+    let o = Options::default();
+    let mut m = good_metrics(200.0);
+    m.set_luma_variance(1.0e10);
+    assert!(hard_gate(&m, &o));
+    let mut m = good_metrics(200.0);
+    m.set_saturation_variance(1.0e10);
+    assert!(hard_gate(&m, &o));
+  }
+
+  #[test]
+  fn hard_gate_rejects_impossible_finite_colorfulness() {
+    let o = Options::default();
+    let mut m = good_metrics(200.0);
+    m.set_colorfulness(f32::MAX);
+    assert!(hard_gate(&m, &o));
+  }
+
+  #[test]
+  fn fallback_argmax_skips_impossible_finite_sharpness() {
+    // Pre-iter-14: a dark frame (fails strict via brightness) with
+    // `sharpness = f32::MAX` would still win fallback because it
+    // had the highest sharpness. Now the domain predicate caps
+    // sharpness at MAX_SHARPNESS, so the impossible frame is
+    // filtered and a valid below-cap candidate wins instead.
+    let opts = Options::default().with_margin_ratio(0.0);
+    let mut det = Detector::new(opts);
+    let impossible = FrameMetrics::new()
+      .with_sharpness(f32::MAX)
+      .with_brightness(5.0) // fails strict
+      .with_luma_variance(200.0)
+      .with_saturation_variance(100.0)
+      .with_clipping(0.0);
+    let valid = FrameMetrics::new()
+      .with_sharpness(50.0)
+      .with_brightness(5.0) // also fails strict
+      .with_luma_variance(200.0)
+      .with_saturation_variance(100.0)
+      .with_clipping(0.0);
+    det.observe(ts(500_000), impossible);
+    det.observe(ts(1_500_000), valid);
+    let out = det.finalize_shot(tr(0, 2_000_000));
+    assert_eq!(out, vec![ts(1_500_000)]);
+  }
+
+  #[test]
   fn fallback_argmax_skips_corrupt_non_sharpness_metrics() {
     // Iter-13 regression: pre-fix, `best_any` only domain-filtered
     // `sharpness`. A frame with high sharpness BUT a corrupt non-
@@ -1630,6 +1722,50 @@ mod tests {
     assert!(
       winner_ts < 2_100_000,
       "strict winner pts {winner_ts} should be in the finite-sample range (<2_100_000)"
+    );
+  }
+
+  #[test]
+  fn adaptive_floor_excludes_corrupt_non_sharpness_metrics_from_percentile() {
+    // Iter-14 regression: pre-fix, `compute_effective_floor` filtered
+    // only sharpness for finite + non-negative. A frame with
+    // finite-positive sharpness AND a corrupt non-sharpness metric
+    // (e.g. negative clipping) would still contribute to the
+    // percentile pool — even though it can never win either ranking
+    // path. That moved the strict floor for otherwise-valid frames.
+    // Post-fix: `metrics_in_domain` is the shared filter, so corrupt
+    // frames are excluded from the percentile computation too.
+    //
+    // Setup: 20 corrupt frames with high sharpness (which would drag
+    // p25 UP if they counted) + 5 valid below-floor frames.
+    let opts = Options::default()
+      .with_margin_ratio(0.0)
+      .with_target_interval(Duration::from_secs(60))
+      .with_adaptive_floor_min_samples(3);
+    let mut det = Detector::new(opts);
+    for i in 0..20 {
+      let m = FrameMetrics::new()
+        .with_sharpness(2_000.0) // way above absolute floor
+        .with_brightness(128.0)
+        .with_luma_variance(200.0)
+        .with_saturation_variance(100.0)
+        .with_clipping(-0.5); // out of domain → corrupt
+      det.observe(ts((i as i64) * 100_000), m);
+    }
+    for i in 0..5 {
+      det.observe(ts(2_100_000 + (i as i64) * 100_000), good_metrics(50.0));
+    }
+    let out = det.finalize_shot(tr(0, 30_000_000));
+    // Corrupt frames are filtered from the percentile pool, so p25
+    // is computed on the 5 valid samples → ~50, effective floor
+    // = min(100, 50) = 50. Each valid frame's sharpness (50) just
+    // clears the floor; the strict path emits one. None of the
+    // corrupt frames can win (both ranking paths reject them).
+    assert_eq!(out.len(), 1, "expected exactly one winner");
+    let winner_ts = out[0].pts();
+    assert!(
+      winner_ts >= 2_100_000,
+      "winner pts {winner_ts} should be one of the valid frames (>= 2_100_000)"
     );
   }
 
