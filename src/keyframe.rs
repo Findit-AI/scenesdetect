@@ -24,6 +24,7 @@
 
 pub mod clipping;
 pub mod luma;
+pub mod metrics;
 pub mod preprocess;
 pub mod saturation;
 pub mod score;
