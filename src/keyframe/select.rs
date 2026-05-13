@@ -210,6 +210,8 @@ pub struct Options {
   adaptive_floor: bool,
   adaptive_floor_percentile: f32,
   adaptive_floor_min_samples: usize,
+  motion_blur_gate: bool,
+  max_motion_blur: f32,
 }
 
 impl Default for Options {
@@ -229,6 +231,8 @@ impl Default for Options {
       adaptive_floor: true,
       adaptive_floor_percentile: 0.25,
       adaptive_floor_min_samples: 20,
+      motion_blur_gate: false,
+      max_motion_blur: 0.75,
     }
   }
 }
@@ -368,6 +372,45 @@ impl Options {
   pub const fn with_adaptive_floor_min_samples(mut self, n: usize) -> Self {
     self.adaptive_floor_min_samples = n;
     self
+  }
+
+  /// Enables or disables the motion-blur hard gate. When enabled,
+  /// frames whose [`FrameMetrics::motion_blur`] exceeds
+  /// [`Self::max_motion_blur`] are rejected from the strict pass.
+  /// Off by default because gradient anisotropy at 256-px downscale
+  /// confounds motion blur with single-orientation scenes (forest,
+  /// façade, horizon).
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn with_motion_blur_gate(mut self, on: bool) -> Self {
+    self.motion_blur_gate = on;
+    self
+  }
+
+  /// Sets the maximum tolerated motion-blur (anisotropy) score. The
+  /// gate (when enabled) rejects frames strictly greater than this
+  /// value.
+  ///
+  /// # Panics
+  /// When outside `[0.0, 1.0]`.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub fn with_max_motion_blur(mut self, m: f32) -> Self {
+    assert!(
+      (0.0..=1.0).contains(&m),
+      "max_motion_blur must be in [0.0, 1.0]"
+    );
+    self.max_motion_blur = m;
+    self
+  }
+
+  /// Whether the motion-blur hard gate is enabled (read-only accessor).
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn motion_blur_gate(&self) -> bool {
+    self.motion_blur_gate
+  }
+  /// Maximum tolerated motion-blur anisotropy score (read-only accessor).
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn max_motion_blur(&self) -> f32 {
+    self.max_motion_blur
   }
 
   /// Whether the adaptive per-shot sharpness floor is enabled (read-only accessor).
@@ -533,11 +576,7 @@ impl Detector {
     // floor. This lets legitimate low-detail shots (fog, night
     // interiors) produce strict winners instead of always degrading
     // to fallback selection.
-    let effective_min_sharpness = compute_effective_floor(
-      &self.buffer,
-      &range,
-      &self.opts,
-    );
+    let effective_min_sharpness = compute_effective_floor(&self.buffer, &range, &self.opts);
 
     // 3. Compute bucket count and precompute per-bucket effective
     //    [start, end) timestamps (with first-/last-bucket margin shrink).
@@ -597,9 +636,7 @@ impl Detector {
       }
       // Strict path: composite-quality ranking among gate-passing
       // frames.
-      if !hard_gate(&metrics, &opts)
-        && metrics.sharpness() >= effective_min_sharpness
-      {
+      if !hard_gate(&metrics, &opts) && metrics.sharpness() >= effective_min_sharpness {
         let q = composite_quality(&metrics, opts.composite_weights());
         if best_strict.is_none_or(|(_, s)| sharper(q, s)) {
           best_strict = Some((ts, q));
@@ -769,6 +806,9 @@ fn hard_gate(m: &FrameMetrics, opts: &Options) -> bool {
     return true;
   }
   if m.clipping() > opts.max_clipping {
+    return true;
+  }
+  if opts.motion_blur_gate && m.motion_blur() > opts.max_motion_blur {
     return true;
   }
   false
@@ -1277,8 +1317,7 @@ mod tests {
     // floor explicitly disabled, the strict gate rejects every frame
     // and we drop to fallback (pure sharpness). The result should
     // still be the sharpest frame — but via the fallback path.
-    let weights = CompositeWeights::new()
-      .with_noise(10.0, 1.0); // huge noise penalty
+    let weights = CompositeWeights::new().with_noise(10.0, 1.0); // huge noise penalty
     let opts = Options::default()
       .with_margin_ratio(0.0)
       .with_target_interval(Duration::from_secs(60))
@@ -1333,5 +1372,54 @@ mod tests {
     // No frame passes the absolute floor → fallback picks the only
     // candidate (all tied at 50.0).
     assert_eq!(out.len(), 1);
+  }
+
+  #[test]
+  fn motion_blur_gate_disabled_by_default_keeps_high_anisotropy_frame() {
+    // Bucket with one strict-eligible frame whose motion_blur=0.9.
+    // Gate off by default → frame passes strict, becomes the winner.
+    let opts = Options::default().with_margin_ratio(0.0);
+    let mut det = Detector::new(opts);
+    let m = FrameMetrics::new()
+      .with_sharpness(500.0)
+      .with_brightness(128.0)
+      .with_luma_variance(200.0)
+      .with_saturation_variance(100.0)
+      .with_clipping(0.0)
+      .with_motion_blur(0.9);
+    det.observe(ts(500_000), m);
+    let out = det.finalize_shot(tr(0, 2_000_000));
+    assert_eq!(out, vec![ts(500_000)]);
+  }
+
+  #[test]
+  fn motion_blur_gate_enabled_rejects_high_anisotropy_frame() {
+    // Same fixture but with the gate on and a fresh, gate-passing
+    // alternative. The high-anisotropy frame falls into fallback;
+    // the low-anisotropy frame wins the strict path.
+    let opts = Options::default()
+      .with_margin_ratio(0.0)
+      .with_motion_blur_gate(true)
+      .with_max_motion_blur(0.75);
+    let mut det = Detector::new(opts);
+    let bad = FrameMetrics::new()
+      .with_sharpness(800.0)
+      .with_brightness(128.0)
+      .with_luma_variance(200.0)
+      .with_saturation_variance(100.0)
+      .with_clipping(0.0)
+      .with_motion_blur(0.9); // above the gate
+    let good = FrameMetrics::new()
+      .with_sharpness(500.0)
+      .with_brightness(128.0)
+      .with_luma_variance(200.0)
+      .with_saturation_variance(100.0)
+      .with_clipping(0.0)
+      .with_motion_blur(0.1);
+    det.observe(ts(500_000), bad);
+    det.observe(ts(1_500_000), good);
+    let out = det.finalize_shot(tr(0, 2_000_000));
+    // Strict path: `good` wins (bad rejected by motion-blur gate).
+    assert_eq!(out, vec![ts(1_500_000)]);
   }
 }
