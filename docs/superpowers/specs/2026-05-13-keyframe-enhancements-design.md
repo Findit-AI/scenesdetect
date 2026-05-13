@@ -128,10 +128,11 @@ impl FrameMetrics {
 `#[derive(Default)]` is preserved. The pipeline pattern becomes:
 
 ```rust
+let stats = luma_det.observe_luma(luma);
 let metrics = FrameMetrics::new()
     .with_sharpness(sharpness.observe_luma(luma))
-    .with_brightness(luma_stats.mean)
-    .with_luma_variance(luma_stats.variance)
+    .with_brightness(stats.mean())
+    .with_luma_variance(stats.variance())
     .with_clipping(clipping.observe_rgb(small_bgr))
     .with_saturation_variance(sat.observe_hsv(hsv))
     .with_noise(noise.observe_luma(luma))
@@ -152,12 +153,68 @@ must be updated. The crate is 0.x; the change is local to the
 downstream callers (if any) require the same mechanical migration —
 documented in CHANGELOG.
 
+### 3.1 `LumaStats` — encapsulate alongside
+
+`keyframe::luma::LumaStats` is the only other type in the crate that
+exposes `pub` fields (`mean`, `variance`). It sits directly in the
+keyframe data flow — the caller wiring in §6 reads it to populate
+`FrameMetrics`. To keep the convention consistent across the crate (and
+avoid mixing two styles in adjacent calls inside the same pipeline),
+encapsulate it in the same PR.
+
+```rust
+// src/keyframe/luma.rs (modified)
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct LumaStats {
+    mean: f32,
+    variance: f32,
+}
+
+impl LumaStats {
+    pub const fn new() -> Self                              { Self { mean: 0.0, variance: 0.0 } }
+    pub const fn mean(&self) -> f32                         { self.mean }
+    pub const fn variance(&self) -> f32                     { self.variance }
+    pub const fn with_mean(mut self, v: f32) -> Self        { self.mean = v; self }
+    pub const fn with_variance(mut self, v: f32) -> Self    { self.variance = v; self }
+    pub fn set_mean(&mut self, v: f32) -> &mut Self         { self.mean = v; self }
+    pub fn set_variance(&mut self, v: f32) -> &mut Self     { self.variance = v; self }
+}
+```
+
+Internal construction in `keyframe::luma`'s scalar reducer switches from
+`LumaStats { mean, variance }` to
+`LumaStats::new().with_mean(mean).with_variance(variance)`. Callers
+switch field reads to method calls.
+
 ## 4. New detectors
 
 Each new module follows the existing detector contract verbatim:
 `Options` with `with_simd`, `Detector::new`, `observe_*`, `clear`. All
 output `f32`. Scalar kernels ship in v1; SIMD kernels are deferred to
 follow-up PRs and gated by the existing `use_simd` flag plumbing.
+
+**Encapsulation convention** (applies to every new struct in §§4–5): all
+fields are private. Read access via `const fn`-getter methods named
+after the field; mutation via `with_*` consuming builders (`const fn`
+where the body is field assignment only) and `&mut self -> &mut Self`
+`set_*` setters. The `Options` skeletons shown below as
+`/* use_simd */` are this pattern in shorthand — concretely:
+
+```rust
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Options { use_simd: bool }
+
+impl Default for Options { fn default() -> Self { Self::new() } }
+
+impl Options {
+    pub const fn new() -> Self                       { Self { use_simd: true } }
+    pub const fn with_simd(mut self, on: bool) -> Self { self.use_simd = on; self }
+    pub const fn use_simd(&self) -> bool             { self.use_simd }
+}
+```
+
+This matches the existing `keyframe::sharpness::Options`,
+`keyframe::luma::Options`, etc.
 
 ### 4.1 `keyframe::noise` — Immerkaer σₙ
 
@@ -452,7 +509,7 @@ contract:
 ```
 BGR frame ─→ Downscaler ─→ small BGR ─┐
                                       ├─→ LumaConverter ─→ luma ─┬─→ sharpness::Detector    ─→ .with_sharpness(...)
-                                      │                          ├─→ luma::Detector         ─→ .with_brightness/luma_variance(...)
+                                      │                          ├─→ luma::Detector         ─→ stats.mean()/variance() → .with_brightness/luma_variance(...)
                                       │                          ├─→ noise::Detector        ─→ .with_noise(...)            [NEW]
                                       │                          └─→ motion_blur::Detector  ─→ .with_motion_blur(...)      [NEW]
                                       │
@@ -564,7 +621,7 @@ recovers some of the new overhead.
 | Composite weights mis-calibrated, keyframe quality regresses | Defaults preserve sharpness as the dominant term. Zero non-sharpness weights to fall back to today's ranking exactly. |
 | Motion-blur metric mis-classifies directional scenes | Gate off by default; composite weight 0.0 by default. Telemetry-only out of the box. |
 | Adaptive floor noisy on short shots | `min_samples = 20` threshold below which the absolute floor is used unchanged. |
-| `FrameMetrics` rename breaks downstream callers | Crate is 0.x. Internal callers updated in the same PR. Public-API change documented in CHANGELOG. |
+| `FrameMetrics` rename + `LumaStats` field encapsulation break downstream callers | Crate is 0.x. Internal callers updated in the same PR. Public-API change documented in CHANGELOG. |
 | Per-frame budget overrun on low-power targets | ~1175 fps scalar at 256-px is well above any realistic ingest rate (~120 fps for 4× real-time on 30fps source). Acceptable. |
 | Doubled Sobel pass wastes work | Acceptable trade for orthogonal module design in v1. Shared-Sobel fusion noted as a future optimisation. |
 
