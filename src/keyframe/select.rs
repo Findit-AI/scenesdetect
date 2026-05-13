@@ -131,6 +131,17 @@ const MAX_NOISE: f32 = 1_000.0;
 // `C = σ_rgyb + 0.3·μ_rgyb ≤ 360.6 · 1.3 ≈ 469`.
 const MAX_COLORFULNESS: f32 = 500.0;
 
+// Hard upper bound on `Options::max_frames_per_shot`. The builder
+// asserts and the serde shim clamps against this value so a
+// malformed caller / config cannot configure an
+// O(`max_frames_per_shot`) allocation in `compute_bucket_ranges`
+// (a `Vec<(Timestamp, Timestamp)>` ≈ 48 bytes/entry, so
+// `u32::MAX` would request ~200 GB and OOM the process before
+// any frame is scored). 4096 keyframes per shot is well above
+// every realistic workload — at the default `target_interval =
+// 4 s`, that's a 4.5-hour shot before the cap could even bind.
+const MAX_FRAMES_PER_SHOT_CAP: u32 = 4_096;
+
 /// Returns `v` when it is finite, otherwise `default`. Used by the
 /// f32 threshold builders that have no documented range but must
 /// still produce a value that `hard_gate`'s `<`/`>` comparisons
@@ -416,11 +427,14 @@ impl From<OptionsRaw> for Options {
       } else {
         r.target_interval
       },
-      // max_frames_per_shot must be > 0.
+      // max_frames_per_shot must lie in [1, MAX_FRAMES_PER_SHOT_CAP].
+      // Zero is clamped to the default; values above the cap are
+      // clamped down to the cap (preserving the user's "high" intent
+      // without the OOM risk of an unbounded value).
       max_frames_per_shot: if r.max_frames_per_shot == 0 {
         defaults.max_frames_per_shot
       } else {
-        r.max_frames_per_shot
+        r.max_frames_per_shot.min(MAX_FRAMES_PER_SHOT_CAP)
       },
       // margin_ratio must lie in [0.0, 0.5).
       margin_ratio: if r.margin_ratio.is_finite() && (0.0..0.5).contains(&r.margin_ratio) {
@@ -495,11 +509,22 @@ impl Options {
 
   /// Upper bound on the number of keyframes emitted per shot.
   ///
+  /// Capped at [`MAX_FRAMES_PER_SHOT_CAP`] (4096). The cap exists
+  /// because [`Detector::finalize_shot`] allocates a
+  /// `Vec<(Timestamp, Timestamp)>` of size `max_frames_per_shot`
+  /// per shot — without the cap, a value like `u32::MAX` would
+  /// request ~200 GB and OOM the process before any frame is
+  /// scored. 4096 is well above every realistic workload.
+  ///
   /// # Panics
-  /// When `n == 0`.
+  /// When `n == 0` or when `n > 4096`.
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn with_max_frames_per_shot(mut self, n: u32) -> Self {
     assert!(n > 0, "max_frames_per_shot must be > 0");
+    assert!(
+      n <= MAX_FRAMES_PER_SHOT_CAP,
+      "max_frames_per_shot must be <= 4096"
+    );
     self.max_frames_per_shot = n;
     self
   }
@@ -1264,6 +1289,55 @@ mod tests {
   #[should_panic(expected = "max_frames_per_shot")]
   fn options_max_frames_zero_panics() {
     let _ = Options::new().with_max_frames_per_shot(0);
+  }
+
+  #[test]
+  #[should_panic(expected = "max_frames_per_shot must be <= 4096")]
+  fn options_max_frames_above_cap_panics() {
+    // Iter-17 regression: an excessive max_frames_per_shot is an OOM
+    // vector because finalize_shot pre-allocates a per-shot
+    // `Vec<(Timestamp, Timestamp)>` of that size. The builder must
+    // reject anything above 4096.
+    let _ = Options::new().with_max_frames_per_shot(u32::MAX);
+  }
+
+  #[test]
+  #[should_panic(expected = "max_frames_per_shot must be <= 4096")]
+  fn options_max_frames_just_above_cap_panics() {
+    let _ = Options::new().with_max_frames_per_shot(4097);
+  }
+
+  #[test]
+  fn options_max_frames_at_cap_is_accepted() {
+    let o = Options::new().with_max_frames_per_shot(4096);
+    assert_eq!(o.max_frames_per_shot(), 4096);
+  }
+
+  #[cfg(feature = "serde")]
+  #[test]
+  fn options_deserialize_clamps_excessive_max_frames_per_shot_to_cap() {
+    // The serde path clamps (rather than panics) so a malformed
+    // config doesn't crash a long-running process. u32::MAX is
+    // clamped down to 4096.
+    let raw = OptionsRaw {
+      target_interval: Duration::from_secs(4),
+      max_frames_per_shot: u32::MAX,
+      margin_ratio: 0.02,
+      min_sharpness: 100.0,
+      black_mean_threshold: 15,
+      bright_mean_threshold: 240,
+      luma_variance_threshold: 5.0,
+      sat_variance_threshold: 3.0,
+      max_clipping: 0.5,
+      weights: CompositeWeights::default(),
+      adaptive_floor: true,
+      adaptive_floor_percentile: 0.25,
+      adaptive_floor_min_samples: 20,
+      motion_blur_gate: false,
+      max_motion_blur: 0.75,
+    };
+    let o: Options = raw.into();
+    assert_eq!(o.max_frames_per_shot(), 4096);
   }
 
   #[test]
