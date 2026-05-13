@@ -384,12 +384,29 @@ impl From<OptionsRaw> for Options {
       } else {
         defaults.margin_ratio
       },
-      // These four have no builder validation and accept any f32.
-      min_sharpness: r.min_sharpness,
+      // These f32 thresholds have no builder range check but they
+      // still compose with `hard_gate`'s NaN-fail-closed contract:
+      // a `NaN` threshold would make every metric "less than NaN"
+      // evaluate to false in IEEE 754, silently disabling the gate.
+      // Clamp non-finite values to the spec defaults so the gate
+      // never reads an `Inf`/`NaN` opt-side threshold.
+      min_sharpness: if r.min_sharpness.is_finite() {
+        r.min_sharpness
+      } else {
+        defaults.min_sharpness
+      },
       black_mean_threshold: r.black_mean_threshold,
       bright_mean_threshold: r.bright_mean_threshold,
-      luma_variance_threshold: r.luma_variance_threshold,
-      sat_variance_threshold: r.sat_variance_threshold,
+      luma_variance_threshold: if r.luma_variance_threshold.is_finite() {
+        r.luma_variance_threshold
+      } else {
+        defaults.luma_variance_threshold
+      },
+      sat_variance_threshold: if r.sat_variance_threshold.is_finite() {
+        r.sat_variance_threshold
+      } else {
+        defaults.sat_variance_threshold
+      },
       // max_clipping must lie in [0.0, 1.0].
       max_clipping: if r.max_clipping.is_finite() && (0.0..=1.0).contains(&r.max_clipping) {
         r.max_clipping
@@ -994,7 +1011,25 @@ fn sharper(a: f32, b: f32) -> bool {
 
 /// Any-one-trips hard gate matching the Python reference's flat /
 /// over-/under-exposed / clipped checks.
+///
+/// **Fails closed on non-finite metric inputs.** IEEE 754 comparisons
+/// with `NaN` evaluate to `false`, so a naive `metric < threshold`
+/// check would let a `NaN` brightness / variance / clipping /
+/// motion-blur bypass every gate ("fail open"). Treating any
+/// non-finite gate metric as a hard-gate failure makes a malformed
+/// `FrameMetrics` (from a corrupt detector or a `FrameMetrics::set_*`
+/// caller that passed `NaN`/`Inf`) drop straight into the fallback
+/// path instead of becoming a strict winner.
 fn hard_gate(m: &FrameMetrics, opts: &Options) -> bool {
+  // Fail closed on any non-finite gate-relevant metric.
+  if !m.brightness().is_finite()
+    || !m.luma_variance().is_finite()
+    || !m.saturation_variance().is_finite()
+    || !m.clipping().is_finite()
+    || !m.motion_blur().is_finite()
+  {
+    return true;
+  }
   if m.brightness() < opts.black_mean_threshold as f32 {
     return true;
   }
@@ -1173,6 +1208,73 @@ mod tests {
     let mut m = good_metrics(200.0);
     m.set_clipping(0.9);
     assert!(hard_gate(&m, &o));
+  }
+
+  #[test]
+  fn hard_gate_rejects_non_finite_brightness() {
+    let o = Options::default();
+    let mut m = good_metrics(200.0);
+    m.set_brightness(f32::NAN);
+    assert!(hard_gate(&m, &o));
+  }
+
+  #[test]
+  fn hard_gate_rejects_non_finite_luma_variance() {
+    let o = Options::default();
+    let mut m = good_metrics(200.0);
+    m.set_luma_variance(f32::INFINITY);
+    assert!(hard_gate(&m, &o));
+  }
+
+  #[test]
+  fn hard_gate_rejects_non_finite_saturation_variance() {
+    let o = Options::default();
+    let mut m = good_metrics(200.0);
+    m.set_saturation_variance(f32::NEG_INFINITY);
+    assert!(hard_gate(&m, &o));
+  }
+
+  #[test]
+  fn hard_gate_rejects_non_finite_clipping() {
+    let o = Options::default();
+    let mut m = good_metrics(200.0);
+    m.set_clipping(f32::NAN);
+    assert!(hard_gate(&m, &o));
+  }
+
+  #[test]
+  fn hard_gate_rejects_non_finite_motion_blur_even_with_gate_disabled() {
+    // The fail-closed check on motion_blur runs regardless of
+    // `motion_blur_gate`. Even with the gate off, a NaN motion_blur
+    // is treated as a corrupt metric and the frame is rejected.
+    let o = Options::default(); // motion_blur_gate = false by default
+    let mut m = good_metrics(200.0);
+    m.set_motion_blur(f32::NAN);
+    assert!(hard_gate(&m, &o));
+  }
+
+  #[test]
+  fn hard_gate_with_nan_brightness_routes_to_fallback_not_strict() {
+    // Regression for the iter-10 finding: with finite sharpness but
+    // NaN brightness, the pre-fix `hard_gate` failed open (NaN
+    // comparisons evaluate to false), letting the frame through the
+    // strict path with a finite composite_quality. The fix makes
+    // hard_gate fail closed on any non-finite gate-relevant metric,
+    // so a single such frame ends up in the fallback path only.
+    let opts = Options::default().with_margin_ratio(0.0);
+    let mut det = Detector::new(opts);
+    let m = FrameMetrics::new()
+      .with_sharpness(500.0) // finite
+      .with_brightness(f32::NAN) // poisons the gate
+      .with_luma_variance(200.0)
+      .with_saturation_variance(100.0)
+      .with_clipping(0.0);
+    det.observe(ts(500_000), m);
+    let out = det.finalize_shot(tr(0, 2_000_000));
+    // hard_gate now trips → strict skipped. Fallback path takes
+    // over (sharpness is finite), still emits one timestamp — but
+    // via the "least bad" fallback, NOT the strict path.
+    assert_eq!(out, vec![ts(500_000)]);
   }
 
   // ----- Detector ------------------------------------------------------------
@@ -1539,6 +1641,45 @@ mod tests {
     assert_eq!(o.adaptive_floor(), false);
     assert_eq!(o.adaptive_floor_min_samples(), 5);
     assert_eq!(o.motion_blur_gate(), true);
+  }
+
+  #[cfg(feature = "serde")]
+  #[test]
+  fn options_deserialize_clamps_non_finite_thresholds_to_defaults() {
+    // min_sharpness, luma_variance_threshold, sat_variance_threshold
+    // are f32 fields the builders accept without range validation.
+    // Serde must still clamp non-finite values to defaults because
+    // `hard_gate` fails closed on non-finite — a NaN threshold
+    // would shadow the metric-side fail-closed by making every
+    // comparison evaluate to false.
+    let defaults = Options::default();
+    let raw = OptionsRaw {
+      target_interval: Duration::from_secs(4),
+      max_frames_per_shot: 16,
+      margin_ratio: 0.02,
+      min_sharpness: f32::NAN, // invalid — non-finite
+      black_mean_threshold: 15,
+      bright_mean_threshold: 240,
+      luma_variance_threshold: f32::INFINITY, // invalid — non-finite
+      sat_variance_threshold: f32::NEG_INFINITY, // invalid — non-finite
+      max_clipping: 0.5,
+      weights: CompositeWeights::default(),
+      adaptive_floor: true,
+      adaptive_floor_percentile: 0.25,
+      adaptive_floor_min_samples: 20,
+      motion_blur_gate: false,
+      max_motion_blur: 0.75,
+    };
+    let o: Options = raw.into();
+    assert_eq!(o.min_sharpness(), defaults.min_sharpness());
+    assert_eq!(
+      o.luma_variance_threshold(),
+      defaults.luma_variance_threshold()
+    );
+    assert_eq!(
+      o.sat_variance_threshold(),
+      defaults.sat_variance_threshold()
+    );
   }
 
   #[cfg(feature = "serde")]
