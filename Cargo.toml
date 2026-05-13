@@ -7,7 +7,7 @@ homepage = "https://github.com/findit-ai/scenesdetect"
 documentation = "https://docs.rs/scenesdetect"
 description = "Scene/shot cut detection ported from PySceneDetect — Sans-I/O streaming API with SIMD-accelerated detectors for histogram, pHash, threshold, content, and adaptive algorithms."
 license = "MIT OR Apache-2.0"
-rust-version = "1.85.0"
+rust-version = "1.95.0"
 
 [[bench]]
 path = "benches/histogram.rs"
