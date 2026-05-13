@@ -825,7 +825,6 @@ pub(super) unsafe fn plane_mean_variance(plane: &[u8], w: usize, h: usize, s: us
   let whole = w / LANES * LANES;
 
   let zero = unsafe { _mm_setzero_si128() };
-  let ones_i16 = unsafe { _mm_set1_epi16(1) };
   let mut sum_acc = unsafe { _mm_setzero_si128() }; // u64x2
   let mut sq_acc = unsafe { _mm_setzero_si128() }; // u64x2
   let mut tail_sum: u64 = 0;
@@ -842,14 +841,17 @@ pub(super) unsafe fn plane_mean_variance(plane: &[u8], w: usize, h: usize, s: us
       let sad = unsafe { _mm_sad_epu8(v, zero) };
       sum_acc = unsafe { _mm_add_epi64(sum_acc, sad) };
 
-      // sum_x²: per-lane u8² → u16, pair-summed via PMADDWD.
+      // sum_x²: zero-extend u8 lanes to u16 (values stay in [0, 255], so
+      // each lane is also a non-negative i16). PMADDWD(v, v) then
+      // computes (v[2i]*v[2i+1] + v[2i+1]*v[2i+2]) wait — actually
+      // PMADDWD(a, b) gives (a[0]*b[0] + a[1]*b[1]) per i32 output lane.
+      // With a == b == widened-u8, each output lane is v[2i]² + v[2i+1]²,
+      // bounded by 2·255² = 130 050 < 2³¹. This avoids the i16-truncation
+      // trap of computing the square as u16 first.
       let v_lo = unsafe { _mm_unpacklo_epi8(v, zero) };
       let v_hi = unsafe { _mm_unpackhi_epi8(v, zero) };
-      let sq_lo_u16 = unsafe { _mm_mullo_epi16(v_lo, v_lo) };
-      let sq_hi_u16 = unsafe { _mm_mullo_epi16(v_hi, v_hi) };
-      // madd(v, 1) pair-sums u16×8 → i32×4 (pair max 2·65025 < 2³¹).
-      let pair_lo = unsafe { _mm_madd_epi16(sq_lo_u16, ones_i16) };
-      let pair_hi = unsafe { _mm_madd_epi16(sq_hi_u16, ones_i16) };
+      let pair_lo = unsafe { _mm_madd_epi16(v_lo, v_lo) };
+      let pair_hi = unsafe { _mm_madd_epi16(v_hi, v_hi) };
       let pair_sum = unsafe { _mm_add_epi32(pair_lo, pair_hi) };
       // Widen i32×4 → two i64×2 (non-negative, zero-extend).
       let part_a = unsafe { _mm_unpacklo_epi32(pair_sum, zero) };

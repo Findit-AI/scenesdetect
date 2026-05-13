@@ -39,6 +39,14 @@
 ///   width`).
 /// - `use_simd`: `true` to dispatch to the best available SIMD backend;
 ///   `false` forces the scalar fallback.
+///
+/// # Panics
+///
+/// Panics in **all** builds if the slice lengths are too short for the
+/// declared dimensions, or if `stride < 3 * width`. The SIMD backends
+/// use unchecked pointer loads/stores; validating up front prevents
+/// callers from reaching those unchecked memory accesses from safe
+/// Rust.
 #[inline]
 #[allow(clippy::too_many_arguments)]
 pub fn bgr_to_hsv_planes(
@@ -51,6 +59,40 @@ pub fn bgr_to_hsv_planes(
   stride: u32,
   use_simd: bool,
 ) {
+  let w = width as usize;
+  let h = height as usize;
+  let s = stride as usize;
+  let plane_len = w
+    .checked_mul(h)
+    .expect("plane size (width * height) overflows usize");
+  let src_min = s
+    .checked_mul(h)
+    .expect("src size (stride * height) overflows usize");
+  assert!(
+    s >= w.saturating_mul(3),
+    "bgr_to_hsv_planes: stride {s} must be >= width*3 ({})",
+    w.saturating_mul(3)
+  );
+  assert!(
+    src.len() >= src_min,
+    "bgr_to_hsv_planes: src len {} < stride*height {src_min}",
+    src.len()
+  );
+  assert!(
+    h_out.len() >= plane_len,
+    "bgr_to_hsv_planes: h_out len {} < width*height {plane_len}",
+    h_out.len()
+  );
+  assert!(
+    s_out.len() >= plane_len,
+    "bgr_to_hsv_planes: s_out len {} < width*height {plane_len}",
+    s_out.len()
+  );
+  assert!(
+    v_out.len() >= plane_len,
+    "bgr_to_hsv_planes: v_out len {} < width*height {plane_len}",
+    v_out.len()
+  );
   crate::arch::bgr_to_hsv_planes(h_out, s_out, v_out, src, width, height, stride, use_simd);
 }
 
@@ -81,13 +123,13 @@ pub fn bgr_to_hsv_planes(
 ///   (aarch64 NEON today; x86 SSSE3/AVX2 and wasm-simd128 in follow-up
 ///   commits); `false` forces the scalar fallback.
 ///
-/// # Panics (debug builds)
+/// # Panics
 ///
-/// Debug builds verify `stride >= 3 * width`, `src.len() >= stride *
-/// height`, and `out.len() >= width * height`. In release builds the
-/// caller is trusted — the frame-type constructors in this crate
-/// (`RgbFrame::try_new`, `LumaFrame::try_new`) already validate these
-/// invariants and should be preferred as the construction path.
+/// Panics in **all** builds if the slice lengths are too short for the
+/// declared dimensions, or if `stride < 3 * width`. The SIMD backends
+/// use unchecked pointer loads/stores; validating up front prevents
+/// callers from reaching those unchecked memory accesses from safe
+/// Rust.
 #[inline]
 pub fn bgr_to_luma(
   out: &mut [u8],
@@ -101,9 +143,27 @@ pub fn bgr_to_luma(
   let h = height as usize;
   let s = stride as usize;
 
-  debug_assert!(s >= w.saturating_mul(3), "stride must be >= width*3");
-  debug_assert!(src.len() >= s.saturating_mul(h), "src too short");
-  debug_assert!(out.len() >= w.saturating_mul(h), "out too short");
+  let out_min = w
+    .checked_mul(h)
+    .expect("out size (width * height) overflows usize");
+  let src_min = s
+    .checked_mul(h)
+    .expect("src size (stride * height) overflows usize");
+  assert!(
+    s >= w.saturating_mul(3),
+    "bgr_to_luma: stride {s} must be >= width*3 ({})",
+    w.saturating_mul(3)
+  );
+  assert!(
+    src.len() >= src_min,
+    "bgr_to_luma: src len {} < stride*height {src_min}",
+    src.len()
+  );
+  assert!(
+    out.len() >= out_min,
+    "bgr_to_luma: out len {} < width*height {out_min}",
+    out.len()
+  );
 
   crate::arch::bgr_to_luma(out, src, width, height, stride, use_simd);
 }
@@ -184,6 +244,53 @@ mod tests {
     bgr_to_luma(&mut out, &src, w as u32, h as u32, stride as u32, false);
     assert!(out[..w].iter().all(|&y| y == 255));
     assert!(out[w..].iter().all(|&y| y == 0));
+  }
+
+  #[test]
+  #[should_panic(expected = "bgr_to_luma: stride")]
+  fn bgr_to_luma_panics_on_short_stride() {
+    // stride=8 < width*3=24 — illegal.
+    let mut out = vec![0u8; 8 * 2];
+    let src = vec![0u8; 8 * 2];
+    bgr_to_luma(&mut out, &src, 8, 2, 8, false);
+  }
+
+  #[test]
+  #[should_panic(expected = "bgr_to_luma: src")]
+  fn bgr_to_luma_panics_on_short_src() {
+    // src is only one row; declared height is 2.
+    let mut out = vec![0u8; 4 * 2];
+    let src = vec![0u8; 4 * 3]; // one row's worth
+    bgr_to_luma(&mut out, &src, 4, 2, 4 * 3, false);
+  }
+
+  #[test]
+  #[should_panic(expected = "bgr_to_luma: out")]
+  fn bgr_to_luma_panics_on_short_out() {
+    // out half the size required.
+    let mut out = vec![0u8; 4];
+    let src = vec![0u8; 4 * 2 * 3];
+    bgr_to_luma(&mut out, &src, 4, 2, 4 * 3, false);
+  }
+
+  #[test]
+  #[should_panic(expected = "bgr_to_hsv_planes: stride")]
+  fn bgr_to_hsv_planes_panics_on_short_stride() {
+    let mut h_out = vec![0u8; 16];
+    let mut s_out = vec![0u8; 16];
+    let mut v_out = vec![0u8; 16];
+    let src = vec![0u8; 16];
+    bgr_to_hsv_planes(&mut h_out, &mut s_out, &mut v_out, &src, 8, 2, 8, false);
+  }
+
+  #[test]
+  #[should_panic(expected = "bgr_to_hsv_planes: h_out")]
+  fn bgr_to_hsv_planes_panics_on_short_h_out() {
+    let mut h_out = vec![0u8; 4]; // too short
+    let mut s_out = vec![0u8; 16];
+    let mut v_out = vec![0u8; 16];
+    let src = vec![0u8; 8 * 2 * 3];
+    bgr_to_hsv_planes(&mut h_out, &mut s_out, &mut v_out, &src, 8, 2, 8 * 3, false);
   }
 
   #[test]

@@ -1649,4 +1649,52 @@ mod tests {
       x86_ssse3::plane_mean_variance(p, w, h, s)
     });
   }
+
+  // Regression guard for the SSSE3 plane_mean_variance squared-sum
+  // truncation bug: when v ≥ 182, v² ≥ 33 124 overflows i16. A backend
+  // that computes the square as u16 first and then feeds the result
+  // through `_mm_madd_epi16` (treating u16 as signed) reports wildly
+  // wrong variance — non-zero on a uniform plane, or sign-flipped on
+  // a bimodal one.
+  //
+  // The scalar reference always handled this correctly; this test
+  // pins the invariant so any SIMD backend that violates it fails
+  // CI. See also `ssse3_plane_mean_variance_bright_matches_scalar`.
+  #[test]
+  fn scalar_plane_mean_variance_bright_uniform_is_zero_var() {
+    for &v in &[182u8, 200, 240, 255] {
+      let data = vec![v; 32 * 8];
+      let (mean, var) = scalar::Scalar::plane_mean_variance(&data, 32, 8, 32);
+      assert!(
+        (mean - v as f32).abs() < 1e-3,
+        "uniform v={v}: mean {mean} ≠ {v}"
+      );
+      assert!(var < 1e-3, "uniform v={v}: variance {var} should be 0");
+    }
+  }
+
+  #[cfg(all(any(target_arch = "x86", target_arch = "x86_64"), feature = "std"))]
+  #[test]
+  fn ssse3_plane_mean_variance_bright_matches_scalar() {
+    if !std::is_x86_feature_detected!("ssse3") {
+      return;
+    }
+    // Bright uniform plane: variance must be ~0. The SSSE3 backend's
+    // historical bug squared u8 lanes at u16 precision before widening,
+    // producing huge negative-then-zero-extended variance on values
+    // ≥ 182.
+    for &v in &[182u8, 200, 240, 255] {
+      let data = vec![v; 32 * 8];
+      let (scalar_m, scalar_v) = scalar::Scalar::plane_mean_variance(&data, 32, 8, 32);
+      let (simd_m, simd_v) = unsafe { x86_ssse3::plane_mean_variance(&data, 32, 8, 32) };
+      assert!(
+        (simd_m - scalar_m).abs() < 1e-3,
+        "v={v}: mean simd={simd_m} scalar={scalar_m}"
+      );
+      assert!(
+        (simd_v - scalar_v).abs() < 1e-3,
+        "v={v}: variance simd={simd_v} scalar={scalar_v}"
+      );
+    }
+  }
 }
