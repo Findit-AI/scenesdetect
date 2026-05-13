@@ -285,6 +285,7 @@ impl CompositeWeights {
 /// variance thresholds — keep them in sync.
 #[derive(Debug, Clone, Copy, PartialEq)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "serde", serde(from = "OptionsRaw"))]
 pub struct Options {
   target_interval: Duration,
   max_frames_per_shot: u32,
@@ -322,6 +323,100 @@ impl Default for Options {
       adaptive_floor_min_samples: 20,
       motion_blur_gate: false,
       max_motion_blur: 0.75,
+    }
+  }
+}
+
+// Private deserialization shim for [`Options`]. The public builders
+// reject several invalid fields with `assert!`, but `serde` would
+// otherwise construct an Options instance directly through the
+// derived [`Deserialize`] and silently weaken hard gates or
+// drive pathological bucket allocation (e.g. `target_interval = 0`,
+// `max_clipping = 2.5`, NaN ratios, …).
+//
+// Validation policy here mirrors the **CompositeWeights** clamp
+// convention rather than the builder panic policy: invalid input
+// silently falls back to the spec default for that field. Rationale:
+// deserialization receives external/config input where a panic
+// upgrades a recoverable error into a hard crash. The fields that
+// don't need validation (raw u8/f32 with no documented range) pass
+// through verbatim.
+#[cfg(feature = "serde")]
+#[derive(Deserialize)]
+struct OptionsRaw {
+  target_interval: Duration,
+  max_frames_per_shot: u32,
+  margin_ratio: f64,
+  min_sharpness: f32,
+  black_mean_threshold: u8,
+  bright_mean_threshold: u8,
+  luma_variance_threshold: f32,
+  sat_variance_threshold: f32,
+  max_clipping: f32,
+  weights: CompositeWeights,
+  adaptive_floor: bool,
+  adaptive_floor_percentile: f32,
+  adaptive_floor_min_samples: usize,
+  motion_blur_gate: bool,
+  max_motion_blur: f32,
+}
+
+#[cfg(feature = "serde")]
+impl From<OptionsRaw> for Options {
+  fn from(r: OptionsRaw) -> Self {
+    let defaults = Self::default();
+    Self {
+      // target_interval must be strictly positive — builder panics on zero.
+      target_interval: if r.target_interval.is_zero() {
+        defaults.target_interval
+      } else {
+        r.target_interval
+      },
+      // max_frames_per_shot must be > 0.
+      max_frames_per_shot: if r.max_frames_per_shot == 0 {
+        defaults.max_frames_per_shot
+      } else {
+        r.max_frames_per_shot
+      },
+      // margin_ratio must lie in [0.0, 0.5).
+      margin_ratio: if r.margin_ratio.is_finite() && (0.0..0.5).contains(&r.margin_ratio) {
+        r.margin_ratio
+      } else {
+        defaults.margin_ratio
+      },
+      // These four have no builder validation and accept any f32.
+      min_sharpness: r.min_sharpness,
+      black_mean_threshold: r.black_mean_threshold,
+      bright_mean_threshold: r.bright_mean_threshold,
+      luma_variance_threshold: r.luma_variance_threshold,
+      sat_variance_threshold: r.sat_variance_threshold,
+      // max_clipping must lie in [0.0, 1.0].
+      max_clipping: if r.max_clipping.is_finite() && (0.0..=1.0).contains(&r.max_clipping) {
+        r.max_clipping
+      } else {
+        defaults.max_clipping
+      },
+      // weights are already sanitised through CompositeWeights's own
+      // `serde(from = "CompositeWeightsRaw")` route.
+      weights: r.weights,
+      adaptive_floor: r.adaptive_floor,
+      // adaptive_floor_percentile must lie in [0.0, 1.0].
+      adaptive_floor_percentile: if r.adaptive_floor_percentile.is_finite()
+        && (0.0..=1.0).contains(&r.adaptive_floor_percentile)
+      {
+        r.adaptive_floor_percentile
+      } else {
+        defaults.adaptive_floor_percentile
+      },
+      adaptive_floor_min_samples: r.adaptive_floor_min_samples,
+      motion_blur_gate: r.motion_blur_gate,
+      // max_motion_blur must lie in [0.0, 1.0].
+      max_motion_blur: if r.max_motion_blur.is_finite() && (0.0..=1.0).contains(&r.max_motion_blur)
+      {
+        r.max_motion_blur
+      } else {
+        defaults.max_motion_blur
+      },
     }
   }
 }
@@ -719,9 +814,15 @@ impl Detector {
       // Running argmax updates.
       // Fallback path: pure-sharpness ranking, preserved so "least
       // bad" is well-defined when every frame in the bucket fails
-      // the strict gate.
-      if best_any.is_none_or(|(_, s)| sharper(metrics.sharpness(), s)) {
-        best_any = Some((ts, metrics.sharpness()));
+      // the strict gate. Skip non-finite sharpness for the same
+      // reason the strict path does — a NaN incumbent would lock
+      // out every later finite candidate via the NaN-tolerant
+      // [`sharper`] comparator. If every fallback candidate is
+      // non-finite, the bucket emits nothing (correct degradation
+      // for a fully-corrupt bucket).
+      let s_now = metrics.sharpness();
+      if s_now.is_finite() && best_any.is_none_or(|(_, s)| sharper(s_now, s)) {
+        best_any = Some((ts, s_now));
       }
       // Strict path: composite-quality ranking among gate-passing
       // frames. Non-finite composites are skipped — a NaN incumbent
@@ -1397,6 +1498,80 @@ mod tests {
     assert_eq!(w.colorfulness_norm(), 200.0);
   }
 
+  #[cfg(feature = "serde")]
+  #[test]
+  fn options_deserialize_clamps_invalid_fields_to_defaults() {
+    // Every builder-validated field with an out-of-range value:
+    // From<OptionsRaw> must clamp each back to its spec default
+    // rather than allow the invalid state through.
+    let defaults = Options::default();
+    let raw = OptionsRaw {
+      target_interval: Duration::ZERO, // invalid — zero
+      max_frames_per_shot: 0,          // invalid — zero
+      margin_ratio: 0.75,              // invalid — out of [0.0, 0.5)
+      min_sharpness: 12.5,             // valid (no builder check)
+      black_mean_threshold: 7,         // valid
+      bright_mean_threshold: 250,      // valid
+      luma_variance_threshold: 8.0,    // valid
+      sat_variance_threshold: 4.0,     // valid
+      max_clipping: 1.5,               // invalid — > 1.0
+      weights: CompositeWeights::default(),
+      adaptive_floor: false,
+      adaptive_floor_percentile: f32::NAN, // invalid — NaN
+      adaptive_floor_min_samples: 5,       // valid
+      motion_blur_gate: true,
+      max_motion_blur: -0.2, // invalid — < 0.0
+    };
+    let o: Options = raw.into();
+    assert_eq!(o.target_interval(), defaults.target_interval());
+    assert_eq!(o.max_frames_per_shot(), defaults.max_frames_per_shot());
+    assert!((o.margin_ratio() - defaults.margin_ratio()).abs() < 1e-9);
+    assert_eq!(o.max_clipping(), defaults.max_clipping());
+    assert_eq!(
+      o.adaptive_floor_percentile(),
+      defaults.adaptive_floor_percentile()
+    );
+    assert_eq!(o.max_motion_blur(), defaults.max_motion_blur());
+    // Unvalidated fields pass through.
+    assert_eq!(o.min_sharpness(), 12.5);
+    assert_eq!(o.black_mean_threshold(), 7);
+    assert_eq!(o.bright_mean_threshold(), 250);
+    assert_eq!(o.adaptive_floor(), false);
+    assert_eq!(o.adaptive_floor_min_samples(), 5);
+    assert_eq!(o.motion_blur_gate(), true);
+  }
+
+  #[cfg(feature = "serde")]
+  #[test]
+  fn options_deserialize_valid_fields_pass_through() {
+    // Every builder-validated field within its valid range must
+    // arrive unchanged.
+    let raw = OptionsRaw {
+      target_interval: Duration::from_secs(2),
+      max_frames_per_shot: 8,
+      margin_ratio: 0.49,
+      min_sharpness: 75.0,
+      black_mean_threshold: 12,
+      bright_mean_threshold: 245,
+      luma_variance_threshold: 4.0,
+      sat_variance_threshold: 2.5,
+      max_clipping: 0.0,
+      weights: CompositeWeights::default(),
+      adaptive_floor: true,
+      adaptive_floor_percentile: 1.0,
+      adaptive_floor_min_samples: 30,
+      motion_blur_gate: true,
+      max_motion_blur: 1.0,
+    };
+    let o: Options = raw.into();
+    assert_eq!(o.target_interval(), Duration::from_secs(2));
+    assert_eq!(o.max_frames_per_shot(), 8);
+    assert!((o.margin_ratio() - 0.49).abs() < 1e-9);
+    assert_eq!(o.max_clipping(), 0.0);
+    assert_eq!(o.adaptive_floor_percentile(), 1.0);
+    assert_eq!(o.max_motion_blur(), 1.0);
+  }
+
   #[test]
   fn composite_weights_paired_builders_are_const_context_usable() {
     // Compile-time evaluation through the sanitise_norm path:
@@ -1789,11 +1964,13 @@ mod tests {
   }
 
   #[test]
-  fn strict_argmax_falls_back_when_only_candidate_is_non_finite() {
-    // Single frame with a NaN sharpness fails the strict path → drops
-    // into the fallback (raw-sharpness) path, which still selects it
-    // as the "least bad" candidate. Verifies that the guard doesn't
-    // accidentally swallow the only candidate.
+  fn argmax_skips_when_only_candidate_has_non_finite_sharpness() {
+    // Single frame with NaN sharpness fails both the strict (non-
+    // finite composite) and the fallback (non-finite sharpness)
+    // paths. The bucket emits nothing — preferable to locking a
+    // keyframe onto a corrupted metric. This is the correct
+    // degradation for a fully-corrupt bucket: better silent drop
+    // than wrong selection.
     let opts = Options::default().with_margin_ratio(0.0);
     let mut det = Detector::new(opts);
     let m = FrameMetrics::new()
@@ -1804,8 +1981,34 @@ mod tests {
       .with_clipping(0.0);
     det.observe(ts(500_000), m);
     let out = det.finalize_shot(tr(0, 2_000_000));
-    // Fallback path emits one timestamp.
-    assert_eq!(out, vec![ts(500_000)]);
+    assert!(out.is_empty(), "non-finite-only bucket must not emit");
+  }
+
+  #[test]
+  fn fallback_argmax_prefers_finite_sharpness_over_nan_incumbent() {
+    // First frame has NaN sharpness — neither strict nor fallback
+    // should lock onto it. Second frame is gate-failing (low
+    // brightness → hard_gate trips) so it only reaches the fallback
+    // path, but its sharpness is finite. The fallback must select
+    // the second frame, not the NaN incumbent.
+    let opts = Options::default().with_margin_ratio(0.0);
+    let mut det = Detector::new(opts);
+    let poisoned = FrameMetrics::new()
+      .with_sharpness(f32::NAN)
+      .with_brightness(128.0)
+      .with_luma_variance(200.0)
+      .with_saturation_variance(100.0)
+      .with_clipping(0.0);
+    let fallback_only = FrameMetrics::new()
+      .with_sharpness(300.0)
+      .with_brightness(5.0) // < black_mean_threshold(15) → strict gate fails
+      .with_luma_variance(200.0)
+      .with_saturation_variance(100.0)
+      .with_clipping(0.0);
+    det.observe(ts(500_000), poisoned);
+    det.observe(ts(1_500_000), fallback_only);
+    let out = det.finalize_shot(tr(0, 2_000_000));
+    assert_eq!(out, vec![ts(1_500_000)]);
   }
 
   #[test]
