@@ -101,7 +101,7 @@ const DEFAULT_COLORFULNESS_NORM: f32 = 50.0;
 /// (the NaN-tolerant [`sharper`] helper retains the first non-numeric
 /// incumbent).
 #[inline]
-fn sanitise_norm(norm: f32, default: f32) -> f32 {
+const fn sanitise_norm(norm: f32, default: f32) -> f32 {
   if norm.is_finite() && norm > 0.0 {
     norm
   } else {
@@ -138,7 +138,7 @@ impl CompositeWeights {
   /// The weight itself is stored verbatim — passing `weight = 0.0`
   /// is the right way to disable a term.
   #[cfg_attr(not(tarpaulin), inline(always))]
-  pub fn with_sharpness(mut self, weight: f32, norm: f32) -> Self {
+  pub const fn with_sharpness(mut self, weight: f32, norm: f32) -> Self {
     self.sharpness = weight;
     self.sharpness_norm = sanitise_norm(norm, DEFAULT_SHARPNESS_NORM);
     self
@@ -150,7 +150,7 @@ impl CompositeWeights {
   /// [`new`](Self::new) default (`20.0`); see
   /// [`Self::with_sharpness`] for the rationale.
   #[cfg_attr(not(tarpaulin), inline(always))]
-  pub fn with_noise(mut self, weight: f32, norm: f32) -> Self {
+  pub const fn with_noise(mut self, weight: f32, norm: f32) -> Self {
     self.noise = weight;
     self.noise_norm = sanitise_norm(norm, DEFAULT_NOISE_NORM);
     self
@@ -161,7 +161,7 @@ impl CompositeWeights {
   /// [`new`](Self::new) default (`50.0`); see
   /// [`Self::with_sharpness`] for the rationale.
   #[cfg_attr(not(tarpaulin), inline(always))]
-  pub fn with_colorfulness(mut self, weight: f32, norm: f32) -> Self {
+  pub const fn with_colorfulness(mut self, weight: f32, norm: f32) -> Self {
     self.colorfulness = weight;
     self.colorfulness_norm = sanitise_norm(norm, DEFAULT_COLORFULNESS_NORM);
     self
@@ -1270,6 +1270,35 @@ mod tests {
   fn composite_weights_new_is_const_context_usable() {
     const W: CompositeWeights = CompositeWeights::new().with_motion_blur(0.5);
     assert_eq!(W.motion_blur(), 0.5);
+  }
+
+  #[test]
+  fn composite_weights_paired_builders_are_const_context_usable() {
+    // Compile-time evaluation through the sanitise_norm path:
+    // - valid norms pass through
+    // - invalid norms fall back to the spec defaults
+    const VALID: CompositeWeights = CompositeWeights::new()
+      .with_sharpness(0.5, 250.0)
+      .with_noise(0.1, 5.0)
+      .with_colorfulness(0.4, 200.0);
+    assert_eq!(VALID.sharpness(), 0.5);
+    assert_eq!(VALID.sharpness_norm(), 250.0);
+    assert_eq!(VALID.noise(), 0.1);
+    assert_eq!(VALID.noise_norm(), 5.0);
+    assert_eq!(VALID.colorfulness(), 0.4);
+    assert_eq!(VALID.colorfulness_norm(), 200.0);
+
+    const CLAMPED: CompositeWeights = CompositeWeights::new()
+      .with_sharpness(1.0, 0.0) // invalid: zero
+      .with_noise(0.3, f32::NAN) // invalid: NaN
+      .with_colorfulness(0.2, f32::INFINITY); // invalid: +Inf
+    assert_eq!(CLAMPED.sharpness_norm(), 1000.0);
+    assert_eq!(CLAMPED.noise_norm(), 20.0);
+    assert_eq!(CLAMPED.colorfulness_norm(), 50.0);
+    // Weights are stored verbatim regardless.
+    assert_eq!(CLAMPED.sharpness(), 1.0);
+    assert_eq!(CLAMPED.noise(), 0.3);
+    assert_eq!(CLAMPED.colorfulness(), 0.2);
   }
 
   #[test]
