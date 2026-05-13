@@ -87,6 +87,28 @@ impl Default for CompositeWeights {
   }
 }
 
+// Default normalisers exposed as named constants so the `with_*`
+// builders can fall back to them when given an invalid (zero,
+// negative, NaN, or Inf) `norm` argument. Kept in sync with the
+// initialisers in [`CompositeWeights::new`].
+const DEFAULT_SHARPNESS_NORM: f32 = 1000.0;
+const DEFAULT_NOISE_NORM: f32 = 20.0;
+const DEFAULT_COLORFULNESS_NORM: f32 = 50.0;
+
+/// Returns `norm` when it is strictly positive and finite, otherwise
+/// returns `default`. Invalid normalisers would feed `Inf`/`NaN` into
+/// [`composite_quality`] and silently corrupt the strict-pass argmax
+/// (the NaN-tolerant [`sharper`] helper retains the first non-numeric
+/// incumbent).
+#[inline]
+fn sanitise_norm(norm: f32, default: f32) -> f32 {
+  if norm.is_finite() && norm > 0.0 {
+    norm
+  } else {
+    default
+  }
+}
+
 impl CompositeWeights {
   /// Creates a [`CompositeWeights`] with the calibrated default
   /// weights and normalisers. See the type docs for the calibration
@@ -95,36 +117,53 @@ impl CompositeWeights {
   pub const fn new() -> Self {
     Self {
       sharpness: 1.0,
-      sharpness_norm: 1000.0,
+      sharpness_norm: DEFAULT_SHARPNESS_NORM,
       noise: 0.3,
-      noise_norm: 20.0,
+      noise_norm: DEFAULT_NOISE_NORM,
       colorfulness: 0.2,
-      colorfulness_norm: 50.0,
+      colorfulness_norm: DEFAULT_COLORFULNESS_NORM,
       clipping: 0.5,
       motion_blur: 0.0,
     }
   }
 
   /// Sets the sharpness weight and its normaliser.
+  ///
+  /// Invalid normalisers (zero, negative, `NaN`, or infinite) are
+  /// silently clamped to the [`new`](Self::new) default
+  /// (`1000.0`). They would otherwise feed `Inf`/`NaN` into
+  /// [`composite_quality`] and silently corrupt the strict-pass
+  /// argmax (the NaN-tolerant [`sharper`] helper retains the first
+  /// non-numeric incumbent and later candidates cannot unseat it).
+  /// The weight itself is stored verbatim — passing `weight = 0.0`
+  /// is the right way to disable a term.
   #[cfg_attr(not(tarpaulin), inline(always))]
-  pub const fn with_sharpness(mut self, weight: f32, norm: f32) -> Self {
+  pub fn with_sharpness(mut self, weight: f32, norm: f32) -> Self {
     self.sharpness = weight;
-    self.sharpness_norm = norm;
+    self.sharpness_norm = sanitise_norm(norm, DEFAULT_SHARPNESS_NORM);
     self
   }
   /// Sets the noise weight and its normaliser. Noise is a penalty
   /// (subtracted in the composite).
+  ///
+  /// Invalid normalisers are silently clamped to the
+  /// [`new`](Self::new) default (`20.0`); see
+  /// [`Self::with_sharpness`] for the rationale.
   #[cfg_attr(not(tarpaulin), inline(always))]
-  pub const fn with_noise(mut self, weight: f32, norm: f32) -> Self {
+  pub fn with_noise(mut self, weight: f32, norm: f32) -> Self {
     self.noise = weight;
-    self.noise_norm = norm;
+    self.noise_norm = sanitise_norm(norm, DEFAULT_NOISE_NORM);
     self
   }
   /// Sets the colorfulness weight and its normaliser.
+  ///
+  /// Invalid normalisers are silently clamped to the
+  /// [`new`](Self::new) default (`50.0`); see
+  /// [`Self::with_sharpness`] for the rationale.
   #[cfg_attr(not(tarpaulin), inline(always))]
-  pub const fn with_colorfulness(mut self, weight: f32, norm: f32) -> Self {
+  pub fn with_colorfulness(mut self, weight: f32, norm: f32) -> Self {
     self.colorfulness = weight;
-    self.colorfulness_norm = norm;
+    self.colorfulness_norm = sanitise_norm(norm, DEFAULT_COLORFULNESS_NORM);
     self
   }
   /// Sets the clipping-penalty weight. Clipping is already in `[0, 1]`
@@ -753,7 +792,12 @@ fn compute_effective_floor(
     })
     .map(|(_, m)| m.sharpness())
     .collect();
-  if sharps.len() < opts.adaptive_floor_min_samples() {
+  // `min_samples == 0` (a valid user setting meaning "adapt regardless
+  // of sample count") combined with an empty in-range shot would skip
+  // the threshold check and then index an empty slice. Treat
+  // `sharps.is_empty()` as "no data to derive a percentile from" and
+  // fall back to the absolute floor.
+  if sharps.is_empty() || sharps.len() < opts.adaptive_floor_min_samples() {
     return opts.min_sharpness();
   }
   sharps.sort_by(|a, b| a.partial_cmp(b).unwrap_or(Ordering::Equal));
@@ -1421,5 +1465,96 @@ mod tests {
     let out = det.finalize_shot(tr(0, 2_000_000));
     // Strict path: `good` wins (bad rejected by motion-blur gate).
     assert_eq!(out, vec![ts(1_500_000)]);
+  }
+
+  // ---- Normalisation / range guard regressions -----------------------------
+
+  #[test]
+  fn composite_weights_invalid_norms_clamp_to_default() {
+    // All flavours of invalid (zero, negative, NaN, +inf, -inf) must
+    // fall back to the spec defaults so composite_quality never sees
+    // an Inf/NaN-producing divisor.
+    let defaults = CompositeWeights::new();
+    for &bad in &[
+      0.0f32,
+      -1.0,
+      -0.0,
+      f32::NAN,
+      f32::INFINITY,
+      f32::NEG_INFINITY,
+    ] {
+      let w = CompositeWeights::new()
+        .with_sharpness(1.0, bad)
+        .with_noise(0.3, bad)
+        .with_colorfulness(0.2, bad);
+      assert_eq!(
+        w.sharpness_norm(),
+        defaults.sharpness_norm(),
+        "sharpness_norm should clamp invalid {bad:?} to default"
+      );
+      assert_eq!(
+        w.noise_norm(),
+        defaults.noise_norm(),
+        "noise_norm should clamp invalid {bad:?} to default"
+      );
+      assert_eq!(
+        w.colorfulness_norm(),
+        defaults.colorfulness_norm(),
+        "colorfulness_norm should clamp invalid {bad:?} to default"
+      );
+      // The weight itself is stored verbatim — clamp is on `norm` only.
+      assert_eq!(w.sharpness(), 1.0);
+      assert_eq!(w.noise(), 0.3);
+      assert_eq!(w.colorfulness(), 0.2);
+    }
+  }
+
+  #[test]
+  fn composite_weights_valid_norms_pass_through() {
+    let w = CompositeWeights::new()
+      .with_sharpness(0.5, 250.0)
+      .with_noise(0.1, 5.0)
+      .with_colorfulness(0.4, 200.0);
+    assert_eq!(w.sharpness_norm(), 250.0);
+    assert_eq!(w.noise_norm(), 5.0);
+    assert_eq!(w.colorfulness_norm(), 200.0);
+  }
+
+  #[test]
+  fn composite_quality_with_clamped_norms_stays_finite() {
+    // Belt-and-braces: even if a caller chains every kind of invalid
+    // norm onto the weights, composite_quality must produce a finite
+    // result on a normal frame so the strict-pass argmax keeps
+    // ranking deterministically.
+    let weights = CompositeWeights::new()
+      .with_sharpness(1.0, f32::NAN)
+      .with_noise(0.3, 0.0)
+      .with_colorfulness(0.2, f32::INFINITY);
+    let m = FrameMetrics::new()
+      .with_sharpness(500.0)
+      .with_noise(5.0)
+      .with_colorfulness(40.0)
+      .with_clipping(0.0)
+      .with_motion_blur(0.0);
+    let q = composite_quality(&m, &weights);
+    assert!(
+      q.is_finite(),
+      "composite_quality must stay finite under clamped invalid norms; got {q}"
+    );
+  }
+
+  #[test]
+  fn adaptive_floor_min_samples_zero_with_empty_shot_uses_absolute_floor() {
+    // min_samples = 0 + empty in-range shot would previously index an
+    // empty Vec and panic. The guard must fall back to the absolute
+    // floor and return cleanly.
+    let opts = Options::default()
+      .with_margin_ratio(0.0)
+      .with_adaptive_floor_min_samples(0);
+    let mut det = Detector::new(opts);
+    // No observations — finalize a non-empty range and expect no emits
+    // (and no panic).
+    let out = det.finalize_shot(tr(0, 4_000_000));
+    assert!(out.is_empty(), "empty shot must yield no keyframes");
   }
 }
