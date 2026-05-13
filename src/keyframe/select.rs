@@ -55,6 +55,137 @@ use crate::{
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
 
+// ---- CompositeWeights ------------------------------------------------------
+
+/// Weights and per-metric normalisers consumed by
+/// [`composite_quality`] when ranking frames inside a bucket.
+///
+/// Defaults are tuned so a "good" baseline frame (sharp, mid-luma,
+/// not noisy, mildly colorful) scores ≈ 1.0. Zeroing every term
+/// except `sharpness` collapses the composite to pure Tenengrad —
+/// identical to the legacy strict-pass argmax.
+///
+/// Fields are private; use `with_*` builders for construction and
+/// the field-name getters for read access.
+#[derive(Debug, Clone, Copy, PartialEq)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+pub struct CompositeWeights {
+  sharpness: f32,
+  sharpness_norm: f32,
+  noise: f32,
+  noise_norm: f32,
+  colorfulness: f32,
+  colorfulness_norm: f32,
+  clipping: f32,
+  motion_blur: f32,
+}
+
+impl Default for CompositeWeights {
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  fn default() -> Self {
+    Self::new()
+  }
+}
+
+impl CompositeWeights {
+  /// Creates a [`CompositeWeights`] with the calibrated default
+  /// weights and normalisers. See the type docs for the calibration
+  /// rationale.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn new() -> Self {
+    Self {
+      sharpness: 1.0,
+      sharpness_norm: 1000.0,
+      noise: 0.3,
+      noise_norm: 20.0,
+      colorfulness: 0.2,
+      colorfulness_norm: 50.0,
+      clipping: 0.5,
+      motion_blur: 0.0,
+    }
+  }
+
+  /// Sets the sharpness weight and its normaliser.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn with_sharpness(mut self, weight: f32, norm: f32) -> Self {
+    self.sharpness = weight;
+    self.sharpness_norm = norm;
+    self
+  }
+  /// Sets the noise weight and its normaliser. Noise is a penalty
+  /// (subtracted in the composite).
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn with_noise(mut self, weight: f32, norm: f32) -> Self {
+    self.noise = weight;
+    self.noise_norm = norm;
+    self
+  }
+  /// Sets the colorfulness weight and its normaliser.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn with_colorfulness(mut self, weight: f32, norm: f32) -> Self {
+    self.colorfulness = weight;
+    self.colorfulness_norm = norm;
+    self
+  }
+  /// Sets the clipping-penalty weight. Clipping is already in `[0, 1]`
+  /// — no normaliser.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn with_clipping(mut self, weight: f32) -> Self {
+    self.clipping = weight;
+    self
+  }
+  /// Sets the motion-blur-penalty weight. Anisotropy is already in
+  /// `[0, 1]` — no normaliser. Defaults to 0 (off).
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn with_motion_blur(mut self, weight: f32) -> Self {
+    self.motion_blur = weight;
+    self
+  }
+
+  // ---- Getters ------------------------------------------------------------
+
+  /// Sharpness weight (read-only accessor).
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn sharpness(&self) -> f32 {
+    self.sharpness
+  }
+  /// Sharpness normaliser (read-only accessor).
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn sharpness_norm(&self) -> f32 {
+    self.sharpness_norm
+  }
+  /// Noise weight (read-only accessor).
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn noise(&self) -> f32 {
+    self.noise
+  }
+  /// Noise normaliser (read-only accessor).
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn noise_norm(&self) -> f32 {
+    self.noise_norm
+  }
+  /// Colorfulness weight (read-only accessor).
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn colorfulness(&self) -> f32 {
+    self.colorfulness
+  }
+  /// Colorfulness normaliser (read-only accessor).
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn colorfulness_norm(&self) -> f32 {
+    self.colorfulness_norm
+  }
+  /// Clipping-penalty weight (read-only accessor).
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn clipping(&self) -> f32 {
+    self.clipping
+  }
+  /// Motion-blur-penalty weight (read-only accessor).
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn motion_blur(&self) -> f32 {
+    self.motion_blur
+  }
+}
+
 // ---- Options ---------------------------------------------------------------
 
 /// Tuning knobs for the selection state machine.
@@ -879,5 +1010,42 @@ mod tests {
     // NaN tolerant — not-greater either way.
     assert!(!sharper(f32::NAN, 1.0));
     assert!(!sharper(1.0, f32::NAN));
+  }
+
+  #[test]
+  fn composite_weights_default_matches_spec() {
+    let w = CompositeWeights::default();
+    assert_eq!(w.sharpness(), 1.0);
+    assert_eq!(w.sharpness_norm(), 1000.0);
+    assert_eq!(w.noise(), 0.3);
+    assert_eq!(w.noise_norm(), 20.0);
+    assert_eq!(w.colorfulness(), 0.2);
+    assert_eq!(w.colorfulness_norm(), 50.0);
+    assert_eq!(w.clipping(), 0.5);
+    assert_eq!(w.motion_blur(), 0.0);
+  }
+
+  #[test]
+  fn composite_weights_builders_roundtrip() {
+    let w = CompositeWeights::new()
+      .with_sharpness(0.5, 500.0)
+      .with_noise(0.1, 10.0)
+      .with_colorfulness(0.4, 100.0)
+      .with_clipping(0.25)
+      .with_motion_blur(0.6);
+    assert_eq!(w.sharpness(), 0.5);
+    assert_eq!(w.sharpness_norm(), 500.0);
+    assert_eq!(w.noise(), 0.1);
+    assert_eq!(w.noise_norm(), 10.0);
+    assert_eq!(w.colorfulness(), 0.4);
+    assert_eq!(w.colorfulness_norm(), 100.0);
+    assert_eq!(w.clipping(), 0.25);
+    assert_eq!(w.motion_blur(), 0.6);
+  }
+
+  #[test]
+  fn composite_weights_new_is_const_context_usable() {
+    const W: CompositeWeights = CompositeWeights::new().with_motion_blur(0.5);
+    assert_eq!(W.motion_blur(), 0.5);
   }
 }
