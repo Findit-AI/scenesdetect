@@ -525,7 +525,7 @@ mod tests {
     TimeRange::new(start_us, end_us, Timebase::new(1, nz(1_000_000)))
   }
 
-  fn good_score(sharpness: f32) -> FrameMetrics {
+  fn good_metrics(sharpness: f32) -> FrameMetrics {
     FrameMetrics::new()
       .with_sharpness(sharpness)
       .with_brightness(128.0)
@@ -621,26 +621,26 @@ mod tests {
   #[test]
   fn hard_gate_rejects_too_dark() {
     let o = Options::default();
-    let mut s = good_score(200.0);
-    s.set_brightness(5.0);
-    assert!(hard_gate(&s, &o));
+    let mut m = good_metrics(200.0);
+    m.set_brightness(5.0);
+    assert!(hard_gate(&m, &o));
   }
 
   #[test]
   fn hard_gate_rejects_too_bright() {
     let o = Options::default();
-    let mut s = good_score(200.0);
-    s.set_brightness(250.0);
-    assert!(hard_gate(&s, &o));
+    let mut m = good_metrics(200.0);
+    m.set_brightness(250.0);
+    assert!(hard_gate(&m, &o));
   }
 
   #[test]
   fn hard_gate_rejects_flat_frame() {
     let o = Options::default();
-    let mut s = good_score(200.0);
-    s.set_luma_variance(1.0);
-    s.set_saturation_variance(1.0);
-    assert!(hard_gate(&s, &o));
+    let mut m = good_metrics(200.0);
+    m.set_luma_variance(1.0);
+    m.set_saturation_variance(1.0);
+    assert!(hard_gate(&m, &o));
   }
 
   #[test]
@@ -648,18 +648,18 @@ mod tests {
     // Low luma variance but high saturation variance — the AND-gate
     // keeps this frame alive.
     let o = Options::default();
-    let mut s = good_score(200.0);
-    s.set_luma_variance(1.0);
-    s.set_saturation_variance(80.0);
-    assert!(!hard_gate(&s, &o));
+    let mut m = good_metrics(200.0);
+    m.set_luma_variance(1.0);
+    m.set_saturation_variance(80.0);
+    assert!(!hard_gate(&m, &o));
   }
 
   #[test]
   fn hard_gate_rejects_heavy_clipping() {
     let o = Options::default();
-    let mut s = good_score(200.0);
-    s.set_clipping(0.9);
-    assert!(hard_gate(&s, &o));
+    let mut m = good_metrics(200.0);
+    m.set_clipping(0.9);
+    assert!(hard_gate(&m, &o));
   }
 
   // ----- Detector ------------------------------------------------------------
@@ -667,15 +667,15 @@ mod tests {
   #[test]
   fn observe_and_buffered() {
     let mut det = Detector::new(Options::default());
-    det.observe(ts(0), good_score(100.0));
-    det.observe(ts(1_000), good_score(200.0));
+    det.observe(ts(0), good_metrics(100.0));
+    det.observe(ts(1_000), good_metrics(200.0));
     assert_eq!(det.buffered(), 2);
   }
 
   #[test]
   fn clear_empties_buffer() {
     let mut det = Detector::new(Options::default());
-    det.observe(ts(0), good_score(100.0));
+    det.observe(ts(0), good_metrics(100.0));
     det.clear();
     assert_eq!(det.buffered(), 0);
   }
@@ -685,9 +685,9 @@ mod tests {
     // 2-second shot with target_interval=4s → 1 bucket.
     let opts = Options::default().with_margin_ratio(0.0); // disable margin
     let mut det = Detector::new(opts);
-    det.observe(ts(0), good_score(100.0));
-    det.observe(ts(500_000), good_score(500.0)); // sharpest
-    det.observe(ts(1_500_000), good_score(200.0));
+    det.observe(ts(0), good_metrics(100.0));
+    det.observe(ts(500_000), good_metrics(500.0)); // sharpest
+    det.observe(ts(1_500_000), good_metrics(200.0));
 
     let out = det.finalize_shot(tr(0, 2_000_000));
     assert_eq!(out, vec![ts(500_000)]);
@@ -701,17 +701,17 @@ mod tests {
     let mut det = Detector::new(opts);
 
     // Bucket 0: [0, 4s). Best at 1s.
-    det.observe(ts(500_000), good_score(100.0));
-    det.observe(ts(1_000_000), good_score(300.0));
-    det.observe(ts(3_500_000), good_score(150.0));
+    det.observe(ts(500_000), good_metrics(100.0));
+    det.observe(ts(1_000_000), good_metrics(300.0));
+    det.observe(ts(3_500_000), good_metrics(150.0));
     // Bucket 1: [4s, 8s). Best at 5s.
-    det.observe(ts(4_500_000), good_score(200.0));
-    det.observe(ts(5_000_000), good_score(500.0));
-    det.observe(ts(7_500_000), good_score(100.0));
+    det.observe(ts(4_500_000), good_metrics(200.0));
+    det.observe(ts(5_000_000), good_metrics(500.0));
+    det.observe(ts(7_500_000), good_metrics(100.0));
     // Bucket 2: [8s, 12s). Best at 10s.
-    det.observe(ts(9_000_000), good_score(150.0));
-    det.observe(ts(10_000_000), good_score(450.0));
-    det.observe(ts(11_500_000), good_score(200.0));
+    det.observe(ts(9_000_000), good_metrics(150.0));
+    det.observe(ts(10_000_000), good_metrics(450.0));
+    det.observe(ts(11_500_000), good_metrics(200.0));
 
     let out = det.finalize_shot(tr(0, 12_000_000));
     assert_eq!(out, vec![ts(1_000_000), ts(5_000_000), ts(10_000_000)]);
@@ -744,9 +744,9 @@ mod tests {
     // 3-bucket shot; middle bucket has no observations.
     let opts = Options::default().with_margin_ratio(0.0);
     let mut det = Detector::new(opts);
-    det.observe(ts(1_000_000), good_score(300.0));
+    det.observe(ts(1_000_000), good_metrics(300.0));
     // 4..8 s: nothing
-    det.observe(ts(9_000_000), good_score(400.0));
+    det.observe(ts(9_000_000), good_metrics(400.0));
 
     let out = det.finalize_shot(tr(0, 12_000_000));
     assert_eq!(out, vec![ts(1_000_000), ts(9_000_000)]);
@@ -756,8 +756,8 @@ mod tests {
   fn finalize_drops_stale_entries_from_earlier_shots() {
     let opts = Options::default().with_margin_ratio(0.0);
     let mut det = Detector::new(opts);
-    det.observe(ts(100), good_score(500.0)); // pre-shot, should be dropped
-    det.observe(ts(500_000), good_score(200.0));
+    det.observe(ts(100), good_metrics(500.0)); // pre-shot, should be dropped
+    det.observe(ts(500_000), good_metrics(200.0));
 
     let out = det.finalize_shot(tr(200_000, 2_000_000));
     assert_eq!(out, vec![ts(500_000)]);
@@ -768,8 +768,8 @@ mod tests {
   fn finalize_retains_post_shot_entries_for_next_call() {
     let opts = Options::default().with_margin_ratio(0.0);
     let mut det = Detector::new(opts);
-    det.observe(ts(500_000), good_score(100.0));
-    det.observe(ts(5_000_000), good_score(900.0)); // belongs to next shot
+    det.observe(ts(500_000), good_metrics(100.0));
+    det.observe(ts(5_000_000), good_metrics(900.0)); // belongs to next shot
 
     let out = det.finalize_shot(tr(0, 2_000_000));
     assert_eq!(out, vec![ts(500_000)]);
@@ -781,8 +781,8 @@ mod tests {
   #[test]
   fn finalize_degenerate_range_returns_empty_and_drops_stale() {
     let mut det = Detector::new(Options::default());
-    det.observe(ts(100), good_score(100.0));
-    det.observe(ts(500_000), good_score(200.0));
+    det.observe(ts(100), good_metrics(100.0));
+    det.observe(ts(500_000), good_metrics(200.0));
 
     // end == start → zero duration, no emits. Stale (pts < 200_000)
     // entries still dropped.
@@ -800,9 +800,9 @@ mod tests {
       .with_target_interval(Duration::from_secs(20)) // force 1 bucket
       .with_margin_ratio(0.1);
     let mut det = Detector::new(opts);
-    det.observe(ts(500_000), good_score(900.0)); // pre-margin
-    det.observe(ts(5_000_000), good_score(300.0)); // in-bucket
-    det.observe(ts(9_500_000), good_score(800.0)); // post-margin
+    det.observe(ts(500_000), good_metrics(900.0)); // pre-margin
+    det.observe(ts(5_000_000), good_metrics(300.0)); // in-bucket
+    det.observe(ts(9_500_000), good_metrics(800.0)); // post-margin
 
     let out = det.finalize_shot(tr(0, 10_000_000));
     assert_eq!(out, vec![ts(5_000_000)]);
@@ -812,9 +812,9 @@ mod tests {
   fn finalize_emits_in_pts_order() {
     let opts = Options::default().with_margin_ratio(0.0);
     let mut det = Detector::new(opts);
-    det.observe(ts(1_000_000), good_score(100.0));
-    det.observe(ts(5_000_000), good_score(100.0));
-    det.observe(ts(9_000_000), good_score(100.0));
+    det.observe(ts(1_000_000), good_metrics(100.0));
+    det.observe(ts(5_000_000), good_metrics(100.0));
+    det.observe(ts(9_000_000), good_metrics(100.0));
     let out = det.finalize_shot(tr(0, 12_000_000));
     assert!(out.windows(2).all(|w| w[0].pts() < w[1].pts()));
   }
@@ -823,8 +823,8 @@ mod tests {
   fn finalize_can_be_called_multiple_times() {
     let opts = Options::default().with_margin_ratio(0.0);
     let mut det = Detector::new(opts);
-    det.observe(ts(500_000), good_score(100.0));
-    det.observe(ts(5_000_000), good_score(100.0));
+    det.observe(ts(500_000), good_metrics(100.0));
+    det.observe(ts(5_000_000), good_metrics(100.0));
     let out1 = det.finalize_shot(tr(0, 2_000_000));
     let out2 = det.finalize_shot(tr(2_000_000, 6_000_000));
     assert_eq!(out1.len(), 1);
@@ -836,11 +836,11 @@ mod tests {
     let opts = Options::default().with_margin_ratio(0.0);
     let mut det = Detector::new(opts);
     // First shot closed normally.
-    det.observe(ts(500_000), good_score(100.0));
+    det.observe(ts(500_000), good_metrics(100.0));
     let _ = det.finalize_shot(tr(0, 2_000_000));
     // Second shot opens but EOS arrives before a confirmed cut.
-    det.observe(ts(3_000_000), good_score(200.0));
-    det.observe(ts(4_500_000), good_score(400.0));
+    det.observe(ts(3_000_000), good_metrics(200.0));
+    det.observe(ts(4_500_000), good_metrics(400.0));
 
     let out = det.finalize_remaining(ts(6_000_000));
     assert_eq!(out, vec![ts(4_500_000)]);
@@ -857,7 +857,7 @@ mod tests {
   #[test]
   fn finalize_remaining_eos_before_buffer_start_returns_empty() {
     let mut det = Detector::new(Options::default());
-    det.observe(ts(5_000_000), good_score(100.0));
+    det.observe(ts(5_000_000), good_metrics(100.0));
     let out = det.finalize_remaining(ts(1_000_000));
     assert!(
       out.is_empty(),

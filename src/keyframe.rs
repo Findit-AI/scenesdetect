@@ -17,9 +17,12 @@
 //!   crushed or blown.
 //! - [`saturation`] — variance of the HSV saturation plane.
 //! - [`sharpness`] — Tenengrad focus measure from a 3×3 Sobel on luma.
-//! - [`score`] — the composite [`score::FrameScore`] type assembled
-//!   from the four metric detectors above.
-//! - [`select`] — buffers [`score::FrameScore`]s and emits keyframe
+//! - [`metrics`] — the [`metrics::FrameMetrics`] type bundling all
+//!   per-frame measurements consumed by [`select`].
+//! - [`noise`] — Immerkaer fast σₙ estimator.
+//! - [`motion_blur`] — gradient anisotropy (Sobel-direction histogram).
+//! - [`colorfulness`] — Hasler-Süßstrunk colourfulness metric.
+//! - [`select`] — buffers [`metrics::FrameMetrics`]s and emits keyframe
 //!   timestamps on shot-boundary events.
 
 pub mod clipping;
@@ -27,7 +30,6 @@ pub mod luma;
 pub mod metrics;
 pub mod preprocess;
 pub mod saturation;
-pub mod score;
 pub mod select;
 pub mod sharpness;
 
