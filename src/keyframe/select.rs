@@ -855,14 +855,17 @@ impl Detector {
       // Running argmax updates.
       // Fallback path: pure-sharpness ranking, preserved so "least
       // bad" is well-defined when every frame in the bucket fails
-      // the strict gate. Skip non-finite sharpness for the same
-      // reason the strict path does — a NaN incumbent would lock
-      // out every later finite candidate via the NaN-tolerant
-      // [`sharper`] comparator. If every fallback candidate is
-      // non-finite, the bucket emits nothing (correct degradation
-      // for a fully-corrupt bucket).
+      // the strict gate. Two skip conditions:
+      //   1. Non-finite sharpness — a NaN incumbent would lock out
+      //      every later finite candidate via the NaN-tolerant
+      //      [`sharper`] comparator.
+      //   2. Negative sharpness — Tenengrad is non-negative by
+      //      construction; a negative value is corrupt input and
+      //      should not win a "least bad" ranking either.
+      // If every fallback candidate is filtered, the bucket emits
+      // nothing — correct degradation for a fully-corrupt bucket.
       let s_now = metrics.sharpness();
-      if s_now.is_finite() && best_any.is_none_or(|(_, s)| sharper(s_now, s)) {
+      if s_now.is_finite() && s_now >= 0.0 && best_any.is_none_or(|(_, s)| sharper(s_now, s)) {
         best_any = Some((ts, s_now));
       }
       // Strict path: composite-quality ranking among gate-passing
@@ -1047,21 +1050,39 @@ fn sharper(a: f32, b: f32) -> bool {
 /// Any-one-trips hard gate matching the Python reference's flat /
 /// over-/under-exposed / clipped checks.
 ///
-/// **Fails closed on non-finite metric inputs.** IEEE 754 comparisons
-/// with `NaN` evaluate to `false`, so a naive `metric < threshold`
-/// check would let a `NaN` brightness / variance / clipping /
-/// motion-blur bypass every gate ("fail open"). Treating any
-/// non-finite gate metric as a hard-gate failure makes a malformed
-/// `FrameMetrics` (from a corrupt detector or a `FrameMetrics::set_*`
-/// caller that passed `NaN`/`Inf`) drop straight into the fallback
-/// path instead of becoming a strict winner.
+/// **Fails closed on non-finite or out-of-domain metrics.** Each
+/// metric has a physical domain (clipping ∈ [0, 1], variance ≥ 0,
+/// brightness ∈ [0, 255], etc.) that a non-malicious detector
+/// cannot violate. Public [`FrameMetrics::set_*`] accept arbitrary
+/// `f32`, so a corrupt caller could feed e.g. `clipping = -1.0`. If
+/// that slipped past, [`composite_quality`]'s penalty term
+/// `-w_clipping * clipping` would become a bonus, gaming the
+/// strict argmax in favour of a malformed frame. Reject any
+/// out-of-domain finite value before the strict path can reward it.
 fn hard_gate(m: &FrameMetrics, opts: &Options) -> bool {
-  // Fail closed on any non-finite gate-relevant metric.
+  // Fail closed on any non-finite gate-relevant metric. IEEE 754
+  // `metric < threshold` is `false` for `NaN`/`Inf`, which would
+  // silently bypass the gate.
   if !m.brightness().is_finite()
     || !m.luma_variance().is_finite()
     || !m.saturation_variance().is_finite()
     || !m.clipping().is_finite()
     || !m.motion_blur().is_finite()
+    || !m.sharpness().is_finite()
+    || !m.noise().is_finite()
+    || !m.colorfulness().is_finite()
+  {
+    return true;
+  }
+  // Fail closed on any finite-but-out-of-domain metric.
+  if !(0.0..=255.0).contains(&m.brightness())
+    || m.luma_variance() < 0.0
+    || m.saturation_variance() < 0.0
+    || !(0.0..=1.0).contains(&m.clipping())
+    || !(0.0..=1.0).contains(&m.motion_blur())
+    || m.sharpness() < 0.0
+    || m.noise() < 0.0
+    || m.colorfulness() < 0.0
   {
     return true;
   }
@@ -1286,6 +1307,145 @@ mod tests {
     let mut m = good_metrics(200.0);
     m.set_motion_blur(f32::NAN);
     assert!(hard_gate(&m, &o));
+  }
+
+  // ---- Domain validation (iter-12 regression) -----------------------------
+
+  #[test]
+  fn hard_gate_rejects_negative_noise() {
+    // Negative noise would make composite_quality's -w_noise * (noise/norm)
+    // term a bonus instead of a penalty.
+    let o = Options::default();
+    let mut m = good_metrics(200.0);
+    m.set_noise(-5.0);
+    assert!(hard_gate(&m, &o), "negative noise must trip the gate");
+  }
+
+  #[test]
+  fn hard_gate_rejects_negative_clipping() {
+    let o = Options::default();
+    let mut m = good_metrics(200.0);
+    m.set_clipping(-0.1);
+    assert!(hard_gate(&m, &o));
+  }
+
+  #[test]
+  fn hard_gate_rejects_clipping_above_one() {
+    let o = Options::default();
+    let mut m = good_metrics(200.0);
+    m.set_clipping(1.5);
+    assert!(hard_gate(&m, &o));
+  }
+
+  #[test]
+  fn hard_gate_rejects_negative_motion_blur() {
+    let o = Options::default();
+    let mut m = good_metrics(200.0);
+    m.set_motion_blur(-0.5);
+    assert!(hard_gate(&m, &o));
+  }
+
+  #[test]
+  fn hard_gate_rejects_motion_blur_above_one() {
+    let o = Options::default();
+    let mut m = good_metrics(200.0);
+    m.set_motion_blur(1.5);
+    assert!(hard_gate(&m, &o));
+  }
+
+  #[test]
+  fn hard_gate_rejects_negative_colorfulness() {
+    let o = Options::default();
+    let mut m = good_metrics(200.0);
+    m.set_colorfulness(-10.0);
+    assert!(hard_gate(&m, &o));
+  }
+
+  #[test]
+  fn hard_gate_rejects_negative_sharpness() {
+    let o = Options::default();
+    let mut m = good_metrics(200.0);
+    m.set_sharpness(-1.0);
+    assert!(hard_gate(&m, &o));
+  }
+
+  #[test]
+  fn hard_gate_rejects_brightness_outside_0_255() {
+    let o = Options::default();
+    let mut m = good_metrics(200.0);
+    m.set_brightness(-1.0);
+    assert!(hard_gate(&m, &o));
+    let mut m = good_metrics(200.0);
+    m.set_brightness(256.0);
+    assert!(hard_gate(&m, &o));
+  }
+
+  #[test]
+  fn hard_gate_rejects_negative_variances() {
+    let o = Options::default();
+    let mut m = good_metrics(200.0);
+    m.set_luma_variance(-1.0);
+    assert!(hard_gate(&m, &o));
+    let mut m = good_metrics(200.0);
+    m.set_saturation_variance(-1.0);
+    assert!(hard_gate(&m, &o));
+  }
+
+  #[test]
+  fn strict_argmax_cannot_be_gamed_by_negative_penalty_metrics() {
+    // Pre-fix: a frame with negative noise/clipping/motion_blur
+    // would flip those penalty terms in `composite_quality` into
+    // bonuses, scoring higher than a clean frame. The hard_gate
+    // domain check rejects the malformed frame before
+    // composite_quality runs, so the clean frame wins.
+    let opts = Options::default().with_margin_ratio(0.0);
+    let mut det = Detector::new(opts);
+    let clean = good_metrics(300.0);
+    let malformed = FrameMetrics::new()
+      .with_sharpness(300.0)
+      .with_brightness(128.0)
+      .with_luma_variance(200.0)
+      .with_saturation_variance(100.0)
+      .with_clipping(-1.0) // negative penalty → bonus pre-fix
+      .with_noise(-1000.0) // negative penalty → huge bonus pre-fix
+      .with_motion_blur(-1.0);
+    det.observe(ts(500_000), malformed);
+    det.observe(ts(1_500_000), clean);
+    let out = det.finalize_shot(tr(0, 2_000_000));
+    // The malformed frame is rejected by hard_gate → strict path
+    // skips it. Fallback path also skips it on sharpness domain
+    // check (wait — sharpness is finite and positive here, so
+    // fallback would accept). But strict still selects the clean
+    // frame. We assert the WINNER is the clean frame at
+    // ts(1_500_000), not the malformed at ts(500_000).
+    assert_eq!(out, vec![ts(1_500_000)]);
+  }
+
+  #[test]
+  fn fallback_argmax_skips_negative_sharpness() {
+    // Two frames both fail the strict gate (low brightness). One
+    // has negative sharpness (corrupt input); the other has finite
+    // positive sharpness. Fallback must NOT pick the negative one.
+    let opts = Options::default().with_margin_ratio(0.0);
+    let mut det = Detector::new(opts);
+    let corrupt = FrameMetrics::new()
+      .with_sharpness(-100.0) // negative — out of domain
+      .with_brightness(5.0) // < black_mean_threshold → fails strict
+      .with_luma_variance(200.0)
+      .with_saturation_variance(100.0)
+      .with_clipping(0.0);
+    let valid = FrameMetrics::new()
+      .with_sharpness(50.0) // below absolute floor → fails strict
+      .with_brightness(5.0) // also fails strict via brightness
+      .with_luma_variance(200.0)
+      .with_saturation_variance(100.0)
+      .with_clipping(0.0);
+    det.observe(ts(500_000), corrupt);
+    det.observe(ts(1_500_000), valid);
+    let out = det.finalize_shot(tr(0, 2_000_000));
+    // Fallback selects `valid` (sharpness=50, in-domain), not
+    // `corrupt` (sharpness=-100, filtered).
+    assert_eq!(out, vec![ts(1_500_000)]);
   }
 
   #[test]
