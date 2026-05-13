@@ -59,7 +59,7 @@ thiserror = { version = "2", default-features = false }
 # the `Option`-returning shape to short-circuit degenerate-range
 # finalisations. Bumping past 0.1.1 requires updating that code
 # path — track the move to 0.1.5+ as a follow-up.
-mediatime = { version = "=0.1.1", default-features = false }
+mediatime = { version = "0.1", default-features = false }
 
 libm = { version = "0.2", optional = true, default-features = false }
 
@@ -71,7 +71,7 @@ libm = { version = "0.2", optional = true, default-features = false }
 fast_image_resize = { version = "6", default-features = false, optional = true }
 
 half = { version = "2", optional = true, default-features = false }
-videoframe = { version = "0.2", path = "../videoframe/videoframe", optional = true, default-features = false }
+videoframe = { version = "0.2", optional = true, default-features = false }
 
 serde = { version = "1", default-features = false, features = [
   "derive",
@@ -96,7 +96,10 @@ rpath = false
 all-features = true
 rustdoc-args = ["--cfg", "docsrs"]
 
-[lints.rust]
+[lints]
+workspace = true
+
+[workspace.lints.rust]
 rust_2018_idioms = "warn"
 single_use_lifetimes = "warn"
 unexpected_cfgs = { level = "warn", check-cfg = [
