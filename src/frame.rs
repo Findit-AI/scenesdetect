@@ -22,6 +22,11 @@ pub use mediatime::{TimeRange, Timebase, Timestamp};
 #[cfg_attr(docsrs, doc(cfg(any(feature = "std", feature = "alloc"))))]
 pub mod convert;
 
+// /// Adapters for the RGB-family frame types from the [`videoframe`] crate.
+// #[cfg(feature = "videoframe")]
+// #[cfg_attr(docsrs, doc(cfg(feature = "videoframe")))]
+// pub mod videoframe;
+
 /// A frame containing YUV luma (Y-plane) data, along with its dimensions and
 /// presentation timestamp.
 ///

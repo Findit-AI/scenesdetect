@@ -40,6 +40,14 @@ alloc = ["libm", "dep:fast_image_resize", "fast_image_resize/no_std"]
 std = ["thiserror/default", "dep:fast_image_resize", "fast_image_resize/std"]
 
 serde = ["dep:serde", "dep:humantime-serde"]
+videoframe = [
+  "alloc",
+  "dep:half",
+  "dep:videoframe",
+  "videoframe/rgb",
+  "videoframe/rgb-float",
+  "videoframe/rgb-legacy",
+]
 
 [dependencies]
 derive_more = { version = "2", default-features = false, features = ["is_variant", "display"] }
@@ -61,6 +69,9 @@ libm = { version = "0.2", optional = true, default-features = false }
 # --no-default-features` because the dependency's own build requires one of
 # its float feature flags.
 fast_image_resize = { version = "6", default-features = false, optional = true }
+
+half = { version = "2", optional = true, default-features = false }
+videoframe = { version = "0.2", path = "../videoframe/videoframe", optional = true, default-features = false }
 
 serde = { version = "1", default-features = false, features = [
   "derive",
