@@ -104,24 +104,32 @@ const DEFAULT_MIN_SHARPNESS: f32 = 100.0;
 const DEFAULT_LUMA_VARIANCE_THRESHOLD: f32 = 5.0;
 const DEFAULT_SAT_VARIANCE_THRESHOLD: f32 = 3.0;
 
-// Conservative upper bounds for [`FrameMetrics`] fields whose
-// detectors run on 8-bit u8 sources. The values here are loose
-// (3-5× the theoretical maxima) — the goal is to reject `f32::MAX`
-// and other absurdly-large finite values that a malformed caller
-// or corrupt detector could push through `FrameMetrics::set_*`,
-// not to enforce tight semantic bounds. See [`metrics_in_domain`]
-// for the consumer.
+// Detector-derived physical maxima for [`FrameMetrics`] fields,
+// each with a small numeric tolerance (~1–10%) for `f32`
+// rounding and SIMD/scalar implementation drift. Anything above
+// these is physically impossible from a valid 8-bit detector
+// output; rejecting them at the [`metrics_in_domain`] boundary
+// prevents a malformed caller or corrupt detector from gaming the
+// strict / fallback / adaptive-floor paths with finite-but-
+// impossible values.
 //
-// Tenengrad: max per-pixel `gx² + gy²` is `2 × 1020² ≈ 2.08e6`.
-const MAX_SHARPNESS: f32 = 1.0e7;
-// Population variance of u8 is bounded by `(255/2)² ≈ 16_256.25`;
-// `u16::MAX` is a comfortable headroom.
-const MAX_VARIANCE: f32 = 65_535.0;
-// Immerkaer σₙ: bounded by `√(π/2)/6 · 4080 ≈ 852`.
-const MAX_NOISE: f32 = 5_000.0;
-// Hasler-Süßstrunk: bounded by `σ_rgyb + 0.3·μ_rgyb ≈ 500` on
-// 8-bit inputs.
-const MAX_COLORFULNESS: f32 = 5_000.0;
+// Tenengrad on a 3×3 Sobel of u8 luma: per-pixel `gx² + gy²`
+// peaks at `2 · 1020² = 2_080_800`. The Tenengrad mean is bounded
+// by that peak (the mean of constant-peak values equals the peak).
+const MAX_SHARPNESS: f32 = 2_100_000.0;
+// Population variance of u8 values is bounded by
+// `(255 / 2)² = 16_256.25`. Cap at the next power of two above
+// the bound for clean numerics.
+const MAX_VARIANCE: f32 = 16_384.0;
+// Immerkaer noise: per-pixel `|lap|` peaks at `16 · 255 = 4080`
+// (mask coefficient sums); σₙ = √(π/2)/6 · mean|lap| ≤
+// `√(π/2)/6 · 4080 ≈ 852`.
+const MAX_NOISE: f32 = 1_000.0;
+// Hasler-Süßstrunk: with `rg = R - G ∈ [-255, 255]` and
+// `yb = 0.5(R+G) - B ∈ [-255, 255]`, both `σ_rgyb` and `μ_rgyb`
+// are bounded by `√(255² + 255²) = 255·√2 ≈ 360.6`, so
+// `C = σ_rgyb + 0.3·μ_rgyb ≤ 360.6 · 1.3 ≈ 469`.
+const MAX_COLORFULNESS: f32 = 500.0;
 
 /// Returns `v` when it is finite, otherwise `default`. Used by the
 /// f32 threshold builders that have no documented range but must
@@ -813,19 +821,25 @@ impl Detector {
       _ => return Vec::new(),
     };
 
-    // 2.5. Compute the effective strict-gate sharpness floor for this
-    // shot. If adaptive_floor is enabled and the shot has at least
-    // `adaptive_floor_min_samples` buffered in-range entries, set the
-    // floor to `min(absolute_floor, p_percentile)` — never raising the
-    // floor. This lets legitimate low-detail shots (fog, night
-    // interiors) produce strict winners instead of always degrading
-    // to fallback selection.
-    let effective_min_sharpness = compute_effective_floor(&self.buffer, &range, &self.opts);
-
     // 3. Compute bucket count and precompute per-bucket effective
     //    [start, end) timestamps (with first-/last-bucket margin shrink).
     let n = compute_n_buckets(duration, &self.opts);
     let bucket_ranges = compute_bucket_ranges(&range, n, self.opts.margin_ratio);
+
+    // 3.5. Compute the effective strict-gate sharpness floor for
+    // this shot. The percentile pool is restricted to the same
+    // region the bucket walker actually emits from — i.e. the
+    // first bucket's effective start through the last bucket's
+    // effective end — so frames inside the pre-/post-margin zones
+    // that cannot win either ranking path also cannot move the
+    // floor for interior candidates. Order reversed (buckets
+    // first, then floor) to make these ranges available here.
+    let effective_min_sharpness = compute_effective_floor(
+      &self.buffer,
+      &bucket_ranges[0].0,
+      &bucket_ranges[n - 1].1,
+      &self.opts,
+    );
 
     // 4. Single linear walk across the in-range entries. Entries inside
     //    the first-bucket's pre-margin or last-bucket's post-margin zones
@@ -997,32 +1011,38 @@ fn compute_bucket_ranges(
 }
 
 /// Returns the effective strict-gate sharpness floor for the shot
-/// described by `range`, given the entries currently buffered and the
-/// adaptive-floor options. Never raises the floor above
-/// [`Options::min_sharpness`]; only lowers it.
+/// described by the emission-eligible window
+/// `[eligible_start, eligible_end)`, given the entries currently
+/// buffered and the adaptive-floor options. Never raises the floor
+/// above [`Options::min_sharpness`]; only lowers it.
+///
+/// `eligible_start` / `eligible_end` are the first bucket's
+/// effective start and the last bucket's effective end (i.e. the
+/// shot range with first-/last-bucket margins trimmed). Frames in
+/// the pre-/post-margin zones cannot win either ranking path, so
+/// they MUST also be excluded from the percentile pool — letting
+/// margin-zone metrics influence the floor would change strict
+/// eligibility for interior candidates without those frames ever
+/// having a chance to be emitted.
 fn compute_effective_floor(
   buffer: &VecDeque<(Timestamp, FrameMetrics)>,
-  range: &TimeRange,
+  eligible_start: &Timestamp,
+  eligible_end: &Timestamp,
   opts: &Options,
 ) -> f32 {
   if !opts.adaptive_floor() {
     return opts.min_sharpness();
   }
-  // Collect in-range sharpness values from frames whose full metric
-  // set is in domain. Filtering only on `sharpness` was not enough:
-  // a frame with finite-positive sharpness but corrupt
-  // non-sharpness metrics (e.g. negative noise) is rejected from
-  // both ranking paths via [`metrics_in_domain`], so letting it
-  // contribute to the per-shot percentile would change the strict
-  // floor for otherwise-valid later frames without that frame ever
-  // having a chance to be emitted. Use the same domain predicate
-  // here so the floor only reflects samples that could plausibly
-  // win.
+  // Collect sharpness samples from frames inside the
+  // emission-eligible window whose full metric set is in domain.
+  // The domain filter (the second predicate) is the same one
+  // applied to both ranking paths, so the floor only reflects
+  // samples that could plausibly win one of them.
   let mut sharps: Vec<f32> = buffer
     .iter()
     .filter(|(ts, _)| {
-      ts.cmp_semantic(&range.start()) != Ordering::Less
-        && ts.cmp_semantic(&range.end()) == Ordering::Less
+      ts.cmp_semantic(eligible_start) != Ordering::Less
+        && ts.cmp_semantic(eligible_end) == Ordering::Less
     })
     .filter(|(_, m)| metrics_in_domain(m))
     .map(|(_, m)| m.sharpness())
@@ -1560,6 +1580,59 @@ mod tests {
   }
 
   #[test]
+  fn fallback_argmax_skips_above_physical_max_but_below_old_cap_sharpness() {
+    // Iter-15 regression for tightened MAX_SHARPNESS:
+    // 5_000_000 is below the iter-14 cap of 1.0e7 but above the
+    // Tenengrad physical max (~2.08e6 → MAX_SHARPNESS=2.1e6).
+    // The frame must be rejected from both ranking paths so a
+    // valid below-cap candidate wins instead.
+    let opts = Options::default().with_margin_ratio(0.0);
+    let mut det = Detector::new(opts);
+    let above_phys = FrameMetrics::new()
+      .with_sharpness(5_000_000.0)
+      .with_brightness(5.0)
+      .with_luma_variance(200.0)
+      .with_saturation_variance(100.0)
+      .with_clipping(0.0);
+    let valid = FrameMetrics::new()
+      .with_sharpness(50.0)
+      .with_brightness(5.0)
+      .with_luma_variance(200.0)
+      .with_saturation_variance(100.0)
+      .with_clipping(0.0);
+    det.observe(ts(500_000), above_phys);
+    det.observe(ts(1_500_000), valid);
+    let out = det.finalize_shot(tr(0, 2_000_000));
+    assert_eq!(out, vec![ts(1_500_000)]);
+  }
+
+  #[test]
+  fn fallback_argmax_skips_above_physical_max_but_below_old_cap_colorfulness() {
+    // Iter-15 regression for tightened MAX_COLORFULNESS:
+    // 1000.0 is below the iter-14 cap of 5_000 but above the
+    // Hasler-Süßstrunk physical max (~469 → MAX_COLORFULNESS=500).
+    let opts = Options::default().with_margin_ratio(0.0);
+    let mut det = Detector::new(opts);
+    let above_phys = FrameMetrics::new()
+      .with_sharpness(500.0)
+      .with_brightness(5.0)
+      .with_luma_variance(200.0)
+      .with_saturation_variance(100.0)
+      .with_clipping(0.0)
+      .with_colorfulness(1000.0);
+    let valid = FrameMetrics::new()
+      .with_sharpness(50.0)
+      .with_brightness(5.0)
+      .with_luma_variance(200.0)
+      .with_saturation_variance(100.0)
+      .with_clipping(0.0);
+    det.observe(ts(500_000), above_phys);
+    det.observe(ts(1_500_000), valid);
+    let out = det.finalize_shot(tr(0, 2_000_000));
+    assert_eq!(out, vec![ts(1_500_000)]);
+  }
+
+  #[test]
   fn fallback_argmax_skips_corrupt_non_sharpness_metrics() {
     // Iter-13 regression: pre-fix, `best_any` only domain-filtered
     // `sharpness`. A frame with high sharpness BUT a corrupt non-
@@ -1767,6 +1840,43 @@ mod tests {
       winner_ts >= 2_100_000,
       "winner pts {winner_ts} should be one of the valid frames (>= 2_100_000)"
     );
+  }
+
+  #[test]
+  fn adaptive_floor_excludes_margin_zone_samples() {
+    // Iter-15 regression: pre-fix, `compute_effective_floor` filtered
+    // by the raw shot range, not the bucket-walker's emission-
+    // eligible region. Frames inside the first-bucket pre-margin or
+    // last-bucket post-margin could move the percentile floor for
+    // interior frames despite never being emittable.
+    //
+    // Setup: 1 bucket, margin_ratio=0.1 on a 10s shot →
+    // emission window [1s, 9s). Place a high-sharpness frame at
+    // 0.5s (pre-margin) that would, pre-fix, lift the p25. The
+    // valid interior frames at 5s are below the absolute floor;
+    // we want adaptive floor to lower the threshold to allow them
+    // in. Pre-fix the margin-frame's sharpness=5000 polluted the
+    // percentile pool, lifting p25 well above 100 and disabling
+    // adaptive floor's effect. Post-fix: the margin frame is
+    // excluded from the percentile pool; p25 reflects only the
+    // interior frames (sharpness ~50), floor lowers to ~50, the
+    // interior frame wins strict.
+    let opts = Options::default()
+      .with_target_interval(Duration::from_secs(60)) // 1 bucket
+      .with_margin_ratio(0.1)
+      .with_adaptive_floor_min_samples(2);
+    let mut det = Detector::new(opts);
+    // High-sharpness frame in the pre-margin zone (would lift p25
+    // if it counted).
+    det.observe(ts(500_000), good_metrics(5_000.0));
+    // Valid interior frames, below absolute floor of 100.
+    det.observe(ts(2_000_000), good_metrics(40.0));
+    det.observe(ts(5_000_000), good_metrics(60.0));
+    let out = det.finalize_shot(tr(0, 10_000_000));
+    // Post-fix: pre-margin frame excluded from the floor pool,
+    // adaptive floor recovers a strict winner among the interior
+    // frames. The sharpest (sharpness=60, ts=5s) wins.
+    assert_eq!(out, vec![ts(5_000_000)]);
   }
 
   // ----- Detector ------------------------------------------------------------
