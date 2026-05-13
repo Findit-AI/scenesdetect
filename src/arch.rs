@@ -489,6 +489,28 @@ pub(crate) fn noise(
   scalar::Scalar::noise(luma, width, height, stride)
 }
 
+/// Magnitude-weighted gradient-direction concentration. Returns an
+/// anisotropy score in `[0, 1]` — 0 = isotropic gradients, 1 = a single
+/// dominant direction. Dispatches to scalar today; signature preserved
+/// for future SIMD backends.
+///
+/// Inputs are the magnitude and quantized-direction planes produced by
+/// [`sobel`].
+#[cfg_attr(not(tarpaulin), inline(always))]
+#[allow(unreachable_code)]
+pub(crate) fn gradient_anisotropy(
+  mag: &[i32],
+  dir: &[u8],
+  width: usize,
+  height: usize,
+  use_simd: bool,
+) -> f32 {
+  if !use_simd {
+    return scalar::Scalar::gradient_anisotropy(mag, dir, width, height);
+  }
+  scalar::Scalar::gradient_anisotropy(mag, dir, width, height)
+}
+
 /// Population mean and variance of a single-plane `u8` image. Honours
 /// row stride. Uses a single-pass `E[X²] - E[X]²` formulation —
 /// numerically safe for `u8` inputs evaluated in `f64` (variance tops
@@ -823,6 +845,45 @@ mod scalar {
       // √(π/2) / 6 ≈ 0.2088987...
       const COEFF: f64 = 0.208_898_754_886_372_3;
       ((acc as f64) * COEFF / (interior as f64)) as f32
+    }
+
+    /// Magnitude-weighted gradient-direction concentration.
+    /// Inputs are the magnitude and direction planes produced by
+    /// [`super::super::sobel`] — `mag` is L1 magnitude (i32), `dir` is
+    /// the quantized direction bin in `{0, 1, 2, 3}`. Border pixels
+    /// (where Sobel leaves zeros) contribute nothing.
+    ///
+    /// Builds `hist[k] = Σ mag[p] where dir[p] == k`, then returns
+    /// `max((max(hist) / total) - 0.25, 0) / 0.75`. The 0.25 baseline
+    /// is the uniform-distribution expectation over the 4 bins; the
+    /// output is in `[0, 1]` with 0 = perfectly uniform and 1 =
+    /// entirely one direction. Frames with total magnitude 0 (uniform
+    /// luma) return 0.
+    pub(super) fn gradient_anisotropy(mag: &[i32], dir: &[u8], w: usize, h: usize) -> f32 {
+      if w < 3 || h < 3 {
+        return 0.0;
+      }
+      let mut hist = [0u64; 4];
+      for y in 1..h - 1 {
+        for x in 1..w - 1 {
+          let idx = y * w + x;
+          let m = mag[idx];
+          if m <= 0 {
+            continue;
+          }
+          let d = dir[idx] as usize & 0b11;
+          hist[d] = hist[d].saturating_add(m as u64);
+        }
+      }
+      let total: u64 = hist.iter().sum();
+      if total == 0 {
+        return 0.0;
+      }
+      let max_bin = *hist.iter().max().expect("4 bins") as f64;
+      let total_f = total as f64;
+      let frac = max_bin / total_f;
+      // Normalise so [0.25, 1.0] maps to [0.0, 1.0]; clamp below.
+      ((frac - 0.25).max(0.0) / 0.75) as f32
     }
   }
 }
@@ -1257,6 +1318,54 @@ mod tests {
     }
     let sigma = scalar::Scalar::noise(&data, w, h, stride);
     assert_eq!(sigma, 0.0, "padding leaked into the Laplacian");
+  }
+
+  #[test]
+  fn scalar_gradient_anisotropy_zero_mag_is_zero() {
+    let (w, h) = (8usize, 8usize);
+    let mag = vec![0i32; w * h];
+    let dir = vec![0u8; w * h];
+    assert_eq!(scalar::Scalar::gradient_anisotropy(&mag, &dir, w, h), 0.0);
+  }
+
+  #[test]
+  fn scalar_gradient_anisotropy_too_small_is_zero() {
+    let mag = vec![100i32; 4];
+    let dir = vec![0u8; 4];
+    assert_eq!(scalar::Scalar::gradient_anisotropy(&mag, &dir, 2, 2), 0.0);
+  }
+
+  #[test]
+  fn scalar_gradient_anisotropy_single_direction_is_one() {
+    // Every interior pixel has equal magnitude in direction bin 0.
+    let (w, h) = (8usize, 8usize);
+    let mag = vec![100i32; w * h];
+    let dir = vec![0u8; w * h];
+    let a = scalar::Scalar::gradient_anisotropy(&mag, &dir, w, h);
+    assert!(
+      (a - 1.0).abs() < 1e-6,
+      "expected 1.0 for single-direction frame, got {a}"
+    );
+  }
+
+  #[test]
+  fn scalar_gradient_anisotropy_uniform_directions_is_zero() {
+    // Interior pixels evenly split across all 4 bins → fraction 0.25 → 0.0.
+    let (w, h) = (10usize, 10usize);
+    let mag = vec![100i32; w * h];
+    let mut dir = vec![0u8; w * h];
+    // For interior 8×8 = 64 pixels, assign 16 to each of 4 bins.
+    let mut counter = 0u8;
+    for y in 1..h - 1 {
+      for x in 1..w - 1 {
+        dir[y * w + x] = counter & 0b11;
+        counter = counter.wrapping_add(1);
+      }
+    }
+    let a = scalar::Scalar::gradient_anisotropy(&mag, &dir, w, h);
+    assert!(a.abs() < 1e-6, "expected ~0.0 for uniform directions, got {a}");
+    // Sanity-check the construction wrote nonzero magnitudes.
+    assert!(mag.iter().any(|&v| v != 0));
   }
 
   #[test]
