@@ -206,6 +206,7 @@ pub struct Options {
   luma_variance_threshold: f32,
   sat_variance_threshold: f32,
   max_clipping: f32,
+  weights: CompositeWeights,
 }
 
 impl Default for Options {
@@ -221,6 +222,7 @@ impl Default for Options {
       luma_variance_threshold: 5.0,
       sat_variance_threshold: 3.0,
       max_clipping: 0.5,
+      weights: CompositeWeights::new(),
     }
   }
 }
@@ -319,6 +321,20 @@ impl Options {
     );
     self.max_clipping = c;
     self
+  }
+
+  /// Replaces the [`CompositeWeights`] driving the strict-pass argmax
+  /// inside [`Detector::finalize_shot`].
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn with_composite_weights(mut self, w: CompositeWeights) -> Self {
+    self.weights = w;
+    self
+  }
+
+  /// Composite-quality weights and normalisers (read-only accessor).
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn composite_weights(&self) -> &CompositeWeights {
+    &self.weights
   }
 
   /// Target inter-keyframe interval (read-only accessor).
@@ -505,14 +521,21 @@ impl Detector {
       }
 
       // Running argmax updates.
+      // Fallback path: pure-sharpness ranking, preserved so "least
+      // bad" is well-defined when every frame in the bucket fails
+      // the strict gate.
       if best_any.is_none_or(|(_, s)| sharper(metrics.sharpness(), s)) {
         best_any = Some((ts, metrics.sharpness()));
       }
+      // Strict path: composite-quality ranking among gate-passing
+      // frames.
       if !hard_gate(&metrics, &opts)
         && metrics.sharpness() >= opts.min_sharpness
-        && best_strict.is_none_or(|(_, s)| sharper(metrics.sharpness(), s))
       {
-        best_strict = Some((ts, metrics.sharpness()));
+        let q = composite_quality(&metrics, opts.composite_weights());
+        if best_strict.is_none_or(|(_, s)| sharper(q, s)) {
+          best_strict = Some((ts, q));
+        }
       }
     }
 
@@ -602,6 +625,23 @@ fn compute_bucket_ranges(
     out.push((range.interpolate(use_t0), range.interpolate(use_t1)));
   }
   out
+}
+
+/// Weighted composite of [`FrameMetrics`] used as the strict-pass
+/// argmax key inside [`Detector::finalize_shot`].
+///
+/// Higher is better. `sharpness` and `colorfulness` contribute
+/// positively; `noise`, `clipping`, and `motion_blur` contribute
+/// negatively. The fallback path inside `finalize_shot` still ranks
+/// by raw `sharpness` — see the module docs.
+#[cfg_attr(not(tarpaulin), inline(always))]
+fn composite_quality(m: &FrameMetrics, w: &CompositeWeights) -> f32 {
+  let s = w.sharpness() * (m.sharpness() / w.sharpness_norm());
+  let n = w.noise() * (m.noise() / w.noise_norm());
+  let c = w.colorfulness() * (m.colorfulness() / w.colorfulness_norm());
+  let clip = w.clipping() * m.clipping();
+  let mb = w.motion_blur() * m.motion_blur();
+  s - n + c - clip - mb
 }
 
 /// `true` when `a > b` under `f32::partial_cmp`. NaN compares as not-
@@ -1047,5 +1087,66 @@ mod tests {
   fn composite_weights_new_is_const_context_usable() {
     const W: CompositeWeights = CompositeWeights::new().with_motion_blur(0.5);
     assert_eq!(W.motion_blur(), 0.5);
+  }
+
+  #[test]
+  fn composite_argmax_picks_clean_over_sharper_noisy_under_defaults() {
+    // Bucket with two strict-eligible frames:
+    //   A: sharpness=2000, noise=15
+    //   B: sharpness=1800, noise=3
+    // Under default weights:
+    //   q_A = 1.0·(2000/1000) - 0.3·(15/20) + 0 - 0 - 0  = 2.0 - 0.225 = 1.775
+    //   q_B = 1.0·(1800/1000) - 0.3·( 3/20) + 0 - 0 - 0  = 1.8 - 0.045 = 1.755
+    // A still wins by a hair (sharpness dominates), but bumping noise
+    // weight should flip it.  Use a stronger noise weight here:
+    let weights = CompositeWeights::new().with_noise(2.0, 20.0);
+    let opts = Options::default()
+      .with_margin_ratio(0.0)
+      .with_composite_weights(weights);
+    let mut det = Detector::new(opts);
+
+    let a = FrameMetrics::new()
+      .with_sharpness(2000.0)
+      .with_brightness(128.0)
+      .with_luma_variance(200.0)
+      .with_saturation_variance(100.0)
+      .with_clipping(0.0)
+      .with_noise(15.0);
+    let b = FrameMetrics::new()
+      .with_sharpness(1800.0)
+      .with_brightness(128.0)
+      .with_luma_variance(200.0)
+      .with_saturation_variance(100.0)
+      .with_clipping(0.0)
+      .with_noise(3.0);
+
+    det.observe(ts(1_000_000), a);
+    det.observe(ts(2_000_000), b);
+
+    let out = det.finalize_shot(tr(0, 4_000_000));
+    assert_eq!(out, vec![ts(2_000_000)]);
+  }
+
+  #[test]
+  fn composite_argmax_collapses_to_sharpness_when_other_weights_zero() {
+    // Zero out every non-sharpness weight → strict argmax must rank
+    // by pure sharpness (mirrors legacy behaviour).
+    let weights = CompositeWeights::new()
+      .with_noise(0.0, 20.0)
+      .with_colorfulness(0.0, 50.0)
+      .with_clipping(0.0)
+      .with_motion_blur(0.0);
+    let opts = Options::default()
+      .with_margin_ratio(0.0)
+      .with_composite_weights(weights);
+    let mut det = Detector::new(opts);
+
+    // Same fixture as the existing `finalize_single_bucket_picks_sharpest`.
+    det.observe(ts(0), good_metrics(100.0));
+    det.observe(ts(500_000), good_metrics(500.0)); // sharpest
+    det.observe(ts(1_500_000), good_metrics(200.0));
+
+    let out = det.finalize_shot(tr(0, 2_000_000));
+    assert_eq!(out, vec![ts(500_000)]);
   }
 }
