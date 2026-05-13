@@ -855,18 +855,21 @@ impl Detector {
       // Running argmax updates.
       // Fallback path: pure-sharpness ranking, preserved so "least
       // bad" is well-defined when every frame in the bucket fails
-      // the strict gate. Two skip conditions:
-      //   1. Non-finite sharpness — a NaN incumbent would lock out
-      //      every later finite candidate via the NaN-tolerant
-      //      [`sharper`] comparator.
-      //   2. Negative sharpness — Tenengrad is non-negative by
-      //      construction; a negative value is corrupt input and
-      //      should not win a "least bad" ranking either.
-      // If every fallback candidate is filtered, the bucket emits
-      // nothing — correct degradation for a fully-corrupt bucket.
-      let s_now = metrics.sharpness();
-      if s_now.is_finite() && s_now >= 0.0 && best_any.is_none_or(|(_, s)| sharper(s_now, s)) {
-        best_any = Some((ts, s_now));
+      // the strict gate. Domain-validate the whole metric set
+      // before accepting a fallback candidate — the strict path's
+      // `hard_gate` already gates on this, but a frame whose
+      // sharpness is finite-and-positive while another metric is
+      // corrupt (e.g. negative noise / clipping) would otherwise
+      // still win the fallback emit when no strict winner exists.
+      // Sharing the predicate keeps both ranking paths rejecting
+      // the same set of malformed frames. If every fallback
+      // candidate is filtered, the bucket emits nothing — correct
+      // degradation for a fully-corrupt bucket.
+      if metrics_in_domain(&metrics) {
+        let s_now = metrics.sharpness();
+        if best_any.is_none_or(|(_, s)| sharper(s_now, s)) {
+          best_any = Some((ts, s_now));
+        }
       }
       // Strict path: composite-quality ranking among gate-passing
       // frames. Non-finite composites are skipped — a NaN incumbent
@@ -1047,43 +1050,59 @@ fn sharper(a: f32, b: f32) -> bool {
   a.partial_cmp(&b).unwrap_or(Ordering::Equal) == Ordering::Greater
 }
 
+/// Returns `true` when every field of `m` is finite and inside its
+/// physical domain. Shared precondition for both [`hard_gate`]
+/// (strict path) and the fallback argmax inside
+/// [`Detector::finalize_shot`] — keeping the predicate in one
+/// place ensures both ranking paths reject the same set of corrupt
+/// `FrameMetrics`.
+///
+/// Domain bounds:
+/// - `sharpness`, `noise`, `colorfulness`, `luma_variance`,
+///   `saturation_variance`: must be `>= 0`. Tenengrad / Immerkaer /
+///   Hasler-Süßstrunk are non-negative by construction; variance is
+///   always non-negative.
+/// - `brightness`: must be in `[0, 255]` (luma encoding).
+/// - `clipping`, `motion_blur`: must be in `[0, 1]` (fraction /
+///   normalised anisotropy).
+///
+/// Public [`FrameMetrics::set_*`] accept arbitrary `f32`, so a
+/// malformed caller or corrupt detector output could feed e.g.
+/// `clipping = -1.0`. In [`composite_quality`] the penalty term
+/// `-w_clipping * clipping` would become a bonus, gaming the
+/// argmax. The fallback (raw-sharpness) path was previously
+/// vulnerable too: a frame with high sharpness and corrupt
+/// non-sharpness metrics could win the bucket's emit if every
+/// candidate failed the strict gate. Both ranking paths now
+/// reject out-of-domain frames at this single boundary.
+#[inline]
+fn metrics_in_domain(m: &FrameMetrics) -> bool {
+  m.brightness().is_finite()
+    && m.luma_variance().is_finite()
+    && m.saturation_variance().is_finite()
+    && m.clipping().is_finite()
+    && m.motion_blur().is_finite()
+    && m.sharpness().is_finite()
+    && m.noise().is_finite()
+    && m.colorfulness().is_finite()
+    && (0.0..=255.0).contains(&m.brightness())
+    && m.luma_variance() >= 0.0
+    && m.saturation_variance() >= 0.0
+    && (0.0..=1.0).contains(&m.clipping())
+    && (0.0..=1.0).contains(&m.motion_blur())
+    && m.sharpness() >= 0.0
+    && m.noise() >= 0.0
+    && m.colorfulness() >= 0.0
+}
+
 /// Any-one-trips hard gate matching the Python reference's flat /
 /// over-/under-exposed / clipped checks.
 ///
-/// **Fails closed on non-finite or out-of-domain metrics.** Each
-/// metric has a physical domain (clipping ∈ [0, 1], variance ≥ 0,
-/// brightness ∈ [0, 255], etc.) that a non-malicious detector
-/// cannot violate. Public [`FrameMetrics::set_*`] accept arbitrary
-/// `f32`, so a corrupt caller could feed e.g. `clipping = -1.0`. If
-/// that slipped past, [`composite_quality`]'s penalty term
-/// `-w_clipping * clipping` would become a bonus, gaming the
-/// strict argmax in favour of a malformed frame. Reject any
-/// out-of-domain finite value before the strict path can reward it.
+/// Trips when [`metrics_in_domain`] is `false` (corrupt / non-finite
+/// metric input) OR when any of the configured threshold gates
+/// fires (dark, bright, flat, over-clipped, or motion-blurred).
 fn hard_gate(m: &FrameMetrics, opts: &Options) -> bool {
-  // Fail closed on any non-finite gate-relevant metric. IEEE 754
-  // `metric < threshold` is `false` for `NaN`/`Inf`, which would
-  // silently bypass the gate.
-  if !m.brightness().is_finite()
-    || !m.luma_variance().is_finite()
-    || !m.saturation_variance().is_finite()
-    || !m.clipping().is_finite()
-    || !m.motion_blur().is_finite()
-    || !m.sharpness().is_finite()
-    || !m.noise().is_finite()
-    || !m.colorfulness().is_finite()
-  {
-    return true;
-  }
-  // Fail closed on any finite-but-out-of-domain metric.
-  if !(0.0..=255.0).contains(&m.brightness())
-    || m.luma_variance() < 0.0
-    || m.saturation_variance() < 0.0
-    || !(0.0..=1.0).contains(&m.clipping())
-    || !(0.0..=1.0).contains(&m.motion_blur())
-    || m.sharpness() < 0.0
-    || m.noise() < 0.0
-    || m.colorfulness() < 0.0
-  {
+  if !metrics_in_domain(m) {
     return true;
   }
   if m.brightness() < opts.black_mean_threshold as f32 {
@@ -1449,27 +1468,59 @@ mod tests {
   }
 
   #[test]
-  fn hard_gate_with_nan_brightness_routes_to_fallback_not_strict() {
-    // Regression for the iter-10 finding: with finite sharpness but
-    // NaN brightness, the pre-fix `hard_gate` failed open (NaN
-    // comparisons evaluate to false), letting the frame through the
-    // strict path with a finite composite_quality. The fix makes
-    // hard_gate fail closed on any non-finite gate-relevant metric,
-    // so a single such frame ends up in the fallback path only.
+  fn fallback_argmax_skips_corrupt_non_sharpness_metrics() {
+    // Iter-13 regression: pre-fix, `best_any` only domain-filtered
+    // `sharpness`. A frame with high sharpness BUT a corrupt non-
+    // sharpness metric (e.g. negative noise) would still win the
+    // fallback emit when every bucket candidate failed strict — the
+    // strict-path's domain rejection wasn't mirrored on the fallback
+    // path. With the shared `metrics_in_domain` predicate applied to
+    // both paths, the corrupt frame is filtered everywhere.
+    let opts = Options::default().with_margin_ratio(0.0);
+    let mut det = Detector::new(opts);
+    // High sharpness but negative noise — strict-rejected via the
+    // hard_gate domain check.
+    let corrupt = FrameMetrics::new()
+      .with_sharpness(500.0)
+      .with_brightness(5.0) // also fails strict via brightness
+      .with_luma_variance(200.0)
+      .with_saturation_variance(100.0)
+      .with_clipping(0.0)
+      .with_noise(-1000.0); // out of domain
+    // Lower sharpness but all in-domain. Fails strict via low
+    // brightness, but reaches fallback.
+    let valid = FrameMetrics::new()
+      .with_sharpness(50.0)
+      .with_brightness(5.0)
+      .with_luma_variance(200.0)
+      .with_saturation_variance(100.0)
+      .with_clipping(0.0);
+    det.observe(ts(500_000), corrupt);
+    det.observe(ts(1_500_000), valid);
+    let out = det.finalize_shot(tr(0, 2_000_000));
+    // Post-fix: `corrupt` is filtered from fallback (out-of-domain
+    // noise), so `valid` wins despite lower sharpness.
+    assert_eq!(out, vec![ts(1_500_000)]);
+  }
+
+  #[test]
+  fn nan_brightness_corrupt_frame_emits_nothing() {
+    // Frame with finite sharpness but NaN brightness is rejected
+    // by BOTH paths (post iter-13): strict via `hard_gate`'s
+    // domain check, fallback via the same shared `metrics_in_domain`
+    // predicate. The bucket emits nothing — a fully-corrupt frame
+    // is preferable to "least bad" emission of a malformed input.
     let opts = Options::default().with_margin_ratio(0.0);
     let mut det = Detector::new(opts);
     let m = FrameMetrics::new()
-      .with_sharpness(500.0) // finite
-      .with_brightness(f32::NAN) // poisons the gate
+      .with_sharpness(500.0)
+      .with_brightness(f32::NAN)
       .with_luma_variance(200.0)
       .with_saturation_variance(100.0)
       .with_clipping(0.0);
     det.observe(ts(500_000), m);
     let out = det.finalize_shot(tr(0, 2_000_000));
-    // hard_gate now trips → strict skipped. Fallback path takes
-    // over (sharpness is finite), still emits one timestamp — but
-    // via the "least bad" fallback, NOT the strict path.
-    assert_eq!(out, vec![ts(500_000)]);
+    assert!(out.is_empty(), "fully-corrupt frame must not emit");
   }
 
   // ---- Builder-path threshold clamps (iter-11 regression) -----------------
