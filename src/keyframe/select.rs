@@ -1,7 +1,7 @@
 //! Keyframe selection state machine.
 //!
-//! Buffers per-frame [`FrameScore`]s as they stream in, then — when the
-//! caller confirms a shot boundary — partitions the buffered scores into
+//! Buffers per-frame [`FrameMetrics`] as they stream in, then — when the
+//! caller confirms a shot boundary — partitions the buffered metrics into
 //! N time-uniform buckets and emits the sharpest frame per bucket.
 //!
 //! # Pipeline
@@ -49,7 +49,7 @@ use std::{collections::VecDeque, vec::Vec};
 
 use crate::{
   frame::{TimeRange, Timestamp},
-  keyframe::score::FrameScore,
+  keyframe::metrics::FrameMetrics,
 };
 
 #[cfg(feature = "serde")]
@@ -243,7 +243,7 @@ impl Options {
 #[derive(Debug, Clone)]
 pub struct Detector {
   opts: Options,
-  buffer: VecDeque<(Timestamp, FrameScore)>,
+  buffer: VecDeque<(Timestamp, FrameMetrics)>,
 }
 
 impl Detector {
@@ -281,7 +281,7 @@ impl Detector {
   /// you care about catching decoder bugs, run with debug assertions
   /// enabled.
   #[cfg_attr(not(tarpaulin), inline(always))]
-  pub fn observe(&mut self, ts: Timestamp, score: FrameScore) {
+  pub fn observe(&mut self, ts: Timestamp, metrics: FrameMetrics) {
     debug_assert!(
       self
         .buffer
@@ -289,7 +289,7 @@ impl Detector {
         .is_none_or(|(prev, _)| prev.cmp_semantic(&ts) != Ordering::Greater),
       "observe() frames must arrive in non-decreasing PTS order"
     );
-    self.buffer.push_back((ts, score));
+    self.buffer.push_back((ts, metrics));
   }
 
   /// A shot boundary has been confirmed. Drains every buffered entry
@@ -341,7 +341,7 @@ impl Detector {
     // buffer.
     let opts = self.opts;
 
-    while let Some((ts, score)) = self.buffer.front().copied() {
+    while let Some((ts, metrics)) = self.buffer.front().copied() {
       if ts.cmp_semantic(&range.end()) != Ordering::Less {
         break; // past this shot — leave for the next finalize.
       }
@@ -374,14 +374,14 @@ impl Detector {
       }
 
       // Running argmax updates.
-      if best_any.is_none_or(|(_, s)| sharper(score.sharpness, s)) {
-        best_any = Some((ts, score.sharpness));
+      if best_any.is_none_or(|(_, s)| sharper(metrics.sharpness(), s)) {
+        best_any = Some((ts, metrics.sharpness()));
       }
-      if !hard_gate(&score, &opts)
-        && score.sharpness >= opts.min_sharpness
-        && best_strict.is_none_or(|(_, s)| sharper(score.sharpness, s))
+      if !hard_gate(&metrics, &opts)
+        && metrics.sharpness() >= opts.min_sharpness
+        && best_strict.is_none_or(|(_, s)| sharper(metrics.sharpness(), s))
       {
-        best_strict = Some((ts, score.sharpness));
+        best_strict = Some((ts, metrics.sharpness()));
       }
     }
 
@@ -484,21 +484,21 @@ fn sharper(a: f32, b: f32) -> bool {
 
 /// Any-one-trips hard gate matching the Python reference's flat /
 /// over-/under-exposed / clipped checks.
-fn hard_gate(s: &FrameScore, opts: &Options) -> bool {
-  if s.brightness < opts.black_mean_threshold as f32 {
+fn hard_gate(m: &FrameMetrics, opts: &Options) -> bool {
+  if m.brightness() < opts.black_mean_threshold as f32 {
     return true;
   }
-  if s.brightness > opts.bright_mean_threshold as f32 {
+  if m.brightness() > opts.bright_mean_threshold as f32 {
     return true;
   }
   // AND-gate: only flag flat when BOTH variances are low (keeps
   // equiluminant multi-colour frames).
-  if s.luma_variance < opts.luma_variance_threshold
-    && s.saturation_variance < opts.sat_variance_threshold
+  if m.luma_variance() < opts.luma_variance_threshold
+    && m.saturation_variance() < opts.sat_variance_threshold
   {
     return true;
   }
-  if s.clipping > opts.max_clipping {
+  if m.clipping() > opts.max_clipping {
     return true;
   }
   false
@@ -525,14 +525,13 @@ mod tests {
     TimeRange::new(start_us, end_us, Timebase::new(1, nz(1_000_000)))
   }
 
-  fn good_score(sharpness: f32) -> FrameScore {
-    FrameScore {
-      sharpness,
-      brightness: 128.0,
-      luma_variance: 200.0,
-      saturation_variance: 100.0,
-      clipping: 0.0,
-    }
+  fn good_score(sharpness: f32) -> FrameMetrics {
+    FrameMetrics::new()
+      .with_sharpness(sharpness)
+      .with_brightness(128.0)
+      .with_luma_variance(200.0)
+      .with_saturation_variance(100.0)
+      .with_clipping(0.0)
   }
 
   // ----- Options -------------------------------------------------------------
@@ -623,7 +622,7 @@ mod tests {
   fn hard_gate_rejects_too_dark() {
     let o = Options::default();
     let mut s = good_score(200.0);
-    s.brightness = 5.0;
+    s.set_brightness(5.0);
     assert!(hard_gate(&s, &o));
   }
 
@@ -631,7 +630,7 @@ mod tests {
   fn hard_gate_rejects_too_bright() {
     let o = Options::default();
     let mut s = good_score(200.0);
-    s.brightness = 250.0;
+    s.set_brightness(250.0);
     assert!(hard_gate(&s, &o));
   }
 
@@ -639,8 +638,8 @@ mod tests {
   fn hard_gate_rejects_flat_frame() {
     let o = Options::default();
     let mut s = good_score(200.0);
-    s.luma_variance = 1.0;
-    s.saturation_variance = 1.0;
+    s.set_luma_variance(1.0);
+    s.set_saturation_variance(1.0);
     assert!(hard_gate(&s, &o));
   }
 
@@ -650,8 +649,8 @@ mod tests {
     // keeps this frame alive.
     let o = Options::default();
     let mut s = good_score(200.0);
-    s.luma_variance = 1.0;
-    s.saturation_variance = 80.0;
+    s.set_luma_variance(1.0);
+    s.set_saturation_variance(80.0);
     assert!(!hard_gate(&s, &o));
   }
 
@@ -659,7 +658,7 @@ mod tests {
   fn hard_gate_rejects_heavy_clipping() {
     let o = Options::default();
     let mut s = good_score(200.0);
-    s.clipping = 0.9;
+    s.set_clipping(0.9);
     assert!(hard_gate(&s, &o));
   }
 
@@ -724,12 +723,13 @@ mod tests {
     // sharpest anyway.
     let opts = Options::default().with_margin_ratio(0.0);
     let mut det = Detector::new(opts);
-    let bad = |sharp| FrameScore {
-      sharpness: sharp,
-      brightness: 5.0, // below black threshold 15
-      luma_variance: 200.0,
-      saturation_variance: 100.0,
-      clipping: 0.0,
+    let bad = |sharp| {
+      FrameMetrics::new()
+        .with_sharpness(sharp)
+        .with_brightness(5.0)
+        .with_luma_variance(200.0)
+        .with_saturation_variance(100.0)
+        .with_clipping(0.0)
     };
     det.observe(ts(0), bad(100.0));
     det.observe(ts(1_000_000), bad(400.0)); // sharpest among bad
