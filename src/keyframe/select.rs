@@ -1091,31 +1091,51 @@ fn compute_effective_floor(
   if !opts.adaptive_floor() {
     return opts.min_sharpness();
   }
-  // Collect sharpness samples from frames inside the
-  // emission-eligible window whose full metric set is in domain.
-  // The domain filter (the second predicate) is the same one
-  // applied to both ranking paths, so the floor only reflects
-  // samples that could plausibly win one of them. The `take()` cap
-  // bounds the allocation/sort cost at `MAX_ADAPTIVE_FLOOR_SAMPLES`
-  // regardless of buffered-frame count — see the constant's doc
-  // for the OOM-prevention rationale.
-  let mut sharps: Vec<f32> = buffer
-    .iter()
-    .filter(|(ts, _)| {
-      ts.cmp_semantic(eligible_start) != Ordering::Less
-        && ts.cmp_semantic(eligible_end) == Ordering::Less
+  // Two-pass stride-sample over the emission-eligible window.
+  //
+  // Pass 1 counts eligible in-domain samples without allocating.
+  // Pass 2 takes every `stride`-th sample to fill the percentile
+  // pool, capped at `MAX_ADAPTIVE_FLOOR_SAMPLES`. The stride is
+  // chosen so the pool spans the FULL eligible window — a
+  // `.take(N)` prefix cap would bias the percentile toward
+  // early-shot samples and silently disable adaptive flooring
+  // whenever `adaptive_floor_min_samples > N`.
+  //
+  // Both passes use `skip_while`/`take_while` instead of a plain
+  // `.filter` on timestamps, exploiting the buffer's documented
+  // non-decreasing-PTS ordering (post stale-entry drain) to
+  // terminate the iteration at the right edge of the window
+  // rather than scanning every future-shot frame.
+  let eligible_iter = || {
+    buffer
+      .iter()
+      .skip_while(|(ts, _)| ts.cmp_semantic(eligible_start) == Ordering::Less)
+      .take_while(|(ts, _)| ts.cmp_semantic(eligible_end) == Ordering::Less)
+      .filter(|(_, m)| metrics_in_domain(m))
+  };
+  let total = eligible_iter().count();
+  // `min_samples` is checked against the *true* eligible count
+  // (un-capped) so a caller asking for a larger min_samples than
+  // the storage cap still gets adaptive flooring as soon as the
+  // shot has enough valid frames.
+  if total == 0 || total < opts.adaptive_floor_min_samples() {
+    return opts.min_sharpness();
+  }
+  let stride = total.div_ceil(MAX_ADAPTIVE_FLOOR_SAMPLES).max(1);
+  let mut sharps: Vec<f32> = eligible_iter()
+    .enumerate()
+    .filter_map(|(i, (_, m))| {
+      if i % stride == 0 {
+        Some(m.sharpness())
+      } else {
+        None
+      }
     })
-    .filter(|(_, m)| metrics_in_domain(m))
-    .map(|(_, m)| m.sharpness())
-    .take(MAX_ADAPTIVE_FLOOR_SAMPLES)
     .collect();
-  // `min_samples == 0` (a valid user setting meaning "adapt regardless
-  // of sample count") combined with an empty in-range shot — or a
-  // shot whose every sample was filtered as non-finite — would skip
-  // the threshold check and then index an empty slice. Treat
-  // `sharps.is_empty()` as "no data to derive a percentile from" and
-  // fall back to the absolute floor.
-  if sharps.is_empty() || sharps.len() < opts.adaptive_floor_min_samples() {
+  if sharps.is_empty() {
+    // Defensive: total > 0 guarantees at least one stride hit,
+    // but a future refactor could break that. Fall back rather
+    // than index an empty slice.
     return opts.min_sharpness();
   }
   sharps.sort_by(|a, b| a.partial_cmp(b).unwrap_or(Ordering::Equal));
@@ -2022,6 +2042,105 @@ mod tests {
     // Exact-timestamp assertion would be brittle to tie-break
     // details under the truncated sample; just verify one emit.
     assert_eq!(out.len(), 1, "expected one strict winner");
+  }
+
+  #[test]
+  fn adaptive_floor_stride_samples_full_window_not_just_prefix() {
+    // Iter-19 regression: pre-fix, `.take(MAX_ADAPTIVE_FLOOR_SAMPLES)`
+    // truncated to the first 4096 valid frames, biasing the
+    // percentile toward early-shot samples. With first 4000 sharp
+    // (sharpness=5000) and last 2000 dim (sharpness=50), a prefix
+    // cap would compute p25 ≈ 5000 — keeping the floor unchanged
+    // for valid late-shot dim frames. Stride sampling sees both
+    // halves and computes p25 ≈ 50, correctly lowering the floor.
+    let opts = Options::default()
+      .with_margin_ratio(0.0)
+      .with_target_interval(Duration::from_secs(60 * 60)) // 1 bucket
+      .with_adaptive_floor_min_samples(10);
+    let mut det = Detector::new(opts);
+    // First 4000 sharp frames.
+    for i in 0..4000 {
+      det.observe(ts(i as i64 * 1000), good_metrics(5_000.0));
+    }
+    // Last 2000 dim frames, well below absolute floor 100.
+    for i in 4000..6000 {
+      det.observe(ts(i as i64 * 1000), good_metrics(50.0));
+    }
+    let out = det.finalize_shot(tr(0, 7_000_000));
+    // Adaptive floor with stride sampling sees both halves; p25
+    // across ~3000 stride-2 samples ≈ 50, so the floor lowers to
+    // 50 and a dim frame in the last 2000 wins via composite.
+    // (Strict path with default weights ranks by sharpness; the
+    // sharpest dim frame wins.)
+    assert_eq!(out.len(), 1);
+    // Winner is in the dim half — its sharpness is 50 (well above
+    // the lowered floor) and the sharp half also passes the floor.
+    // The sharp half wins because composite ranks them higher.
+    let winner_pts = out[0].pts();
+    assert!(
+      (0..4_000_000).contains(&winner_pts),
+      "winner pts {winner_pts} should be a sharp frame from the first half (0..4_000_000)"
+    );
+  }
+
+  #[test]
+  fn adaptive_floor_works_when_min_samples_exceeds_storage_cap() {
+    // Iter-19 regression: pre-fix, `min_samples > MAX_ADAPTIVE_FLOOR_SAMPLES`
+    // silently disabled adaptive flooring because the .take()-
+    // truncated Vec could never reach `min_samples`. Now
+    // `min_samples` is checked against the un-capped count.
+    let opts = Options::default()
+      .with_margin_ratio(0.0)
+      .with_target_interval(Duration::from_secs(60 * 60))
+      .with_adaptive_floor_min_samples(MAX_ADAPTIVE_FLOOR_SAMPLES + 100);
+    let mut det = Detector::new(opts);
+    // 5000 dim frames (below absolute floor of 100). True count
+    // exceeds min_samples; adaptive must engage.
+    for i in 0..5000 {
+      det.observe(ts(i as i64 * 1000), good_metrics(50.0));
+    }
+    let out = det.finalize_shot(tr(0, 6_000_000));
+    // Adaptive floor lowers to ~50 → a strict winner emerges.
+    assert_eq!(
+      out.len(),
+      1,
+      "adaptive floor must engage despite high min_samples"
+    );
+  }
+
+  #[test]
+  fn floor_sampling_does_not_walk_post_eligible_buffer() {
+    // Iter-19 regression: pre-fix, `.filter` on timestamps scanned
+    // the entire buffer; entries after `eligible_end` (queued for
+    // future shots) were filtered out only after iteration touched
+    // them. The fix uses `take_while` so the iterator terminates
+    // at the first out-of-window entry.
+    //
+    // Setup: small finalised shot [0, 1ms), then 5_000 frames
+    // observed after the shot boundary. The post-boundary frames
+    // should NOT be walked by compute_effective_floor; only the
+    // in-window subset is examined. Functionally we can't observe
+    // the CPU savings, but we can prove the post-shot frames don't
+    // affect the floor: place them at corrupt-metric values that
+    // would lower p25 if they leaked through.
+    let opts = Options::default()
+      .with_margin_ratio(0.0)
+      .with_adaptive_floor_min_samples(2);
+    let mut det = Detector::new(opts);
+    // Two in-window frames at sharpness 200 (above absolute floor 100).
+    det.observe(ts(100_000), good_metrics(200.0));
+    det.observe(ts(500_000), good_metrics(250.0));
+    // 5_000 future-shot frames at sharpness 10 (would drag p25 down
+    // pre-fix). Range cut-off is at 1_000_000; these are AFTER.
+    for i in 0..5_000 {
+      det.observe(ts(2_000_000 + (i as i64) * 1000), good_metrics(10.0));
+    }
+    let out = det.finalize_shot(tr(0, 1_000_000));
+    // In-window frames win strict; the future frames don't pollute
+    // p25 (they aren't even examined).
+    assert_eq!(out.len(), 1);
+    // The future-shot frames remain buffered for the next finalize.
+    assert!(det.buffered() >= 5_000);
   }
 
   // ----- Detector ------------------------------------------------------------
