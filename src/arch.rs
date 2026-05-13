@@ -946,10 +946,16 @@ mod scalar {
 
       // Population variance (use k, not k-1) so an all-identical frame
       // gives σ = 0.
+      //
+      // `crate::sqrt_64` routes through the inherent `f64::sqrt` under
+      // `std` and through `libm::sqrt` under `alloc`/no_std — the bare
+      // `.sqrt()` method isn't available in the latter, so calling it
+      // directly would break `cargo check --no-default-features
+      // --features alloc`.
       let var_rg = (m2_rg / n_f).max(0.0);
       let var_yb = (m2_yb / n_f).max(0.0);
-      let sigma_rgyb = (var_rg + var_yb).sqrt();
-      let mu_rgyb = (mean_rg * mean_rg + mean_yb * mean_yb).sqrt();
+      let sigma_rgyb = crate::sqrt_64(var_rg + var_yb);
+      let mu_rgyb = crate::sqrt_64(mean_rg * mean_rg + mean_yb * mean_yb);
       (sigma_rgyb + 0.3 * mu_rgyb) as f32
     }
   }
