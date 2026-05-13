@@ -467,6 +467,28 @@ pub(crate) fn tenengrad(
   scalar::Scalar::tenengrad(luma, width, height, stride)
 }
 
+/// Immerkaer (1996) fast noise variance estimator. Returns σₙ (the
+/// estimated per-pixel additive-Gaussian noise standard deviation) in
+/// 0-255 space. Dispatches to scalar today; the parameter shape
+/// matches the SIMD-ladder convention so future backends slot in
+/// without changing the signature.
+#[cfg_attr(not(tarpaulin), inline(always))]
+#[allow(unreachable_code)]
+pub(crate) fn noise(
+  luma: &[u8],
+  width: usize,
+  height: usize,
+  stride: usize,
+  use_simd: bool,
+) -> f32 {
+  if !use_simd {
+    return scalar::Scalar::noise(luma, width, height, stride);
+  }
+
+  // SIMD backends not yet implemented — scalar path.
+  scalar::Scalar::noise(luma, width, height, stride)
+}
+
 /// Population mean and variance of a single-plane `u8` image. Honours
 /// row stride. Uses a single-pass `E[X²] - E[X]²` formulation —
 /// numerically safe for `u8` inputs evaluated in `f64` (variance tops
@@ -754,6 +776,53 @@ mod scalar {
       }
 
       ((acc as f64) / (interior as f64)) as f32
+    }
+
+    /// Immerkaer (1996) fast noise variance estimator.
+    /// Convolves the luma plane with the 3×3 Laplacian-of-difference
+    /// mask `[[1,-2,1],[-2,4,-2],[1,-2,1]]`, sums the absolute values
+    /// over interior pixels, then scales by `sqrt(π/2) / (6·N_inner)`
+    /// to yield an estimate of the per-pixel additive-Gaussian noise
+    /// standard deviation σₙ in 0-255 space. Honours row stride.
+    pub(super) fn noise(luma: &[u8], w: usize, h: usize, s: usize) -> f32 {
+      if w < 3 || h < 3 {
+        return 0.0;
+      }
+      let interior = (w - 2) * (h - 2);
+      if interior == 0 {
+        return 0.0;
+      }
+
+      // Σ |I ⊛ N| over interior, where N is the Laplacian-of-difference
+      // mask above. Per-pixel response fits in i32 (peak magnitude on
+      // 8-bit input is 4·255 + 4·2·255 + 4·255 = 4·255 + 8·255 + 4·255 =
+      // 16·255 = 4080); the i64 accumulator handles any realistic
+      // interior count.
+      let mut acc: i64 = 0;
+      for y in 1..h - 1 {
+        for x in 1..w - 1 {
+          let p = |dy: isize, dx: isize| -> i32 {
+            luma[((y as isize + dy) as usize) * s + ((x as isize + dx) as usize)] as i32
+          };
+          let tl = p(-1, -1);
+          let t = p(-1, 0);
+          let tr = p(-1, 1);
+          let l = p(0, -1);
+          let c = p(0, 0);
+          let r = p(0, 1);
+          let bl = p(1, -1);
+          let b = p(1, 0);
+          let br = p(1, 1);
+          // N · I = 4c - 2(t+b+l+r) + (tl+tr+bl+br)
+          let lap = 4 * c - 2 * (t + b + l + r) + (tl + tr + bl + br);
+          acc += lap.unsigned_abs() as i64;
+        }
+      }
+
+      // σₙ ≈ √(π/2) / 6 · (Σ|lap| / interior)
+      // √(π/2) / 6 ≈ 0.2088987...
+      const COEFF: f64 = 0.208_898_754_886_372_3;
+      ((acc as f64) * COEFF / (interior as f64)) as f32
     }
   }
 }
@@ -1134,6 +1203,60 @@ mod tests {
   fn scalar_tenengrad_uniform_is_zero() {
     let data = vec![128u8; 16 * 16];
     assert_eq!(scalar::Scalar::tenengrad(&data, 16, 16, 16), 0.0);
+  }
+
+  #[test]
+  fn scalar_noise_uniform_is_zero() {
+    // No high-frequency signal → σₙ should be 0.
+    let data = vec![100u8; 16 * 16];
+    assert_eq!(scalar::Scalar::noise(&data, 16, 16, 16), 0.0);
+  }
+
+  #[test]
+  fn scalar_noise_too_small_is_zero() {
+    let data = vec![0u8; 4];
+    assert_eq!(scalar::Scalar::noise(&data, 2, 2, 2), 0.0);
+  }
+
+  #[test]
+  fn scalar_noise_alternating_stripe_matches_closed_form() {
+    // Use a checkerboard at amplitude k=64. Every interior pixel sees
+    // lap = 4·c - 2·(t+b+l+r) + (tl+tr+bl+br)
+    //     = 4·(±64) + 8·(±64) + 4·(±64) = 16·(±64) = ±1024
+    // |lap| = 1024 per interior pixel. With interior = 14·14 = 196,
+    // mean |lap| = 1024, σₙ ≈ 0.208898 · 1024 ≈ 213.92.
+    let (w, h) = (16usize, 16usize);
+    let mut data = vec![0u8; w * h];
+    for y in 0..h {
+      for x in 0..w {
+        let phase = ((x + y) & 1) as i32; // 0 or 1
+        let val = 100i32 + if phase == 0 { -64 } else { 64 };
+        data[y * w + x] = val as u8;
+      }
+    }
+    let sigma = scalar::Scalar::noise(&data, w, h, w);
+    let expected = 0.208_898_754_886_372_3_f64 * 1024.0;
+    assert!(
+      ((sigma as f64) - expected).abs() < 0.5,
+      "expected ~{expected}, got {sigma}"
+    );
+  }
+
+  #[test]
+  fn scalar_noise_stride_padding_is_ignored() {
+    // 4 wide × 4 high, stride 8. Padding filled with 255 — would
+    // explode |lap| if it leaked into the kernel.
+    let w = 4usize;
+    let h = 4usize;
+    let stride = 8usize;
+    let mut data = vec![255u8; stride * h];
+    for y in 0..h {
+      for x in 0..w {
+        data[y * stride + x] = 100; // uniform pixel area → σₙ = 0
+      }
+    }
+    let sigma = scalar::Scalar::noise(&data, w, h, stride);
+    assert_eq!(sigma, 0.0, "padding leaked into the Laplacian");
   }
 
   #[test]
