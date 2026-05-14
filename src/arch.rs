@@ -126,6 +126,13 @@ pub(crate) fn bgr_to_hsv_planes(
       }
       return;
     }
+    if std::is_x86_feature_detected!("sse4.1") {
+      // SAFETY: runtime-checked above.
+      unsafe {
+        x86_sse41::bgr_to_hsv_planes(h_out, s_out, v_out, src, width, height, stride);
+      }
+      return;
+    }
     if std::is_x86_feature_detected!("ssse3") {
       // SAFETY: runtime-checked above.
       unsafe {
@@ -152,7 +159,22 @@ pub(crate) fn bgr_to_hsv_planes(
   #[cfg(all(
     any(target_arch = "x86", target_arch = "x86_64"),
     not(feature = "std"),
+    target_feature = "sse4.1",
+    not(target_feature = "avx2"),
+    not(miri),
+  ))]
+  {
+    // SAFETY: target feature enabled at compile time.
+    unsafe {
+      x86_sse41::bgr_to_hsv_planes(h_out, s_out, v_out, src, width, height, stride);
+    }
+    return;
+  }
+  #[cfg(all(
+    any(target_arch = "x86", target_arch = "x86_64"),
+    not(feature = "std"),
     target_feature = "ssse3",
+    not(target_feature = "sse4.1"),
     not(target_feature = "avx2"),
     not(miri),
   ))]
@@ -204,6 +226,10 @@ pub(crate) fn mean_abs_diff(a: &[u8], b: &[u8], n: usize, use_simd: bool) -> f64
       not(miri)
     ))]
     {
+      if std::is_x86_feature_detected!("sse4.1") {
+        // SAFETY: runtime-checked.
+        return unsafe { x86_sse41::mean_abs_diff(a, b, n) };
+      }
       if std::is_x86_feature_detected!("ssse3") {
         // SAFETY: runtime-checked.
         return unsafe { x86_ssse3::mean_abs_diff(a, b, n) };
@@ -213,7 +239,18 @@ pub(crate) fn mean_abs_diff(a: &[u8], b: &[u8], n: usize, use_simd: bool) -> f64
     #[cfg(all(
       any(target_arch = "x86", target_arch = "x86_64"),
       not(feature = "std"),
+      target_feature = "sse4.1",
+      not(miri),
+    ))]
+    {
+      return unsafe { x86_sse41::mean_abs_diff(a, b, n) };
+    }
+
+    #[cfg(all(
+      any(target_arch = "x86", target_arch = "x86_64"),
+      not(feature = "std"),
       target_feature = "ssse3",
+      not(target_feature = "sse4.1"),
       not(miri),
     ))]
     {
@@ -268,6 +305,9 @@ pub(crate) fn sobel(
       not(miri)
     ))]
     {
+      if std::is_x86_feature_detected!("sse4.1") {
+        return unsafe { x86_sse41::sobel(input, mag, dir, w, h) };
+      }
       if std::is_x86_feature_detected!("ssse3") {
         return unsafe { x86_ssse3::sobel(input, mag, dir, w, h) };
       }
@@ -276,7 +316,18 @@ pub(crate) fn sobel(
     #[cfg(all(
       any(target_arch = "x86", target_arch = "x86_64"),
       not(feature = "std"),
+      target_feature = "sse4.1",
+      not(miri),
+    ))]
+    {
+      return unsafe { x86_sse41::sobel(input, mag, dir, w, h) };
+    }
+
+    #[cfg(all(
+      any(target_arch = "x86", target_arch = "x86_64"),
+      not(feature = "std"),
       target_feature = "ssse3",
+      not(target_feature = "sse4.1"),
       not(miri),
     ))]
     {
@@ -343,6 +394,12 @@ pub(crate) fn bgr_to_luma(
     not(miri)
   ))]
   {
+    if std::is_x86_feature_detected!("sse4.1") {
+      unsafe {
+        x86_sse41::bgr_to_luma(out, src, width, height, stride);
+      }
+      return;
+    }
     if std::is_x86_feature_detected!("ssse3") {
       // SAFETY: runtime-checked above.
       unsafe {
@@ -356,7 +413,20 @@ pub(crate) fn bgr_to_luma(
   #[cfg(all(
     any(target_arch = "x86", target_arch = "x86_64"),
     not(feature = "std"),
+    target_feature = "sse4.1",
+    not(miri),
+  ))]
+  {
+    unsafe {
+      x86_sse41::bgr_to_luma(out, src, width, height, stride);
+    }
+    return;
+  }
+  #[cfg(all(
+    any(target_arch = "x86", target_arch = "x86_64"),
+    not(feature = "std"),
     target_feature = "ssse3",
+    not(target_feature = "sse4.1"),
     not(miri),
   ))]
   {
@@ -410,6 +480,9 @@ pub(crate) fn clipping_count(
     not(miri)
   ))]
   {
+    if std::is_x86_feature_detected!("sse4.1") {
+      return unsafe { x86_sse41::clipping_count(src, width, height, stride) };
+    }
     if std::is_x86_feature_detected!("ssse3") {
       // SAFETY: runtime-checked above.
       return unsafe { x86_ssse3::clipping_count(src, width, height, stride) };
@@ -419,7 +492,17 @@ pub(crate) fn clipping_count(
   #[cfg(all(
     any(target_arch = "x86", target_arch = "x86_64"),
     not(feature = "std"),
+    target_feature = "sse4.1",
+    not(miri),
+  ))]
+  {
+    return unsafe { x86_sse41::clipping_count(src, width, height, stride) };
+  }
+  #[cfg(all(
+    any(target_arch = "x86", target_arch = "x86_64"),
+    not(feature = "std"),
     target_feature = "ssse3",
+    not(target_feature = "sse4.1"),
     not(miri),
   ))]
   {
@@ -467,6 +550,9 @@ pub(crate) fn tenengrad(
     not(miri)
   ))]
   {
+    if std::is_x86_feature_detected!("sse4.1") {
+      return unsafe { x86_sse41::tenengrad(luma, width, height, stride) };
+    }
     if std::is_x86_feature_detected!("ssse3") {
       // SAFETY: runtime-checked above.
       return unsafe { x86_ssse3::tenengrad(luma, width, height, stride) };
@@ -476,7 +562,17 @@ pub(crate) fn tenengrad(
   #[cfg(all(
     any(target_arch = "x86", target_arch = "x86_64"),
     not(feature = "std"),
+    target_feature = "sse4.1",
+    not(miri),
+  ))]
+  {
+    return unsafe { x86_sse41::tenengrad(luma, width, height, stride) };
+  }
+  #[cfg(all(
+    any(target_arch = "x86", target_arch = "x86_64"),
+    not(feature = "std"),
     target_feature = "ssse3",
+    not(target_feature = "sse4.1"),
     not(miri),
   ))]
   {
@@ -804,6 +900,9 @@ pub(crate) fn plane_mean_variance(
     not(miri)
   ))]
   {
+    if std::is_x86_feature_detected!("sse4.1") {
+      return unsafe { x86_sse41::plane_mean_variance(plane, width, height, stride) };
+    }
     if std::is_x86_feature_detected!("ssse3") {
       // SAFETY: runtime-checked above.
       return unsafe { x86_ssse3::plane_mean_variance(plane, width, height, stride) };
@@ -813,7 +912,17 @@ pub(crate) fn plane_mean_variance(
   #[cfg(all(
     any(target_arch = "x86", target_arch = "x86_64"),
     not(feature = "std"),
+    target_feature = "sse4.1",
+    not(miri),
+  ))]
+  {
+    return unsafe { x86_sse41::plane_mean_variance(plane, width, height, stride) };
+  }
+  #[cfg(all(
+    any(target_arch = "x86", target_arch = "x86_64"),
+    not(feature = "std"),
     target_feature = "ssse3",
+    not(target_feature = "sse4.1"),
     not(miri),
   ))]
   {
