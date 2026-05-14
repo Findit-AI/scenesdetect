@@ -1172,12 +1172,14 @@ pub(super) unsafe fn colorfulness(bgr: &[u8], w: usize, h: usize, stride: usize)
 ///
 /// Bin accumulator overflow: `mag` is `i32` (peak `≈ 2.1·10⁹`).
 /// Even on a 4K×2K interior (`~8·10⁶` pixels), a single bin can
-/// hold at most `~1.7·10¹⁶`, well inside `i64::MAX ≈ 9.2·10¹⁸`,
-/// so the vector path uses non-saturating adds with no behavioural
-/// change for any realistic input. The scalar tail keeps the
-/// reference implementation's defensive `saturating_add`; under
-/// the same no-overflow bound, SIMD / scalar agreement is still
-/// bitwise-determined by the hist values.
+/// hold at most `~1.7·10¹⁶`, well inside `i64::MAX ≈ 9.2·10¹⁸`.
+/// In the vector loop the i64×2 accumulator wraps on overflow
+/// (no SIMD `saturating_add` on x86); the **final** scalar
+/// combine that folds in the tail uses `saturating_add` to
+/// match the scalar reference, so a tail-only run, a SIMD-only
+/// run, and a mixed run all agree at every input that stays
+/// inside the documented bound and degrade to `u64::MAX`
+/// rather than wrapping past it on pathological inputs.
 ///
 /// # Safety
 ///
@@ -1258,14 +1260,22 @@ pub(super) unsafe fn gradient_anisotropy(mag: &[i32], dir: &[u8], w: usize, h: u
   }
 
   // Horizontal-reduce each i64×2 accumulator into the per-bin
-  // total and fold in the scalar tail.
+  // total and fold in the scalar tail. The SIMD lanes already
+  // wrap internally (no saturating SIMD i64 add on x86), but the
+  // scalar-combine step uses `saturating_add` to match the
+  // scalar reference and the tail loop above — so an unbroken
+  // tail+SIMD reduction never returns a smaller value than the
+  // pure-scalar path on identical input. Overflow analysis is
+  // documented above: realistic inputs stay well below
+  // `i64::MAX`, so the saturation only acts as a defence-in-
+  // depth backstop.
   let mut hist = tail;
   for bin_val in 0..4 {
     let mut lanes = [0i64; 2];
     unsafe { _mm_storeu_si128(lanes.as_mut_ptr() as *mut __m128i, acc[bin_val]) };
     hist[bin_val] = hist[bin_val]
-      .wrapping_add(lanes[0] as u64)
-      .wrapping_add(lanes[1] as u64);
+      .saturating_add(lanes[0] as u64)
+      .saturating_add(lanes[1] as u64);
   }
 
   let total: u64 = hist.iter().sum();

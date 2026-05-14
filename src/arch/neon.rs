@@ -969,10 +969,16 @@ pub(super) unsafe fn gradient_anisotropy(mag: &[i32], dir: &[u8], w: usize, h: u
     }
   }
 
+  // Final scalar combine uses `saturating_add` to match the
+  // scalar reference and the tail-loop `tail[d].saturating_add`
+  // above. The SIMD lanes wrap internally (NEON has no
+  // saturating i64 add), but the documented overflow bound
+  // (`< 1.7·10¹⁶` even on 4K×2K) leaves both options
+  // behaviourally identical for realistic inputs.
   let mut hist = tail;
   for bin_idx in 0..4 {
     let bin_sum = unsafe { vaddvq_s64(acc[bin_idx]) } as u64;
-    hist[bin_idx] = hist[bin_idx].wrapping_add(bin_sum);
+    hist[bin_idx] = hist[bin_idx].saturating_add(bin_sum);
   }
 
   let total: u64 = hist.iter().sum();
