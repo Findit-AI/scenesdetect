@@ -190,7 +190,7 @@ impl Detector {
       self.v_scratch.resize(size, 0);
     }
 
-    crate::frame::convert::bgr_to_hsv_planes(
+    crate::frame::convert::bgr_to_hsv_planes_with_order(
       &mut self.h_scratch[..size],
       &mut self.s_scratch[..size],
       &mut self.v_scratch[..size],
@@ -349,7 +349,7 @@ mod tests {
     let mut h = vec![0u8; n];
     let mut s = vec![0u8; n];
     let mut v = vec![0u8; n];
-    crate::frame::convert::bgr_to_hsv_planes(
+    crate::frame::convert::bgr_to_hsv_planes_with_order(
       &mut h,
       &mut s,
       &mut v,

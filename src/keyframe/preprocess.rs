@@ -257,7 +257,7 @@ impl LumaConverter {
       self.scratch.resize(size, 0);
     }
 
-    crate::frame::convert::bgr_to_luma(
+    crate::frame::convert::bgr_to_luma_with_order(
       &mut self.scratch[..size],
       bgr.data(),
       w,
@@ -345,7 +345,7 @@ impl HsvConverter {
       self.v.resize(size, 0);
     }
 
-    crate::frame::convert::bgr_to_hsv_planes(
+    crate::frame::convert::bgr_to_hsv_planes_with_order(
       &mut self.h[..size],
       &mut self.s[..size],
       &mut self.v[..size],
@@ -545,7 +545,7 @@ mod tests {
     let out = lc.run(frame);
 
     let mut reference = vec![0u8; w * h];
-    crate::frame::convert::bgr_to_luma(
+    crate::frame::convert::bgr_to_luma_with_order(
       &mut reference,
       &src,
       w as u32,
@@ -593,7 +593,7 @@ mod tests {
     let mut rh = vec![0u8; w * h];
     let mut rs = vec![0u8; w * h];
     let mut rv = vec![0u8; w * h];
-    crate::frame::convert::bgr_to_hsv_planes(
+    crate::frame::convert::bgr_to_hsv_planes_with_order(
       &mut rh,
       &mut rs,
       &mut rv,
