@@ -817,6 +817,17 @@ pub(crate) fn gradient_anisotropy(
   height: usize,
   use_simd: bool,
 ) -> f32 {
+  // Short-circuit degenerate frames BEFORE the slice-length
+  // assertions. Every backend (scalar, SSSE3, SSE4.1, AVX2, NEON,
+  // wasm) returns `0.0` on `width < 3 || height < 3`; if we
+  // asserted slice lengths first, a `MotionBlur::observe_sobel`
+  // caller streaming an empty / 1×1 / 2×2 crop with empty mag /
+  // dir buffers would panic instead of degrading to the
+  // documented zero score.
+  if width < 3 || height < 3 {
+    return 0.0;
+  }
+
   // Validate slice lengths BEFORE any SIMD dispatch. The SIMD
   // backends read 4 i32 mag values (SSSE3) or 8 i32 mag values +
   // 8 dir bytes (NEON, wasm) per chunk via raw pointer loads;
@@ -3059,6 +3070,30 @@ mod tests {
     let mag = vec![0i32; 10];
     let dir = vec![0u8; 64];
     let _ = gradient_anisotropy(&mag, &dir, 8, 8, false);
+  }
+
+  #[test]
+  fn gradient_anisotropy_dispatcher_short_circuits_degenerate_before_assert() {
+    // A `MotionBlur::observe_sobel` caller streaming an empty / 1×1
+    // / 2×2 crop is allowed to pass empty mag/dir buffers — the
+    // dispatcher MUST return 0.0 before the slice-length asserts.
+    // Without the early short-circuit ordering, the slice-length
+    // asserts would fire on the empty slices and the caller would
+    // panic instead of getting the documented zero score.
+    let empty_mag: Vec<i32> = Vec::new();
+    let empty_dir: Vec<u8> = Vec::new();
+    for (w, h) in [(0usize, 0usize), (1, 1), (2, 2), (2, 5), (5, 2)] {
+      assert_eq!(
+        gradient_anisotropy(&empty_mag, &empty_dir, w, h, true),
+        0.0,
+        "SIMD dispatcher panicked instead of short-circuiting on {w}x{h}"
+      );
+      assert_eq!(
+        gradient_anisotropy(&empty_mag, &empty_dir, w, h, false),
+        0.0,
+        "scalar dispatcher panicked instead of short-circuiting on {w}x{h}"
+      );
+    }
   }
 
   // ---- plane_mean_variance --------------------------------------------------

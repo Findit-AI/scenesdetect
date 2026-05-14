@@ -440,9 +440,13 @@ pub(super) unsafe fn gradient_anisotropy(mag: &[i32], dir: &[u8], w: usize, h: u
   for bin_val in 0..4 {
     let mut lanes = [0i64; 2];
     unsafe { _mm_storeu_si128(lanes.as_mut_ptr() as *mut __m128i, acc[bin_val]) };
+    // Match scalar `saturating_add` semantics: SIMD lanes still wrap
+    // internally (no saturating-i64 intrinsic on SSE4.1), but the
+    // final scalar combine clamps to u64::MAX so the histogram never
+    // wraps to a smaller value than the scalar reference would.
     hist[bin_val] = hist[bin_val]
-      .wrapping_add(lanes[0] as u64)
-      .wrapping_add(lanes[1] as u64);
+      .saturating_add(lanes[0] as u64)
+      .saturating_add(lanes[1] as u64);
   }
 
   let total: u64 = hist.iter().sum();
