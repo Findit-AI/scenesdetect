@@ -129,9 +129,12 @@ pub(crate) fn bgr_to_hsv_planes(
     not(miri)
   ))]
   {
-    if std::is_x86_feature_detected!("avx2") {
-      // SAFETY: runtime-checked above. AVX2 implies SSSE3 at the hardware
-      // level; the callee is annotated with both target features.
+    if std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("ssse3") {
+      // SAFETY: runtime-checked above. The callee uses 128-bit SSSE3
+      // `pshufb` for the BGR deinterleave alongside 256-bit AVX2
+      // arithmetic; treating AVX2 → SSSE3 as a hard implication would
+      // be incorrect on virtualised targets that can expose AVX2
+      // without SSSE3.
       unsafe {
         x86_avx2::bgr_to_hsv_planes(h_out, s_out, v_out, src, width, height, stride, order);
       }
@@ -158,10 +161,11 @@ pub(crate) fn bgr_to_hsv_planes(
     any(target_arch = "x86", target_arch = "x86_64"),
     not(feature = "std"),
     target_feature = "avx2",
+    target_feature = "ssse3",
     not(miri),
   ))]
   {
-    // SAFETY: target feature enabled at compile time.
+    // SAFETY: target features enabled at compile time.
     unsafe {
       x86_avx2::bgr_to_hsv_planes(h_out, s_out, v_out, src, width, height, stride, order);
     }
@@ -437,8 +441,9 @@ pub(crate) fn bgr_to_luma(
     not(miri)
   ))]
   {
-    if std::is_x86_feature_detected!("avx2") {
-      // SAFETY: runtime-checked above.
+    if std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("ssse3") {
+      // SAFETY: runtime-checked above. The callee uses 128-bit SSSE3
+      // `pshufb` for the BGR deinterleave alongside 256-bit AVX2 MAC.
       unsafe {
         x86_avx2::bgr_to_luma(out, src, width, height, stride, order);
       }
@@ -464,10 +469,11 @@ pub(crate) fn bgr_to_luma(
     any(target_arch = "x86", target_arch = "x86_64"),
     not(feature = "std"),
     target_feature = "avx2",
+    target_feature = "ssse3",
     not(miri),
   ))]
   {
-    // SAFETY: target feature enabled at compile time.
+    // SAFETY: target features enabled at compile time.
     unsafe {
       x86_avx2::bgr_to_luma(out, src, width, height, stride, order);
     }
@@ -546,7 +552,9 @@ pub(crate) fn clipping_count(
     not(miri)
   ))]
   {
-    if std::is_x86_feature_detected!("avx2") {
+    if std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("ssse3") {
+      // SAFETY: runtime-checked above. AVX2 backend uses 128-bit
+      // SSSE3 `pshufb` for the BGR deinterleave.
       return unsafe { x86_avx2::clipping_count(src, width, height, stride) };
     }
     if std::is_x86_feature_detected!("sse4.1") && std::is_x86_feature_detected!("ssse3") {
@@ -562,6 +570,7 @@ pub(crate) fn clipping_count(
     any(target_arch = "x86", target_arch = "x86_64"),
     not(feature = "std"),
     target_feature = "avx2",
+    target_feature = "ssse3",
     not(miri),
   ))]
   {
@@ -915,7 +924,9 @@ pub(crate) fn colorfulness(
     not(miri)
   ))]
   {
-    if std::is_x86_feature_detected!("avx2") {
+    if std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("ssse3") {
+      // SAFETY: runtime-checked above. AVX2 colorfulness uses
+      // 128-bit SSSE3 `pshufb` for the BGR deinterleave.
       return unsafe { x86_avx2::colorfulness(bgr, width, height, stride, order) };
     }
     if std::is_x86_feature_detected!("sse4.1") && std::is_x86_feature_detected!("ssse3") {
@@ -930,6 +941,7 @@ pub(crate) fn colorfulness(
     any(target_arch = "x86", target_arch = "x86_64"),
     not(feature = "std"),
     target_feature = "avx2",
+    target_feature = "ssse3",
     not(miri),
   ))]
   {
