@@ -1787,6 +1787,72 @@ mod tests {
     });
   }
 
+  // SSE4.1-direct HSV equivalence vs scalar.
+  //
+  // This test exists specifically to catch SSE4.1 vs scalar HSV
+  // drift on AVX2-capable CI hosts. The runtime dispatcher picks AVX2
+  // when available, so generic tests never exercise the SSE4.1 path
+  // on those runners. By calling `x86_sse41::bgr_to_hsv_planes`
+  // directly, we get full per-pixel equivalence coverage even on
+  // AVX2 hardware. Iter-1 regression: an earlier draft of the
+  // SSE4.1 backend used `_mm_round_ps::<NEAREST_INT>` (ties-to-even)
+  // which produces a 1-LSB drift on half-value inputs vs scalar
+  // `round()` (ties-away-from-zero). The half-value coverage in
+  // `make_bgr` randoms is sparse; this test includes an explicit
+  // BGR(5, 6, 6) pixel whose saturation lands at exactly 42.5 to
+  // stress that path.
+  #[cfg(all(any(target_arch = "x86", target_arch = "x86_64"), feature = "std"))]
+  #[test]
+  fn sse41_bgr_to_hsv_planes_matches_scalar() {
+    if !std::is_x86_feature_detected!("sse4.1") {
+      return;
+    }
+    let (w, h) = (64usize, 16usize);
+    let n = w * h;
+    let mut bgr = make_bgr(w, h);
+    // Plant a known half-value pixel: BGR(5, 6, 6) gives V = 6,
+    // saturation = round(255 * (V - min) / V) = round(255 * 1/6) =
+    // round(42.5). Scalar `f32::round()` is ties-away-from-zero so
+    // expects 43; SSE4.1 NEAREST-INT would round to 42.
+    bgr[0] = 5;
+    bgr[1] = 6;
+    bgr[2] = 6;
+    let mut h_simd = vec![0u8; n];
+    let mut s_simd = vec![0u8; n];
+    let mut v_simd = vec![0u8; n];
+    unsafe {
+      x86_sse41::bgr_to_hsv_planes(
+        &mut h_simd,
+        &mut s_simd,
+        &mut v_simd,
+        &bgr,
+        w as u32,
+        h as u32,
+        (w * 3) as u32,
+        ChannelOrder::Bgr,
+      );
+    }
+    let mut h_ref = vec![0u8; n];
+    let mut s_ref = vec![0u8; n];
+    let mut v_ref = vec![0u8; n];
+    scalar::Scalar::bgr_to_hsv_planes(
+      &mut h_ref,
+      &mut s_ref,
+      &mut v_ref,
+      &bgr,
+      w as u32,
+      h as u32,
+      (w * 3) as u32,
+      ChannelOrder::Bgr,
+    );
+    assert_eq!(h_simd, h_ref, "H plane drift");
+    assert_eq!(s_simd, s_ref, "S plane drift");
+    assert_eq!(v_simd, v_ref, "V plane drift");
+    // Spot-check the planted pixel.
+    assert_eq!(v_simd[0], 6);
+    assert_eq!(s_simd[0], 43);
+  }
+
   // x86: call AVX2 bgr_to_hsv_planes directly (exercises the AVX2 tail path too).
   #[cfg(all(any(target_arch = "x86", target_arch = "x86_64"), feature = "std"))]
   #[test]

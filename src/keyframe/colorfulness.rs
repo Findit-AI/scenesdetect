@@ -44,6 +44,11 @@ use serde::{Deserialize, Serialize};
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct Options {
   use_simd: bool,
+  // `serde(default)` keeps pre-`channel_order` payloads
+  // deserializing (they fall back to `ChannelOrder::Bgr`, matching the
+  // pre-existing internal behaviour). Without this, upgrading the
+  // crate would break any stored config.
+  #[cfg_attr(feature = "serde", serde(default))]
   channel_order: ChannelOrder,
 }
 
@@ -200,6 +205,19 @@ mod tests {
   fn options_with_channel_order_round_trips() {
     let o = Options::new().with_channel_order(ChannelOrder::Rgb);
     assert_eq!(o.channel_order(), ChannelOrder::Rgb);
+  }
+
+  #[cfg(feature = "serde")]
+  #[test]
+  fn options_deserializes_legacy_payload_without_channel_order() {
+    // Pre-`channel_order` JSON payloads only had `use_simd`. They MUST
+    // continue to deserialize so upgrading the crate doesn't break
+    // existing stored configs; the missing field falls back to
+    // `ChannelOrder::Bgr` via `#[serde(default)]`.
+    let legacy = r#"{"use_simd": true}"#;
+    let opts: Options = serde_json::from_str(legacy).expect("legacy payload must deserialize");
+    assert!(opts.use_simd());
+    assert_eq!(opts.channel_order(), ChannelOrder::Bgr);
   }
 
   #[test]

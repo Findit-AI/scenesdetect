@@ -467,8 +467,10 @@ pub(super) unsafe fn gradient_anisotropy(mag: &[i32], dir: &[u8], w: usize, h: u
 //
 // `bgr_to_hsv_planes` does use real SSE4.1 features: `_mm_blendv_ps` for the
 // per-lane conditional selects (replaces the SSE2 `(mask & t) | (!mask & f)`
-// idiom) and `_mm_round_ps` for the half-up rounding (replaces the add-0.5 +
-// truncate pattern).
+// idiom). Rounding stays on the SSSE3/AVX2 add-0.5-then-truncate idiom —
+// SSE4.1's `_mm_round_ps::<NEAREST_INT>` is ties-to-even and would drift
+// by 1 LSB on half-value inputs vs the scalar `round()` which is
+// ties-away-from-zero.
 // ============================================================================
 
 /// SSE4.1 `mean_abs_diff`: identical to the SSSE3 backend (no SSE4.1
@@ -1059,9 +1061,11 @@ pub(super) unsafe fn plane_mean_variance(plane: &[u8], w: usize, h: usize, s: us
 
 /// SSE4.1 BGR→HSV. Uses SSE4.1's `_mm_blendv_ps` (true per-lane select,
 /// replaces the SSE2 `(mask & t) | (!mask & f)` idiom — saves one op per
-/// blend) and `_mm_round_ps::<_MM_FROUND_TO_NEAREST_INT>` for the hue/2,
-/// sat, val rounding (replaces the add-0.5 + truncate idiom). The
-/// channel widening uses `_mm_cvtepu8_epi16` for the low half and
+/// blend). Rounding stays on the add-0.5-then-truncate SSSE3/AVX2 idiom
+/// (NOT `_mm_round_ps::<NEAREST_INT>`, which is ties-to-even and would
+/// drift by 1 LSB on half-value inputs vs the scalar `round()`'s
+/// ties-away-from-zero). The channel widening uses `_mm_cvtepu8_epi16`
+/// for the low half and
 /// `_mm_unpackhi_epi8(v, zero)` for the high half, mirroring the
 /// `bgr_to_luma` pattern above.
 ///
@@ -1166,33 +1170,19 @@ pub(super) unsafe fn bgr_to_hsv_planes(
           let gf = unsafe { _mm_cvtepi32_ps(gu) };
           let rf = unsafe { _mm_cvtepi32_ps(ru) };
           let (hue, sat, val) = unsafe { bgr_to_hsv_f32x4_sse41(bf, gf, rf) };
-          // SSE4.1 `_mm_round_ps` with NEAREST-INT rounding matches the
-          // scalar reference's `round()` semantics. The hue is /2 first.
-          let hh = unsafe { _mm_mul_ps(hue, _mm_set1_ps(0.5)) };
-          let h_u32 = unsafe {
-            clamp_i32_max_sse41(
-              _mm_cvtps_epi32(_mm_round_ps::<
-                { _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC },
-              >(hh)),
-              179,
-            )
-          };
-          let s_u32 = unsafe {
-            clamp_i32_max_sse41(
-              _mm_cvtps_epi32(_mm_round_ps::<
-                { _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC },
-              >(sat)),
-              255,
-            )
-          };
-          let v_u32 = unsafe {
-            clamp_i32_max_sse41(
-              _mm_cvtps_epi32(_mm_round_ps::<
-                { _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC },
-              >(val)),
-              255,
-            )
-          };
+          // Scalar uses Rust `f32::round()` which is ties-away-from-zero;
+          // for our non-negative inputs that's the add-0.5-then-truncate
+          // pattern. SSE4.1's `_mm_round_ps::<NEAREST_INT>` is ties-to-
+          // even — half-values like BGR(5,6,6)'s saturation = 42.5 would
+          // round to 42 instead of the scalar's 43, producing 1-LSB drift
+          // on SSE4.1-only x86 hosts. Match the SSSE3 / AVX2 pattern
+          // (`_mm_cvttps_epi32(_mm_add_ps(v, 0.5))`) for bit-identical
+          // results across every backend.
+          let half = unsafe { _mm_set1_ps(0.5) };
+          let hh = unsafe { _mm_mul_ps(hue, half) };
+          let h_u32 = unsafe { clamp_i32_max_sse41(_mm_cvttps_epi32(_mm_add_ps(hh, half)), 179) };
+          let s_u32 = unsafe { clamp_i32_max_sse41(_mm_cvttps_epi32(_mm_add_ps(sat, half)), 255) };
+          let v_u32 = unsafe { clamp_i32_max_sse41(_mm_cvttps_epi32(_mm_add_ps(val, half)), 255) };
           (h_u32, s_u32, v_u32)
         }};
       }
