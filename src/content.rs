@@ -629,6 +629,7 @@ impl Detector {
       frame.width(),
       frame.height(),
       frame.stride(),
+      crate::frame::ChannelOrder::Bgr,
       self.use_simd,
     );
     self.process_inner(ts)
@@ -1378,6 +1379,7 @@ mod tests {
       w,
       h,
       w * 3,
+      crate::frame::ChannelOrder::Bgr,
       true,
     );
 

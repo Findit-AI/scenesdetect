@@ -81,6 +81,10 @@ humantime-serde = { version = "1", default-features = false, optional = true }
 [dev-dependencies]
 criterion = "0.8"
 tempfile = "3"
+# JSON form used in `#[cfg(feature = "serde")]` round-trip tests
+# (forward-compat checks for legacy payloads that predate newer
+# Options fields). Test-only — not pulled into library builds.
+serde_json = "1"
 
 [profile.bench]
 opt-level = 3

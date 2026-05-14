@@ -9,6 +9,8 @@
 
 use core::arch::wasm32::*;
 
+use crate::frame::ChannelOrder;
+
 const BLK0_B: [u8; 16] = [
   0, 3, 6, 9, 12, 15, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
 ];
@@ -44,6 +46,7 @@ const BLK2_R: [u8; 16] = [
 /// Caller must ensure the `simd128` target feature is enabled.
 #[target_feature(enable = "simd128")]
 #[allow(unused_unsafe)]
+#[allow(clippy::too_many_arguments)]
 pub(super) unsafe fn bgr_to_hsv_planes(
   h_out: &mut [u8],
   s_out: &mut [u8],
@@ -52,6 +55,7 @@ pub(super) unsafe fn bgr_to_hsv_planes(
   width: u32,
   height: u32,
   stride: u32,
+  order: ChannelOrder,
 ) {
   const LANES: usize = 16;
   let w = width as usize;
@@ -59,16 +63,37 @@ pub(super) unsafe fn bgr_to_hsv_planes(
   let s = stride as usize;
   let whole = w / LANES * LANES;
 
-  let m_b0 = unsafe { v128_load(BLK0_B.as_ptr() as *const v128) };
+  let (m_b0, m_b1, m_b2, m_r0, m_r1, m_r2) = match order {
+    ChannelOrder::Bgr => unsafe {
+      (
+        v128_load(BLK0_B.as_ptr() as *const v128),
+        v128_load(BLK1_B.as_ptr() as *const v128),
+        v128_load(BLK2_B.as_ptr() as *const v128),
+        v128_load(BLK0_R.as_ptr() as *const v128),
+        v128_load(BLK1_R.as_ptr() as *const v128),
+        v128_load(BLK2_R.as_ptr() as *const v128),
+      )
+    },
+    ChannelOrder::Rgb => unsafe {
+      (
+        v128_load(BLK0_R.as_ptr() as *const v128),
+        v128_load(BLK1_R.as_ptr() as *const v128),
+        v128_load(BLK2_R.as_ptr() as *const v128),
+        v128_load(BLK0_B.as_ptr() as *const v128),
+        v128_load(BLK1_B.as_ptr() as *const v128),
+        v128_load(BLK2_B.as_ptr() as *const v128),
+      )
+    },
+  };
   let m_g0 = unsafe { v128_load(BLK0_G.as_ptr() as *const v128) };
-  let m_r0 = unsafe { v128_load(BLK0_R.as_ptr() as *const v128) };
-  let m_b1 = unsafe { v128_load(BLK1_B.as_ptr() as *const v128) };
   let m_g1 = unsafe { v128_load(BLK1_G.as_ptr() as *const v128) };
-  let m_r1 = unsafe { v128_load(BLK1_R.as_ptr() as *const v128) };
-  let m_b2 = unsafe { v128_load(BLK2_B.as_ptr() as *const v128) };
   let m_g2 = unsafe { v128_load(BLK2_G.as_ptr() as *const v128) };
-  let m_r2 = unsafe { v128_load(BLK2_R.as_ptr() as *const v128) };
   let zero = f32x4_splat(0.0);
+
+  let (b_off, r_off) = match order {
+    ChannelOrder::Bgr => (0usize, 2usize),
+    ChannelOrder::Rgb => (2usize, 0usize),
+  };
 
   for y in 0..h {
     let row_base = y * s;
@@ -141,9 +166,9 @@ pub(super) unsafe fn bgr_to_hsv_planes(
     let _ = zero;
     let row = &src[row_base..row_base + w * 3];
     while x < w {
-      let b = row[x * 3] as f32;
+      let b = row[x * 3 + b_off] as f32;
       let g = row[x * 3 + 1] as f32;
-      let r = row[x * 3 + 2] as f32;
+      let r = row[x * 3 + r_off] as f32;
       let (hue, sat, val) = super::scalar::Scalar::bgr_to_hsv_pixel(b, g, r);
       h_out[dst_off + x] = hue;
       s_out[dst_off + x] = sat;
@@ -406,22 +431,50 @@ pub(super) unsafe fn sobel(input: &[u8], mag: &mut [i32], dir: &mut [u8], w: usi
 /// Caller must ensure `simd128` target feature is enabled.
 #[target_feature(enable = "simd128")]
 #[allow(unused_unsafe)]
-pub(super) unsafe fn bgr_to_luma(out: &mut [u8], src: &[u8], width: u32, height: u32, stride: u32) {
+pub(super) unsafe fn bgr_to_luma(
+  out: &mut [u8],
+  src: &[u8],
+  width: u32,
+  height: u32,
+  stride: u32,
+  order: ChannelOrder,
+) {
   const LANES: usize = 16;
   let w = width as usize;
   let h = height as usize;
   let s = stride as usize;
   let whole = w / LANES * LANES;
 
-  let m_b0 = unsafe { v128_load(BLK0_B.as_ptr() as *const v128) };
+  let (m_b0, m_b1, m_b2, m_r0, m_r1, m_r2) = match order {
+    ChannelOrder::Bgr => unsafe {
+      (
+        v128_load(BLK0_B.as_ptr() as *const v128),
+        v128_load(BLK1_B.as_ptr() as *const v128),
+        v128_load(BLK2_B.as_ptr() as *const v128),
+        v128_load(BLK0_R.as_ptr() as *const v128),
+        v128_load(BLK1_R.as_ptr() as *const v128),
+        v128_load(BLK2_R.as_ptr() as *const v128),
+      )
+    },
+    ChannelOrder::Rgb => unsafe {
+      (
+        v128_load(BLK0_R.as_ptr() as *const v128),
+        v128_load(BLK1_R.as_ptr() as *const v128),
+        v128_load(BLK2_R.as_ptr() as *const v128),
+        v128_load(BLK0_B.as_ptr() as *const v128),
+        v128_load(BLK1_B.as_ptr() as *const v128),
+        v128_load(BLK2_B.as_ptr() as *const v128),
+      )
+    },
+  };
   let m_g0 = unsafe { v128_load(BLK0_G.as_ptr() as *const v128) };
-  let m_r0 = unsafe { v128_load(BLK0_R.as_ptr() as *const v128) };
-  let m_b1 = unsafe { v128_load(BLK1_B.as_ptr() as *const v128) };
   let m_g1 = unsafe { v128_load(BLK1_G.as_ptr() as *const v128) };
-  let m_r1 = unsafe { v128_load(BLK1_R.as_ptr() as *const v128) };
-  let m_b2 = unsafe { v128_load(BLK2_B.as_ptr() as *const v128) };
   let m_g2 = unsafe { v128_load(BLK2_G.as_ptr() as *const v128) };
-  let m_r2 = unsafe { v128_load(BLK2_R.as_ptr() as *const v128) };
+
+  let (b_off, r_off) = match order {
+    ChannelOrder::Bgr => (0usize, 2usize),
+    ChannelOrder::Rgb => (2usize, 0usize),
+  };
 
   // Coefficient splats. i16x8 lanes; values fit in i16.
   let k_b = i16x8_splat(29);
@@ -485,9 +538,9 @@ pub(super) unsafe fn bgr_to_luma(out: &mut [u8], src: &[u8], width: u32, height:
 
     // Scalar tail.
     while x < w {
-      let b = src[row_base + x * 3] as u32;
+      let b = src[row_base + x * 3 + b_off] as u32;
       let g = src[row_base + x * 3 + 1] as u32;
-      let r = src[row_base + x * 3 + 2] as u32;
+      let r = src[row_base + x * 3 + r_off] as u32;
       out[dst_off + x] = ((77 * r + 150 * g + 29 * b) >> 8) as u8;
       x += 1;
     }
@@ -840,7 +893,13 @@ pub(super) unsafe fn noise(luma: &[u8], w: usize, h: usize, s: usize) -> f32 {
 /// Caller must ensure `simd128` target feature is enabled.
 #[target_feature(enable = "simd128")]
 #[allow(unused_unsafe)]
-pub(super) unsafe fn colorfulness(bgr: &[u8], w: usize, h: usize, stride: usize) -> f32 {
+pub(super) unsafe fn colorfulness(
+  bgr: &[u8],
+  w: usize,
+  h: usize,
+  stride: usize,
+  order: ChannelOrder,
+) -> f32 {
   let n = w.saturating_mul(h);
   if n == 0 {
     return 0.0;
@@ -849,15 +908,36 @@ pub(super) unsafe fn colorfulness(bgr: &[u8], w: usize, h: usize, stride: usize)
   const LANES: usize = 16;
   let whole = w / LANES * LANES;
 
-  let m_b0 = unsafe { v128_load(BLK0_B.as_ptr() as *const v128) };
+  let (m_b0, m_b1, m_b2, m_r0, m_r1, m_r2) = match order {
+    ChannelOrder::Bgr => unsafe {
+      (
+        v128_load(BLK0_B.as_ptr() as *const v128),
+        v128_load(BLK1_B.as_ptr() as *const v128),
+        v128_load(BLK2_B.as_ptr() as *const v128),
+        v128_load(BLK0_R.as_ptr() as *const v128),
+        v128_load(BLK1_R.as_ptr() as *const v128),
+        v128_load(BLK2_R.as_ptr() as *const v128),
+      )
+    },
+    ChannelOrder::Rgb => unsafe {
+      (
+        v128_load(BLK0_R.as_ptr() as *const v128),
+        v128_load(BLK1_R.as_ptr() as *const v128),
+        v128_load(BLK2_R.as_ptr() as *const v128),
+        v128_load(BLK0_B.as_ptr() as *const v128),
+        v128_load(BLK1_B.as_ptr() as *const v128),
+        v128_load(BLK2_B.as_ptr() as *const v128),
+      )
+    },
+  };
   let m_g0 = unsafe { v128_load(BLK0_G.as_ptr() as *const v128) };
-  let m_r0 = unsafe { v128_load(BLK0_R.as_ptr() as *const v128) };
-  let m_b1 = unsafe { v128_load(BLK1_B.as_ptr() as *const v128) };
   let m_g1 = unsafe { v128_load(BLK1_G.as_ptr() as *const v128) };
-  let m_r1 = unsafe { v128_load(BLK1_R.as_ptr() as *const v128) };
-  let m_b2 = unsafe { v128_load(BLK2_B.as_ptr() as *const v128) };
   let m_g2 = unsafe { v128_load(BLK2_G.as_ptr() as *const v128) };
-  let m_r2 = unsafe { v128_load(BLK2_R.as_ptr() as *const v128) };
+
+  let (b_off, r_off) = match order {
+    ChannelOrder::Bgr => (0usize, 2usize),
+    ChannelOrder::Rgb => (2usize, 0usize),
+  };
 
   // All four accumulators are i64×2; biased 8K+ frames pushed
   // an i32×4 lane past `i32::MAX` and caused mean_rg/mean_yb to
@@ -947,9 +1027,9 @@ pub(super) unsafe fn colorfulness(bgr: &[u8], w: usize, h: usize, stride: usize)
     }
 
     while x < w {
-      let b = bgr[row_base + x * 3] as i32;
+      let b = bgr[row_base + x * 3 + b_off] as i32;
       let g = bgr[row_base + x * 3 + 1] as i32;
-      let r = bgr[row_base + x * 3 + 2] as i32;
+      let r = bgr[row_base + x * 3 + r_off] as i32;
       let rg = r - g;
       let u = r + g - 2 * b;
       tail_sum_rg += rg as i64;

@@ -1,12 +1,13 @@
-//! Color-space conversions for packed 24-bit BGR video frames.
+//! Color-space conversions for packed 24-bit BGR / RGB video frames.
 //!
 //! # Byte order
 //!
-//! All functions in this module consume **BGR** — three bytes per pixel,
-//! in the order `B, G, R`. This matches the convention used by the
-//! `content` detector and OpenCV's default layout. Callers holding RGB
-//! buffers must swizzle `R` and `B` before calling (cheap — a single
-//! SIMD shuffle per 16 pixels on any modern target).
+//! Each function takes an explicit [`ChannelOrder`] parameter that
+//! selects between BGR (`B, G, R` per pixel — OpenCV's default layout
+//! and the `content` detector's native convention) and RGB (`R, G, B`
+//! per pixel — common in still-image pipelines). The kernels read the
+//! relevant channels through whichever byte positions the order
+//! indicates; the math is otherwise identical.
 //!
 //! # Dispatch
 //!
@@ -22,18 +23,25 @@
 //! - Scalar only (for now) for [`bgr_to_luma`]; SIMD lands in a later
 //!   revision.
 
+use crate::frame::ChannelOrder;
+
 /// Converts a packed 24-bit BGR frame into three planar 8-bit HSV buffers
 /// matching OpenCV's `cv2.COLOR_BGR2HSV` semantics (H in `[0, 179]`, S and
-/// V in `[0, 255]`).
+/// V in `[0, 255]`). Source is interpreted as **BGR** byte order. For
+/// RGB-ordered input, call [`bgr_to_hsv_planes_with_order`].
+///
+/// Signature-compatible with the pre-`ChannelOrder` releases; existing
+/// callers compile unchanged.
 ///
 /// # Arguments
 ///
 /// - `h_out`, `s_out`, `v_out`: destination planes, each at least
 ///   `width * height` bytes. Row `y` of each plane starts at byte offset
 ///   `y * width`.
-/// - `src`: source BGR buffer; must be at least `stride * height` bytes.
-///   Row `y` starts at byte offset `y * stride`; within each row, pixel
-///   `x` occupies bytes `x*3 .. x*3 + 3` in the order `B, G, R`.
+/// - `src`: source packed 3-byte-per-pixel buffer (BGR order); must be at
+///   least `stride * height` bytes. Row `y` starts at byte offset
+///   `y * stride`; within each row, pixel `x` occupies bytes
+///   `x*3 .. x*3 + 3`.
 /// - `width`, `height`: frame dimensions in pixels.
 /// - `stride`: source row stride in bytes (must satisfy `stride >= 3 *
 ///   width`).
@@ -43,10 +51,7 @@
 /// # Panics
 ///
 /// Panics in **all** builds if the slice lengths are too short for the
-/// declared dimensions, or if `stride < 3 * width`. The SIMD backends
-/// use unchecked pointer loads/stores; validating up front prevents
-/// callers from reaching those unchecked memory accesses from safe
-/// Rust.
+/// declared dimensions, or if `stride < 3 * width`.
 #[inline]
 #[allow(clippy::too_many_arguments)]
 pub fn bgr_to_hsv_planes(
@@ -57,6 +62,41 @@ pub fn bgr_to_hsv_planes(
   width: u32,
   height: u32,
   stride: u32,
+  use_simd: bool,
+) {
+  bgr_to_hsv_planes_with_order(
+    h_out,
+    s_out,
+    v_out,
+    src,
+    width,
+    height,
+    stride,
+    ChannelOrder::Bgr,
+    use_simd,
+  );
+}
+
+/// Order-aware variant of [`bgr_to_hsv_planes`].
+///
+/// `src` carries either **BGR** or **RGB** byte order per the
+/// `order` parameter — `ChannelOrder::Bgr` reads `(B, G, R)`
+/// at byte positions 0/1/2 per pixel, `ChannelOrder::Rgb`
+/// reads `(R, G, B)`. The HSV math is otherwise identical
+/// (we just route the correct byte through the kernel's `b`
+/// and `r` lanes). The legacy BGR-only [`bgr_to_hsv_planes`]
+/// shim above forwards to this with `ChannelOrder::Bgr`.
+#[inline]
+#[allow(clippy::too_many_arguments)]
+pub fn bgr_to_hsv_planes_with_order(
+  h_out: &mut [u8],
+  s_out: &mut [u8],
+  v_out: &mut [u8],
+  src: &[u8],
+  width: u32,
+  height: u32,
+  stride: u32,
+  order: ChannelOrder,
   use_simd: bool,
 ) {
   let w = width as usize;
@@ -93,7 +133,9 @@ pub fn bgr_to_hsv_planes(
     "bgr_to_hsv_planes: v_out len {} < width*height {plane_len}",
     v_out.len()
   );
-  crate::arch::bgr_to_hsv_planes(h_out, s_out, v_out, src, width, height, stride, use_simd);
+  crate::arch::bgr_to_hsv_planes(
+    h_out, s_out, v_out, src, width, height, stride, order, use_simd,
+  );
 }
 
 /// Converts a packed 24-bit BGR frame to a single-plane 8-bit BT.601 luma
@@ -109,27 +151,30 @@ pub fn bgr_to_hsv_planes(
 /// expression `Y = 0.299·R + 0.587·G + 0.114·B`. The coefficients sum to
 /// exactly 256, so the output is always in `[0, 255]`.
 ///
+/// Source is interpreted as **BGR** byte order. For RGB-ordered input,
+/// call [`bgr_to_luma_with_order`].
+///
+/// Signature-compatible with the pre-`ChannelOrder` releases; existing
+/// callers compile unchanged.
+///
 /// # Arguments
 ///
 /// - `out`: destination luma plane; must be at least `width * height`
 ///   bytes. Row `y` starts at byte offset `y * width`.
-/// - `src`: source BGR buffer; must be at least `stride * height` bytes.
-///   Row `y` starts at byte offset `y * stride`; within each row, pixel
-///   `x` occupies bytes `x*3 .. x*3 + 3` in the order `B, G, R`.
+/// - `src`: source packed 3-byte-per-pixel buffer (BGR order); must be
+///   at least `stride * height` bytes. Row `y` starts at byte offset
+///   `y * stride`; within each row, pixel `x` occupies bytes
+///   `x*3 .. x*3 + 3`.
 /// - `width`, `height`: frame dimensions in pixels.
 /// - `stride`: source row stride in bytes (must satisfy `stride >= 3 *
 ///   width`).
-/// - `use_simd`: `true` to dispatch to the best available SIMD backend
-///   (aarch64 NEON today; x86 SSSE3/AVX2 and wasm-simd128 in follow-up
-///   commits); `false` forces the scalar fallback.
+/// - `use_simd`: `true` to dispatch to the best available SIMD backend;
+///   `false` forces the scalar fallback.
 ///
 /// # Panics
 ///
 /// Panics in **all** builds if the slice lengths are too short for the
-/// declared dimensions, or if `stride < 3 * width`. The SIMD backends
-/// use unchecked pointer loads/stores; validating up front prevents
-/// callers from reaching those unchecked memory accesses from safe
-/// Rust.
+/// declared dimensions, or if `stride < 3 * width`.
 #[inline]
 pub fn bgr_to_luma(
   out: &mut [u8],
@@ -137,6 +182,29 @@ pub fn bgr_to_luma(
   width: u32,
   height: u32,
   stride: u32,
+  use_simd: bool,
+) {
+  bgr_to_luma_with_order(out, src, width, height, stride, ChannelOrder::Bgr, use_simd);
+}
+
+/// Order-aware variant of [`bgr_to_luma`].
+///
+/// `src` carries either **BGR** or **RGB** byte order per the
+/// `order` parameter — `ChannelOrder::Bgr` reads `(B, G, R)`
+/// at byte positions 0/1/2 per pixel, `ChannelOrder::Rgb`
+/// reads `(R, G, B)`. Coefficients `(29, 150, 77)` stay
+/// pinned to the symbolic `(B, G, R)` channels; the dispatch
+/// just routes the correct byte through. The legacy BGR-only
+/// [`bgr_to_luma`] shim above forwards to this with
+/// `ChannelOrder::Bgr`.
+#[inline]
+pub fn bgr_to_luma_with_order(
+  out: &mut [u8],
+  src: &[u8],
+  width: u32,
+  height: u32,
+  stride: u32,
+  order: ChannelOrder,
   use_simd: bool,
 ) {
   let w = width as usize;
@@ -165,7 +233,7 @@ pub fn bgr_to_luma(
     out.len()
   );
 
-  crate::arch::bgr_to_luma(out, src, width, height, stride, use_simd);
+  crate::arch::bgr_to_luma(out, src, width, height, stride, order, use_simd);
 }
 
 #[cfg(all(test, feature = "std"))]
@@ -188,7 +256,15 @@ mod tests {
     let (w, h) = (8, 4);
     let src = vec![0u8; w * h * 3];
     let mut out = vec![255u8; w * h];
-    bgr_to_luma(&mut out, &src, w as u32, h as u32, (w * 3) as u32, false);
+    bgr_to_luma_with_order(
+      &mut out,
+      &src,
+      w as u32,
+      h as u32,
+      (w * 3) as u32,
+      ChannelOrder::Bgr,
+      false,
+    );
     assert!(
       out.iter().all(|&y| y == 0),
       "black frame should be all zero"
@@ -200,7 +276,15 @@ mod tests {
     let (w, h) = (8, 4);
     let src = vec![255u8; w * h * 3];
     let mut out = vec![0u8; w * h];
-    bgr_to_luma(&mut out, &src, w as u32, h as u32, (w * 3) as u32, false);
+    bgr_to_luma_with_order(
+      &mut out,
+      &src,
+      w as u32,
+      h as u32,
+      (w * 3) as u32,
+      ChannelOrder::Bgr,
+      false,
+    );
     // 77 + 150 + 29 = 256; (256*255) >> 8 = 255.
     assert!(out.iter().all(|&y| y == 255), "white frame should saturate");
   }
@@ -215,15 +299,15 @@ mod tests {
 
     let mut out = [0u8; 1];
 
-    bgr_to_luma(&mut out, &red_bgr, 1, 1, 3, false);
+    bgr_to_luma_with_order(&mut out, &red_bgr, 1, 1, 3, ChannelOrder::Bgr, false);
     // 77 * 255 / 256 = 76
     assert_eq!(out[0], 76);
 
-    bgr_to_luma(&mut out, &green_bgr, 1, 1, 3, false);
+    bgr_to_luma_with_order(&mut out, &green_bgr, 1, 1, 3, ChannelOrder::Bgr, false);
     // 150 * 255 / 256 = 149
     assert_eq!(out[0], 149);
 
-    bgr_to_luma(&mut out, &blue_bgr, 1, 1, 3, false);
+    bgr_to_luma_with_order(&mut out, &blue_bgr, 1, 1, 3, ChannelOrder::Bgr, false);
     // 29 * 255 / 256 = 28
     assert_eq!(out[0], 28);
   }
@@ -241,9 +325,38 @@ mod tests {
       src[x * 3 + 2] = 255;
     }
     let mut out = vec![0u8; w * h];
-    bgr_to_luma(&mut out, &src, w as u32, h as u32, stride as u32, false);
+    bgr_to_luma_with_order(
+      &mut out,
+      &src,
+      w as u32,
+      h as u32,
+      stride as u32,
+      ChannelOrder::Bgr,
+      false,
+    );
     assert!(out[..w].iter().all(|&y| y == 255));
     assert!(out[w..].iter().all(|&y| y == 0));
+  }
+
+  #[test]
+  fn rgb_to_luma_swaps_red_and_blue_coefficients() {
+    // For the same pixel value, RGB ordering swaps which channel
+    // gets the 29-weight (B) and the 77-weight (R). Pure-channel
+    // probes round-trip through the kernel exactly.
+    let red_rgb = [255u8, 0, 0]; // R first
+    let green_rgb = [0u8, 255, 0];
+    let blue_rgb = [0u8, 0, 255];
+
+    let mut out = [0u8; 1];
+
+    bgr_to_luma_with_order(&mut out, &red_rgb, 1, 1, 3, ChannelOrder::Rgb, false);
+    assert_eq!(out[0], 76, "RGB-red should weight by 77");
+
+    bgr_to_luma_with_order(&mut out, &green_rgb, 1, 1, 3, ChannelOrder::Rgb, false);
+    assert_eq!(out[0], 149, "RGB-green should weight by 150");
+
+    bgr_to_luma_with_order(&mut out, &blue_rgb, 1, 1, 3, ChannelOrder::Rgb, false);
+    assert_eq!(out[0], 28, "RGB-blue should weight by 29");
   }
 
   #[test]
@@ -252,7 +365,7 @@ mod tests {
     // stride=8 < width*3=24 — illegal.
     let mut out = vec![0u8; 8 * 2];
     let src = vec![0u8; 8 * 2];
-    bgr_to_luma(&mut out, &src, 8, 2, 8, false);
+    bgr_to_luma_with_order(&mut out, &src, 8, 2, 8, ChannelOrder::Bgr, false);
   }
 
   #[test]
@@ -261,7 +374,7 @@ mod tests {
     // src is only one row; declared height is 2.
     let mut out = vec![0u8; 4 * 2];
     let src = vec![0u8; 4 * 3]; // one row's worth
-    bgr_to_luma(&mut out, &src, 4, 2, 4 * 3, false);
+    bgr_to_luma_with_order(&mut out, &src, 4, 2, 4 * 3, ChannelOrder::Bgr, false);
   }
 
   #[test]
@@ -270,7 +383,7 @@ mod tests {
     // out half the size required.
     let mut out = vec![0u8; 4];
     let src = vec![0u8; 4 * 2 * 3];
-    bgr_to_luma(&mut out, &src, 4, 2, 4 * 3, false);
+    bgr_to_luma_with_order(&mut out, &src, 4, 2, 4 * 3, ChannelOrder::Bgr, false);
   }
 
   #[test]
@@ -280,7 +393,17 @@ mod tests {
     let mut s_out = vec![0u8; 16];
     let mut v_out = vec![0u8; 16];
     let src = vec![0u8; 16];
-    bgr_to_hsv_planes(&mut h_out, &mut s_out, &mut v_out, &src, 8, 2, 8, false);
+    bgr_to_hsv_planes_with_order(
+      &mut h_out,
+      &mut s_out,
+      &mut v_out,
+      &src,
+      8,
+      2,
+      8,
+      ChannelOrder::Bgr,
+      false,
+    );
   }
 
   #[test]
@@ -290,7 +413,17 @@ mod tests {
     let mut s_out = vec![0u8; 16];
     let mut v_out = vec![0u8; 16];
     let src = vec![0u8; 8 * 2 * 3];
-    bgr_to_hsv_planes(&mut h_out, &mut s_out, &mut v_out, &src, 8, 2, 8 * 3, false);
+    bgr_to_hsv_planes_with_order(
+      &mut h_out,
+      &mut s_out,
+      &mut v_out,
+      &src,
+      8,
+      2,
+      8 * 3,
+      ChannelOrder::Bgr,
+      false,
+    );
   }
 
   #[test]
@@ -301,7 +434,7 @@ mod tests {
     let mut ho = vec![0u8; w * h];
     let mut so = vec![0u8; w * h];
     let mut vo = vec![0u8; w * h];
-    bgr_to_hsv_planes(
+    bgr_to_hsv_planes_with_order(
       &mut ho,
       &mut so,
       &mut vo,
@@ -309,8 +442,56 @@ mod tests {
       w as u32,
       h as u32,
       (w * 3) as u32,
+      ChannelOrder::Bgr,
       false,
     );
     assert!(vo.iter().any(|&v| v > 0));
+  }
+
+  #[test]
+  fn rgb_to_hsv_planes_matches_swapped_bgr() {
+    // Construct random pixels, then run both orders with the
+    // bytes correspondingly swapped — outputs must match.
+    let (w, h) = (16, 4);
+    let bgr = make_bgr(w, h, 0xDEAD_BEEF);
+    let mut rgb = bgr.clone();
+    for chunk in rgb.chunks_exact_mut(3) {
+      chunk.swap(0, 2);
+    }
+
+    let n = w * h;
+    let mut h_bgr = vec![0u8; n];
+    let mut s_bgr = vec![0u8; n];
+    let mut v_bgr = vec![0u8; n];
+    bgr_to_hsv_planes_with_order(
+      &mut h_bgr,
+      &mut s_bgr,
+      &mut v_bgr,
+      &bgr,
+      w as u32,
+      h as u32,
+      (w * 3) as u32,
+      ChannelOrder::Bgr,
+      false,
+    );
+
+    let mut h_rgb = vec![0u8; n];
+    let mut s_rgb = vec![0u8; n];
+    let mut v_rgb = vec![0u8; n];
+    bgr_to_hsv_planes_with_order(
+      &mut h_rgb,
+      &mut s_rgb,
+      &mut v_rgb,
+      &rgb,
+      w as u32,
+      h as u32,
+      (w * 3) as u32,
+      ChannelOrder::Rgb,
+      false,
+    );
+
+    assert_eq!(h_bgr, h_rgb);
+    assert_eq!(s_bgr, s_rgb);
+    assert_eq!(v_bgr, v_rgb);
   }
 }
