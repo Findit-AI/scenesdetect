@@ -48,6 +48,13 @@ mod x86_ssse3;
 
 #[cfg(all(
   any(target_arch = "x86", target_arch = "x86_64"),
+  any(feature = "std", target_feature = "sse4.1"),
+  not(miri),
+))]
+mod x86_sse41;
+
+#[cfg(all(
+  any(target_arch = "x86", target_arch = "x86_64"),
   any(feature = "std", target_feature = "avx2"),
   not(miri),
 ))]
@@ -520,6 +527,10 @@ pub(crate) fn noise(
       // SAFETY: runtime-checked above.
       return unsafe { x86_avx2::noise(luma, width, height, stride) };
     }
+    if std::is_x86_feature_detected!("sse4.1") {
+      // SAFETY: runtime-checked above.
+      return unsafe { x86_sse41::noise(luma, width, height, stride) };
+    }
     if std::is_x86_feature_detected!("ssse3") {
       // SAFETY: runtime-checked above.
       return unsafe { x86_ssse3::noise(luma, width, height, stride) };
@@ -540,7 +551,20 @@ pub(crate) fn noise(
   #[cfg(all(
     any(target_arch = "x86", target_arch = "x86_64"),
     not(feature = "std"),
+    target_feature = "sse4.1",
+    not(target_feature = "avx2"),
+    not(miri),
+  ))]
+  {
+    // SAFETY: target feature enabled at compile time.
+    return unsafe { x86_sse41::noise(luma, width, height, stride) };
+  }
+
+  #[cfg(all(
+    any(target_arch = "x86", target_arch = "x86_64"),
+    not(feature = "std"),
     target_feature = "ssse3",
+    not(target_feature = "sse4.1"),
     not(target_feature = "avx2"),
     not(miri),
   ))]
@@ -619,6 +643,9 @@ pub(crate) fn gradient_anisotropy(
     if std::is_x86_feature_detected!("avx2") {
       return unsafe { x86_avx2::gradient_anisotropy(mag, dir, width, height) };
     }
+    if std::is_x86_feature_detected!("sse4.1") {
+      return unsafe { x86_sse41::gradient_anisotropy(mag, dir, width, height) };
+    }
     if std::is_x86_feature_detected!("ssse3") {
       return unsafe { x86_ssse3::gradient_anisotropy(mag, dir, width, height) };
     }
@@ -637,7 +664,19 @@ pub(crate) fn gradient_anisotropy(
   #[cfg(all(
     any(target_arch = "x86", target_arch = "x86_64"),
     not(feature = "std"),
+    target_feature = "sse4.1",
+    not(target_feature = "avx2"),
+    not(miri),
+  ))]
+  {
+    return unsafe { x86_sse41::gradient_anisotropy(mag, dir, width, height) };
+  }
+
+  #[cfg(all(
+    any(target_arch = "x86", target_arch = "x86_64"),
+    not(feature = "std"),
     target_feature = "ssse3",
+    not(target_feature = "sse4.1"),
     not(target_feature = "avx2"),
     not(miri),
   ))]
@@ -684,6 +723,9 @@ pub(crate) fn colorfulness(
     if std::is_x86_feature_detected!("avx2") {
       return unsafe { x86_avx2::colorfulness(bgr, width, height, stride) };
     }
+    if std::is_x86_feature_detected!("sse4.1") {
+      return unsafe { x86_sse41::colorfulness(bgr, width, height, stride) };
+    }
     if std::is_x86_feature_detected!("ssse3") {
       return unsafe { x86_ssse3::colorfulness(bgr, width, height, stride) };
     }
@@ -702,7 +744,19 @@ pub(crate) fn colorfulness(
   #[cfg(all(
     any(target_arch = "x86", target_arch = "x86_64"),
     not(feature = "std"),
+    target_feature = "sse4.1",
+    not(target_feature = "avx2"),
+    not(miri),
+  ))]
+  {
+    return unsafe { x86_sse41::colorfulness(bgr, width, height, stride) };
+  }
+
+  #[cfg(all(
+    any(target_arch = "x86", target_arch = "x86_64"),
+    not(feature = "std"),
     target_feature = "ssse3",
+    not(target_feature = "sse4.1"),
     not(target_feature = "avx2"),
     not(miri),
   ))]
@@ -1874,6 +1928,26 @@ mod tests {
 
   #[cfg(all(any(target_arch = "x86", target_arch = "x86_64"), feature = "std"))]
   #[test]
+  fn sse41_noise_matches_scalar() {
+    if !std::is_x86_feature_detected!("sse4.1") {
+      return;
+    }
+    assert_noise_equiv(10, 10, 10, |luma, w, h, s| unsafe {
+      x86_sse41::noise(luma, w, h, s)
+    });
+    assert_noise_equiv(11, 10, 11, |luma, w, h, s| unsafe {
+      x86_sse41::noise(luma, w, h, s)
+    });
+    assert_noise_equiv(24, 12, 64, |luma, w, h, s| unsafe {
+      x86_sse41::noise(luma, w, h, s)
+    });
+    assert_noise_equiv(257, 31, 257, |luma, w, h, s| unsafe {
+      x86_sse41::noise(luma, w, h, s)
+    });
+  }
+
+  #[cfg(all(any(target_arch = "x86", target_arch = "x86_64"), feature = "std"))]
+  #[test]
   fn avx2_noise_matches_scalar() {
     if !std::is_x86_feature_detected!("avx2") {
       return;
@@ -1976,6 +2050,26 @@ mod tests {
 
   #[cfg(all(any(target_arch = "x86", target_arch = "x86_64"), feature = "std"))]
   #[test]
+  fn sse41_colorfulness_matches_scalar() {
+    if !std::is_x86_feature_detected!("sse4.1") {
+      return;
+    }
+    assert_colorfulness_equiv(16, 12, 48, |bgr, w, h, s| unsafe {
+      x86_sse41::colorfulness(bgr, w, h, s)
+    });
+    assert_colorfulness_equiv(17, 12, 51, |bgr, w, h, s| unsafe {
+      x86_sse41::colorfulness(bgr, w, h, s)
+    });
+    assert_colorfulness_equiv(24, 9, 128, |bgr, w, h, s| unsafe {
+      x86_sse41::colorfulness(bgr, w, h, s)
+    });
+    assert_colorfulness_equiv(259, 17, 259 * 3, |bgr, w, h, s| unsafe {
+      x86_sse41::colorfulness(bgr, w, h, s)
+    });
+  }
+
+  #[cfg(all(any(target_arch = "x86", target_arch = "x86_64"), feature = "std"))]
+  #[test]
   fn avx2_colorfulness_matches_scalar() {
     if !std::is_x86_feature_detected!("avx2") {
       return;
@@ -2063,6 +2157,26 @@ mod tests {
     });
     assert_anisotropy_equiv(257, 31, |m, d, w, h| unsafe {
       x86_ssse3::gradient_anisotropy(m, d, w, h)
+    });
+  }
+
+  #[cfg(all(any(target_arch = "x86", target_arch = "x86_64"), feature = "std"))]
+  #[test]
+  fn sse41_gradient_anisotropy_matches_scalar() {
+    if !std::is_x86_feature_detected!("sse4.1") {
+      return;
+    }
+    assert_anisotropy_equiv(6, 6, |m, d, w, h| unsafe {
+      x86_sse41::gradient_anisotropy(m, d, w, h)
+    });
+    assert_anisotropy_equiv(7, 6, |m, d, w, h| unsafe {
+      x86_sse41::gradient_anisotropy(m, d, w, h)
+    });
+    assert_anisotropy_equiv(11, 10, |m, d, w, h| unsafe {
+      x86_sse41::gradient_anisotropy(m, d, w, h)
+    });
+    assert_anisotropy_equiv(257, 31, |m, d, w, h| unsafe {
+      x86_sse41::gradient_anisotropy(m, d, w, h)
     });
   }
 
