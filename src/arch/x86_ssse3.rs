@@ -1148,8 +1148,6 @@ pub(super) unsafe fn colorfulness(bgr: &[u8], w: usize, h: usize, stride: usize)
   (sigma_rgyb + 0.3 * mu_rgyb) as f32
 }
 
-/// SSSE3 single-pass `(mean, variance)` on a u8 plane.
-///
 /// SSSE3 magnitude-weighted gradient-direction anisotropy.
 ///
 /// Builds `hist[k] = Σ mag[p] where dir[p] & 3 == k` over the
@@ -1175,11 +1173,11 @@ pub(super) unsafe fn colorfulness(bgr: &[u8], w: usize, h: usize, stride: usize)
 /// Bin accumulator overflow: `mag` is `i32` (peak `≈ 2.1·10⁹`).
 /// Even on a 4K×2K interior (`~8·10⁶` pixels), a single bin can
 /// hold at most `~1.7·10¹⁶`, well inside `i64::MAX ≈ 9.2·10¹⁸`,
-/// so we drop the scalar's defensive `saturating_add` in favour
-/// of wrapping ops with no behavioural change for any realistic
-/// input. The tail loop matches the scalar reference exactly so
-/// SIMD / scalar agreement is bitwise-determined by the hist
-/// values.
+/// so the vector path uses non-saturating adds with no behavioural
+/// change for any realistic input. The scalar tail keeps the
+/// reference implementation's defensive `saturating_add`; under
+/// the same no-overflow bound, SIMD / scalar agreement is still
+/// bitwise-determined by the hist values.
 ///
 /// # Safety
 ///
