@@ -1086,6 +1086,28 @@ pub(crate) fn plane_mean_variance(
   scalar::Scalar::plane_mean_variance(plane, width, height, stride)
 }
 
+/// Shared final-reduce for `gradient_anisotropy` histograms. Every
+/// backend builds a `[u64; 4]` direction histogram with per-pixel
+/// `saturating_add`, so each bin is in `[0, u64::MAX]`. The four-bin
+/// total can exceed `u64::MAX` (4 × u64::MAX) — `hist.iter().sum::<u64>()`
+/// would panic in debug builds and wrap in release builds, making
+/// `max_bin / total` exceed 1 and pushing the score outside its
+/// documented `[0, 1]` contract. Use `u128` for the total (4 × u64
+/// always fits in u128), and `.min(1.0)` after normalisation as
+/// defense-in-depth against f64 rounding at the boundary.
+#[inline(always)]
+pub(crate) fn gradient_anisotropy_score_from_hist(hist: &[u64; 4]) -> f32 {
+  let total: u128 = hist.iter().map(|&x| x as u128).sum();
+  if total == 0 {
+    return 0.0;
+  }
+  let max_bin = *hist.iter().max().expect("4 bins") as f64;
+  let total_f = total as f64;
+  let frac = max_bin / total_f;
+  // Normalise so [0.25, 1.0] maps to [0.0, 1.0]; clamp on both sides.
+  (((frac - 0.25).max(0.0) / 0.75).min(1.0)) as f32
+}
+
 // -----------------------------------------------------------------------------
 // Scalar implementation — used as the fallback on non-aarch64 targets and
 // as the reference for the single-pixel helper everywhere.
@@ -1411,15 +1433,7 @@ mod scalar {
           hist[d] = hist[d].saturating_add(m as u64);
         }
       }
-      let total: u64 = hist.iter().sum();
-      if total == 0 {
-        return 0.0;
-      }
-      let max_bin = *hist.iter().max().expect("4 bins") as f64;
-      let total_f = total as f64;
-      let frac = max_bin / total_f;
-      // Normalise so [0.25, 1.0] maps to [0.0, 1.0]; clamp below.
-      ((frac - 0.25).max(0.0) / 0.75) as f32
+      super::gradient_anisotropy_score_from_hist(&hist)
     }
 
     /// Hasler-Süßstrunk colourfulness metric on packed 24-bit BGR.
@@ -3094,6 +3108,51 @@ mod tests {
         "scalar dispatcher panicked instead of short-circuiting on {w}x{h}"
       );
     }
+  }
+
+  #[test]
+  fn gradient_anisotropy_score_from_hist_multi_bin_saturation_stays_in_contract() {
+    // The per-pixel sum into each bin uses `saturating_add`, so each
+    // of the four bins can independently reach `u64::MAX`. The naive
+    // `hist.iter().sum::<u64>()` reduction panicked in debug builds
+    // and wrapped in release builds the moment two bins saturated,
+    // making `max_bin / total` exceed 1 and pushing the score
+    // outside its documented `[0, 1]` contract. Verify the shared
+    // reducer stays within the contract for every shape of saturated
+    // histogram.
+    let max = u64::MAX;
+    let cases: &[([u64; 4], &str)] = &[
+      ([0, 0, 0, 0], "all zero"),
+      ([max, 0, 0, 0], "one bin saturated"),
+      ([max, max, 0, 0], "two bins saturated — overflow case"),
+      ([max, max, max, 0], "three bins saturated"),
+      ([max, max, max, max], "all four bins saturated"),
+      ([max, max / 2, max / 4, max / 8], "uneven near-saturation"),
+    ];
+    for (hist, label) in cases {
+      let score = gradient_anisotropy_score_from_hist(hist);
+      assert!(
+        score.is_finite(),
+        "score must be finite for {label}, got {score}"
+      );
+      assert!(
+        (0.0..=1.0).contains(&score),
+        "score must be in [0, 1] for {label}, got {score}"
+      );
+    }
+  }
+
+  #[test]
+  fn gradient_anisotropy_score_from_hist_matches_documented_endpoints() {
+    // Uniform (all bins equal) → frac = 0.25 → score = 0.
+    assert_eq!(
+      gradient_anisotropy_score_from_hist(&[100, 100, 100, 100]),
+      0.0
+    );
+    // Single bin → frac = 1.0 → score = 1.0.
+    assert_eq!(gradient_anisotropy_score_from_hist(&[100, 0, 0, 0]), 1.0);
+    // Empty histogram → 0.0 (uniform-luma fallback).
+    assert_eq!(gradient_anisotropy_score_from_hist(&[0, 0, 0, 0]), 0.0);
   }
 
   // ---- plane_mean_variance --------------------------------------------------

@@ -1173,14 +1173,7 @@ pub(super) unsafe fn gradient_anisotropy(mag: &[i32], dir: &[u8], w: usize, h: u
     hist[bin_idx] = hist[bin_idx].saturating_add(bin_sum as u64);
   }
 
-  let total: u64 = hist.iter().sum();
-  if total == 0 {
-    return 0.0;
-  }
-  let max_bin = *hist.iter().max().expect("4 bins") as f64;
-  let total_f = total as f64;
-  let frac = max_bin / total_f;
-  ((frac - 0.25).max(0.0) / 0.75) as f32
+  super::gradient_anisotropy_score_from_hist(&hist)
 }
 
 /// wasm single-pass `(mean, variance)` on a u8 plane.
