@@ -18,3 +18,8 @@
 Cargo.lock
 
 **.claude/
+
+# Local plan / spec scratchpad — kept out of the public repo so the
+# crate's docs surface stays the rendered rustdoc rather than these
+# working notes.
+docs/

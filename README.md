@@ -23,7 +23,7 @@ A Rust port of [PySceneDetect](https://github.com/Breakthrough/PySceneDetect) �
 
 Timestamps are represented as raw integer `pts + Timebase` (matching FFmpeg's `AVRational`) rather than floating-point seconds, so all arithmetic is exact and cross-stream comparisons are unambiguous.
 
-## Detectors
+## Cut detectors
 
 | Module | Algorithm | Good for |
 |---|---|---|
@@ -39,10 +39,45 @@ Timestamps are represented as raw integer `pts + Timebase` (matching FFmpeg's `A
 [`content`]: https://docs.rs/scenesdetect/latest/scenesdetect/content/
 [`adaptive`]: https://docs.rs/scenesdetect/latest/scenesdetect/adaptive/
 
+## Keyframe selection
+
+The [`keyframe`] module scores each frame on several quality axes and
+picks one best-frame timestamp per shot via a composite argmax with
+adaptive hard-gate floors. Each detector is its own pure-algo state
+machine, so callers can compose only the metrics they need.
+
+| Module | Metric | What it measures |
+|---|---|---|
+| [`keyframe::luma`] | mean + variance | Underexposed / blown frames |
+| [`keyframe::clipping`] | crushed-or-blown pixel fraction | Detail loss in shadows/highlights |
+| [`keyframe::saturation`] | HSV S-plane variance | Flat-colour frames |
+| [`keyframe::sharpness`] | Tenengrad (3×3 Sobel on luma) | Focus / blur |
+| [`keyframe::noise`] | Immerkaer fast σₙ | Sensor / compression noise |
+| [`keyframe::motion_blur`] | Gradient direction anisotropy | Camera-motion smear |
+| [`keyframe::colorfulness`] | Hasler-Süßstrunk colourfulness | Perceptual colour richness |
+| [`keyframe::select`] | composite argmax + adaptive floor | One keyframe per shot |
+
+Inputs are either an `RgbFrame` (BGR or RGB — pick via
+`Options::with_channel_order`) or pre-converted `LumaFrame` /
+`HsvFrame`. [`keyframe::preprocess`] exposes scratch-owning
+`Downscaler`, `LumaConverter`, and `HsvConverter` helpers for the
+typical streaming case.
+
+[`keyframe`]: https://docs.rs/scenesdetect/latest/scenesdetect/keyframe/
+[`keyframe::luma`]: https://docs.rs/scenesdetect/latest/scenesdetect/keyframe/luma/
+[`keyframe::clipping`]: https://docs.rs/scenesdetect/latest/scenesdetect/keyframe/clipping/
+[`keyframe::saturation`]: https://docs.rs/scenesdetect/latest/scenesdetect/keyframe/saturation/
+[`keyframe::sharpness`]: https://docs.rs/scenesdetect/latest/scenesdetect/keyframe/sharpness/
+[`keyframe::noise`]: https://docs.rs/scenesdetect/latest/scenesdetect/keyframe/noise/
+[`keyframe::motion_blur`]: https://docs.rs/scenesdetect/latest/scenesdetect/keyframe/motion_blur/
+[`keyframe::colorfulness`]: https://docs.rs/scenesdetect/latest/scenesdetect/keyframe/colorfulness/
+[`keyframe::select`]: https://docs.rs/scenesdetect/latest/scenesdetect/keyframe/select/
+[`keyframe::preprocess`]: https://docs.rs/scenesdetect/latest/scenesdetect/keyframe/preprocess/
+
 ## Features
 
 - **Sans-I/O streaming API** — hand in `LumaFrame` / `RgbFrame` / `HsvFrame` (zero-copy slices), get `Option<Timestamp>` back per frame. No allocation on the hot path once the detector is primed.
-- **Hand-written SIMD backends** — aarch64 NEON, x86 SSSE3 + AVX2 (runtime-dispatched via `is_x86_feature_detected!`), and wasm `simd128`. All with scalar fallbacks, toggleable per-detector via `Options::with_simd(false)`.
+- **Hand-written SIMD backends** — aarch64 NEON, x86 SSSE3 / SSE4.1 / AVX2 (runtime-dispatched via `is_x86_feature_detected!`), and wasm `simd128`. All with scalar fallbacks, toggleable per-detector via `Options::with_simd(false)`.
 - **Exact rational timestamps** — `Timebase` mirrors FFmpeg's `AVRational`; `Timestamp` compares semantically across timebases via i128 cross-multiply.
 - **`no_std` + `alloc`** — the crate builds without `std`; enable the default `std` feature for runtime x86 feature detection.
 - **Optional `serde`** — all `Options` types derive `Serialize` / `Deserialize` under the `serde` feature.
@@ -51,7 +86,7 @@ Timestamps are represented as raw integer `pts + Timebase` (matching FFmpeg's `A
 
 ```toml
 [dependencies]
-scenesdetect = "0.1"
+scenesdetect = "0.2"
 ```
 
 ## Crate features
