@@ -152,7 +152,8 @@ pub(super) unsafe fn noise(luma: &[u8], w: usize, h: usize, s: usize) -> f32 {
   (((vec_sum + tail_acc) as f64) * super::NOISE_COEFF / (interior as f64)) as f32
 }
 
-/// SSE4.1 Hasler-Süßstrunk colourfulness on packed 24-bit BGR.
+/// SSE4.1 Hasler-Süßstrunk colourfulness on packed 24-bit BGR or RGB
+/// (selected at runtime by `order: ChannelOrder`).
 ///
 /// Algorithm matches the SSSE3 backend. SSE4.1 changes:
 /// `_mm_cvtepu8_epi16(v)` replaces `_mm_unpacklo_epi8(v, zero)`
@@ -169,7 +170,7 @@ pub(super) unsafe fn noise(luma: &[u8], w: usize, h: usize, s: usize) -> f32 {
 #[target_feature(enable = "sse4.1", enable = "ssse3")]
 #[allow(unused_unsafe)]
 pub(super) unsafe fn colorfulness(
-  bgr: &[u8],
+  src: &[u8],
   w: usize,
   h: usize,
   stride: usize,
@@ -230,7 +231,7 @@ pub(super) unsafe fn colorfulness(
 
     let mut x = 0;
     while x < whole {
-      let p = unsafe { bgr.as_ptr().add(row_base + x * 3) };
+      let p = unsafe { src.as_ptr().add(row_base + x * 3) };
       let blk0 = unsafe { _mm_loadu_si128(p as *const __m128i) };
       let blk1 = unsafe { _mm_loadu_si128(p.add(16) as *const __m128i) };
       let blk2 = unsafe { _mm_loadu_si128(p.add(32) as *const __m128i) };
@@ -309,9 +310,9 @@ pub(super) unsafe fn colorfulness(
     }
 
     while x < w {
-      let b = bgr[row_base + x * 3 + b_off] as i32;
-      let g = bgr[row_base + x * 3 + 1] as i32;
-      let r = bgr[row_base + x * 3 + r_off] as i32;
+      let b = src[row_base + x * 3 + b_off] as i32;
+      let g = src[row_base + x * 3 + 1] as i32;
+      let r = src[row_base + x * 3 + r_off] as i32;
       let rg = r - g;
       let u = r + g - 2 * b;
       tail_sum_rg += rg as i64;

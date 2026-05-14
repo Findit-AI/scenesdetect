@@ -923,7 +923,7 @@ pub(crate) fn gradient_anisotropy(
 #[cfg_attr(not(tarpaulin), inline(always))]
 #[allow(unreachable_code)]
 pub(crate) fn colorfulness(
-  bgr: &[u8],
+  src: &[u8],
   width: usize,
   height: usize,
   stride: usize,
@@ -931,17 +931,17 @@ pub(crate) fn colorfulness(
   use_simd: bool,
 ) -> f32 {
   if !use_simd {
-    return scalar::Scalar::colorfulness(bgr, width, height, stride, order);
+    return scalar::Scalar::colorfulness(src, width, height, stride, order);
   }
 
   #[cfg(all(target_arch = "aarch64", not(miri)))]
   {
-    return unsafe { neon::colorfulness(bgr, width, height, stride, order) };
+    return unsafe { neon::colorfulness(src, width, height, stride, order) };
   }
 
   #[cfg(all(target_arch = "wasm32", target_feature = "simd128", not(miri)))]
   {
-    return unsafe { wasm_simd128::colorfulness(bgr, width, height, stride, order) };
+    return unsafe { wasm_simd128::colorfulness(src, width, height, stride, order) };
   }
 
   #[cfg(all(
@@ -952,14 +952,14 @@ pub(crate) fn colorfulness(
   {
     if std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("ssse3") {
       // SAFETY: runtime-checked above. AVX2 colorfulness uses
-      // 128-bit SSSE3 `pshufb` for the BGR deinterleave.
-      return unsafe { x86_avx2::colorfulness(bgr, width, height, stride, order) };
+      // 128-bit SSSE3 `pshufb` for the BGR/RGB deinterleave.
+      return unsafe { x86_avx2::colorfulness(src, width, height, stride, order) };
     }
     if std::is_x86_feature_detected!("sse4.1") && std::is_x86_feature_detected!("ssse3") {
-      return unsafe { x86_sse41::colorfulness(bgr, width, height, stride, order) };
+      return unsafe { x86_sse41::colorfulness(src, width, height, stride, order) };
     }
     if std::is_x86_feature_detected!("ssse3") {
-      return unsafe { x86_ssse3::colorfulness(bgr, width, height, stride, order) };
+      return unsafe { x86_ssse3::colorfulness(src, width, height, stride, order) };
     }
   }
 
@@ -971,7 +971,7 @@ pub(crate) fn colorfulness(
     not(miri),
   ))]
   {
-    return unsafe { x86_avx2::colorfulness(bgr, width, height, stride, order) };
+    return unsafe { x86_avx2::colorfulness(src, width, height, stride, order) };
   }
 
   #[cfg(all(
@@ -983,7 +983,7 @@ pub(crate) fn colorfulness(
     not(miri),
   ))]
   {
-    return unsafe { x86_sse41::colorfulness(bgr, width, height, stride, order) };
+    return unsafe { x86_sse41::colorfulness(src, width, height, stride, order) };
   }
 
   #[cfg(all(
@@ -995,10 +995,10 @@ pub(crate) fn colorfulness(
     not(miri),
   ))]
   {
-    return unsafe { x86_ssse3::colorfulness(bgr, width, height, stride, order) };
+    return unsafe { x86_ssse3::colorfulness(src, width, height, stride, order) };
   }
 
-  scalar::Scalar::colorfulness(bgr, width, height, stride, order)
+  scalar::Scalar::colorfulness(src, width, height, stride, order)
 }
 
 /// Population mean and variance of a single-plane `u8` image. Honours
@@ -1450,7 +1450,7 @@ mod scalar {
     /// `σ_rgyb = √(σ²_rg + σ²_yb)` and `μ_rgyb = √(μ²_rg + μ²_yb)`.
     /// Empty inputs return 0.
     pub(super) fn colorfulness(
-      bgr: &[u8],
+      src: &[u8],
       w: usize,
       h: usize,
       stride: usize,
@@ -1475,8 +1475,9 @@ mod scalar {
       let mut k: u64 = 0;
 
       for y in 0..h {
-        let row = &bgr[y * stride..y * stride + w * 3];
-        // BGR packed: row[3i + b_off] = B, row[3i+1] = G, row[3i + r_off] = R.
+        let row = &src[y * stride..y * stride + w * 3];
+        // Packed pixels: row[3i + b_off] = B, row[3i+1] = G, row[3i + r_off] = R.
+        // `b_off` / `r_off` swap above to abstract the BGR vs RGB byte layout.
         for i in 0..w {
           let b = row[3 * i + b_off] as f64;
           let g = row[3 * i + 1] as f64;

@@ -78,9 +78,20 @@ pub(super) unsafe fn bgr_to_hsv_planes(
   let s = stride as usize;
   let whole = w / LANES * LANES;
 
-  // Channel-order branching: BGR keeps the BLK*_B masks gathering blue;
-  // RGB swaps the B/R mask roles so the "b" symbolic channel reads the
-  // R position and vice versa. The kernel math then runs unchanged.
+  // Channel-order branching. The mask-table names (`BLK*_B` / `BLK*_R`)
+  // reference BYTE POSITIONS in the legacy BGR layout: `*_B` extracts
+  // byte 0 of each pixel triplet, `*_R` extracts byte 2. The kernel
+  // always wants the SEMANTIC `(B, G, R)` channels regardless of input
+  // order — only the table → channel routing changes:
+  //
+  // - BGR input: byte 0 = B, byte 2 = R → use `BLK*_B` for `m_b*` and
+  //   `BLK*_R` for `m_r*`.
+  // - RGB input: byte 0 = R, byte 2 = B → swap the routing so `m_b*`
+  //   (semantic blue) is loaded from `BLK*_R` (byte 2) and `m_r*`
+  //   (semantic red) is loaded from `BLK*_B` (byte 0).
+  //
+  // The kernel math then runs unchanged on the symbolic `(b, g, r)`
+  // lanes.
   let (m_b0, m_b1, m_b2, m_r0, m_r1, m_r2) = match order {
     ChannelOrder::Bgr => unsafe {
       (
@@ -487,12 +498,14 @@ pub(super) unsafe fn bgr_to_luma(
   let s = stride as usize;
   let whole = w / LANES * LANES;
 
-  // Channel-order branching: same pattern as bgr_to_hsv_planes. The
-  // BT.601 coefficients (k_b=29, k_g=150, k_r=77) stay attached to
-  // the symbolic b/g/r channels — once the mask routing is swapped,
-  // the symbolic "b" reads from the input's R position (for RGB
-  // input) and the coefficient is the blue weight 29, applied to
-  // the real blue lane.
+  // Channel-order branching: same pattern as bgr_to_hsv_planes — the
+  // mask-table names (`BLK*_B` / `BLK*_R`) reference byte positions in
+  // the legacy BGR layout (`*_B` = byte 0, `*_R` = byte 2); the kernel
+  // wants the semantic `(B, G, R)` channels regardless of input order,
+  // so for RGB we swap the table → channel routing (`m_b*` ← `BLK*_R`,
+  // `m_r*` ← `BLK*_B`). The BT.601 coefficients (`k_b=29`, `k_g=150`,
+  // `k_r=77`) stay attached to the SEMANTIC `b`/`g`/`r` lanes — the
+  // blue weight 29 always multiplies the actual blue channel.
   let (m_b0, m_b1, m_b2, m_r0, m_r1, m_r2) = match order {
     ChannelOrder::Bgr => unsafe {
       (
@@ -999,7 +1012,8 @@ pub(super) unsafe fn noise(luma: &[u8], w: usize, h: usize, s: usize) -> f32 {
   (((vec_sum + tail_acc) as f64) * super::NOISE_COEFF / (interior as f64)) as f32
 }
 
-/// SSSE3 Hasler-Süßstrunk colourfulness on packed 24-bit BGR.
+/// SSSE3 Hasler-Süßstrunk colourfulness on packed 24-bit BGR or RGB
+/// (selected at runtime by `order: ChannelOrder`).
 ///
 /// The scalar reference uses Welford-streaming f64 moments. We
 /// trade that for an exact-integer two-pass formulation that's
@@ -1041,7 +1055,7 @@ pub(super) unsafe fn noise(luma: &[u8], w: usize, h: usize, s: usize) -> f32 {
 #[target_feature(enable = "ssse3")]
 #[allow(unused_unsafe)]
 pub(super) unsafe fn colorfulness(
-  bgr: &[u8],
+  src: &[u8],
   w: usize,
   h: usize,
   stride: usize,
@@ -1108,7 +1122,7 @@ pub(super) unsafe fn colorfulness(
 
     let mut x = 0;
     while x < whole {
-      let p = unsafe { bgr.as_ptr().add(row_base + x * 3) };
+      let p = unsafe { src.as_ptr().add(row_base + x * 3) };
       let blk0 = unsafe { _mm_loadu_si128(p as *const __m128i) };
       let blk1 = unsafe { _mm_loadu_si128(p.add(16) as *const __m128i) };
       let blk2 = unsafe { _mm_loadu_si128(p.add(32) as *const __m128i) };
@@ -1190,9 +1204,9 @@ pub(super) unsafe fn colorfulness(
 
     // Scalar tail.
     while x < w {
-      let b = bgr[row_base + x * 3 + b_off] as i32;
-      let g = bgr[row_base + x * 3 + 1] as i32;
-      let r = bgr[row_base + x * 3 + r_off] as i32;
+      let b = src[row_base + x * 3 + b_off] as i32;
+      let g = src[row_base + x * 3 + 1] as i32;
+      let r = src[row_base + x * 3 + r_off] as i32;
       let rg = r - g;
       let u = r + g - 2 * b;
       tail_sum_rg += rg as i64;

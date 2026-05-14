@@ -741,7 +741,8 @@ pub(super) unsafe fn noise(luma: &[u8], w: usize, h: usize, s: usize) -> f32 {
   ((total as f64) * super::NOISE_COEFF / (interior as f64)) as f32
 }
 
-/// NEON Hasler-Süßstrunk colourfulness on packed 24-bit BGR.
+/// NEON Hasler-Süßstrunk colourfulness on packed 24-bit BGR or RGB
+/// (selected at runtime by `order: ChannelOrder`).
 ///
 /// Same integer two-pass formulation as the SSSE3 backend
 /// (sum / sum-of-squares per `rg = R-G` and `u = R+G-2B`, with
@@ -771,7 +772,7 @@ pub(super) unsafe fn noise(luma: &[u8], w: usize, h: usize, s: usize) -> f32 {
 #[target_feature(enable = "neon")]
 #[allow(unused_unsafe)]
 pub(super) unsafe fn colorfulness(
-  bgr: &[u8],
+  src: &[u8],
   w: usize,
   h: usize,
   stride: usize,
@@ -808,10 +809,10 @@ pub(super) unsafe fn colorfulness(
 
     let mut x = 0;
     while x < whole {
-      let bgr_v = unsafe { vld3q_u8(bgr.as_ptr().add(row_base + x * 3)) };
+      let pix = unsafe { vld3q_u8(src.as_ptr().add(row_base + x * 3)) };
       let (b, g, r) = match order {
-        ChannelOrder::Bgr => (bgr_v.0, bgr_v.1, bgr_v.2),
-        ChannelOrder::Rgb => (bgr_v.2, bgr_v.1, bgr_v.0),
+        ChannelOrder::Bgr => (pix.0, pix.1, pix.2),
+        ChannelOrder::Rgb => (pix.2, pix.1, pix.0),
       };
 
       // Low halves.
@@ -879,9 +880,9 @@ pub(super) unsafe fn colorfulness(
 
     // Scalar tail.
     while x < w {
-      let b = bgr[row_base + x * 3 + b_off] as i32;
-      let g = bgr[row_base + x * 3 + 1] as i32;
-      let r = bgr[row_base + x * 3 + r_off] as i32;
+      let b = src[row_base + x * 3 + b_off] as i32;
+      let g = src[row_base + x * 3 + 1] as i32;
+      let r = src[row_base + x * 3 + r_off] as i32;
       let rg = r - g;
       let u = r + g - 2 * b;
       tail_sum_rg += rg as i64;
