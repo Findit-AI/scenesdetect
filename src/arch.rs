@@ -31,6 +31,8 @@
 // Detector tests then still run under Miri (validating memory safety of
 // the full pipeline) without hitting unsupported operations.
 
+use crate::frame::ChannelOrder;
+
 #[cfg(all(target_arch = "aarch64", not(miri)))]
 mod neon;
 
@@ -86,10 +88,13 @@ pub(crate) fn bgr_to_hsv_planes(
   width: u32,
   height: u32,
   stride: u32,
+  order: ChannelOrder,
   use_simd: bool,
 ) {
   if !use_simd {
-    return scalar::Scalar::bgr_to_hsv_planes(h_out, s_out, v_out, src, width, height, stride);
+    return scalar::Scalar::bgr_to_hsv_planes(
+      h_out, s_out, v_out, src, width, height, stride, order,
+    );
   }
 
   #[cfg(all(target_arch = "aarch64", not(miri)))]
@@ -97,7 +102,7 @@ pub(crate) fn bgr_to_hsv_planes(
     // SAFETY: NEON is part of the base ARMv8-A ISA — every aarch64 Rust
     // target has it. No runtime feature detection required.
     unsafe {
-      neon::bgr_to_hsv_planes(h_out, s_out, v_out, src, width, height, stride);
+      neon::bgr_to_hsv_planes(h_out, s_out, v_out, src, width, height, stride, order);
     }
     return;
   }
@@ -106,7 +111,7 @@ pub(crate) fn bgr_to_hsv_planes(
   {
     // SAFETY: simd128 target feature enabled at compile time.
     unsafe {
-      wasm_simd128::bgr_to_hsv_planes(h_out, s_out, v_out, src, width, height, stride);
+      wasm_simd128::bgr_to_hsv_planes(h_out, s_out, v_out, src, width, height, stride, order);
     }
     return;
   }
@@ -122,21 +127,21 @@ pub(crate) fn bgr_to_hsv_planes(
       // SAFETY: runtime-checked above. AVX2 implies SSSE3 at the hardware
       // level; the callee is annotated with both target features.
       unsafe {
-        x86_avx2::bgr_to_hsv_planes(h_out, s_out, v_out, src, width, height, stride);
+        x86_avx2::bgr_to_hsv_planes(h_out, s_out, v_out, src, width, height, stride, order);
       }
       return;
     }
     if std::is_x86_feature_detected!("sse4.1") {
       // SAFETY: runtime-checked above.
       unsafe {
-        x86_sse41::bgr_to_hsv_planes(h_out, s_out, v_out, src, width, height, stride);
+        x86_sse41::bgr_to_hsv_planes(h_out, s_out, v_out, src, width, height, stride, order);
       }
       return;
     }
     if std::is_x86_feature_detected!("ssse3") {
       // SAFETY: runtime-checked above.
       unsafe {
-        x86_ssse3::bgr_to_hsv_planes(h_out, s_out, v_out, src, width, height, stride);
+        x86_ssse3::bgr_to_hsv_planes(h_out, s_out, v_out, src, width, height, stride, order);
       }
       return;
     }
@@ -152,7 +157,7 @@ pub(crate) fn bgr_to_hsv_planes(
   {
     // SAFETY: target feature enabled at compile time.
     unsafe {
-      x86_avx2::bgr_to_hsv_planes(h_out, s_out, v_out, src, width, height, stride);
+      x86_avx2::bgr_to_hsv_planes(h_out, s_out, v_out, src, width, height, stride, order);
     }
     return;
   }
@@ -166,7 +171,7 @@ pub(crate) fn bgr_to_hsv_planes(
   {
     // SAFETY: target feature enabled at compile time.
     unsafe {
-      x86_sse41::bgr_to_hsv_planes(h_out, s_out, v_out, src, width, height, stride);
+      x86_sse41::bgr_to_hsv_planes(h_out, s_out, v_out, src, width, height, stride, order);
     }
     return;
   }
@@ -181,13 +186,13 @@ pub(crate) fn bgr_to_hsv_planes(
   {
     // SAFETY: target feature enabled at compile time.
     unsafe {
-      x86_ssse3::bgr_to_hsv_planes(h_out, s_out, v_out, src, width, height, stride);
+      x86_ssse3::bgr_to_hsv_planes(h_out, s_out, v_out, src, width, height, stride, order);
     }
     return;
   }
 
   // Fallback.
-  scalar::Scalar::bgr_to_hsv_planes(h_out, s_out, v_out, src, width, height, stride);
+  scalar::Scalar::bgr_to_hsv_planes(h_out, s_out, v_out, src, width, height, stride, order);
 }
 
 /// Single-pixel scalar BGR → HSV, exposed for tests and for callers that
@@ -360,17 +365,18 @@ pub(crate) fn bgr_to_luma(
   width: u32,
   height: u32,
   stride: u32,
+  order: ChannelOrder,
   use_simd: bool,
 ) {
   if !use_simd {
-    return scalar::Scalar::bgr_to_luma(out, src, width, height, stride);
+    return scalar::Scalar::bgr_to_luma(out, src, width, height, stride, order);
   }
 
   #[cfg(all(target_arch = "aarch64", not(miri)))]
   {
     // SAFETY: NEON is part of the base ARMv8-A ISA.
     unsafe {
-      neon::bgr_to_luma(out, src, width, height, stride);
+      neon::bgr_to_luma(out, src, width, height, stride, order);
     }
     return;
   }
@@ -379,7 +385,7 @@ pub(crate) fn bgr_to_luma(
   {
     // SAFETY: simd128 target feature enabled at compile time.
     unsafe {
-      wasm_simd128::bgr_to_luma(out, src, width, height, stride);
+      wasm_simd128::bgr_to_luma(out, src, width, height, stride, order);
     }
     return;
   }
@@ -396,14 +402,14 @@ pub(crate) fn bgr_to_luma(
   {
     if std::is_x86_feature_detected!("sse4.1") {
       unsafe {
-        x86_sse41::bgr_to_luma(out, src, width, height, stride);
+        x86_sse41::bgr_to_luma(out, src, width, height, stride, order);
       }
       return;
     }
     if std::is_x86_feature_detected!("ssse3") {
       // SAFETY: runtime-checked above.
       unsafe {
-        x86_ssse3::bgr_to_luma(out, src, width, height, stride);
+        x86_ssse3::bgr_to_luma(out, src, width, height, stride, order);
       }
       return;
     }
@@ -418,7 +424,7 @@ pub(crate) fn bgr_to_luma(
   ))]
   {
     unsafe {
-      x86_sse41::bgr_to_luma(out, src, width, height, stride);
+      x86_sse41::bgr_to_luma(out, src, width, height, stride, order);
     }
     return;
   }
@@ -432,12 +438,12 @@ pub(crate) fn bgr_to_luma(
   {
     // SAFETY: target feature enabled at compile time.
     unsafe {
-      x86_ssse3::bgr_to_luma(out, src, width, height, stride);
+      x86_ssse3::bgr_to_luma(out, src, width, height, stride, order);
     }
     return;
   }
 
-  scalar::Scalar::bgr_to_luma(out, src, width, height, stride);
+  scalar::Scalar::bgr_to_luma(out, src, width, height, stride, order);
 }
 
 /// Counts pixels in a packed 24-bit BGR frame whose brightest channel
@@ -794,20 +800,21 @@ pub(crate) fn colorfulness(
   width: usize,
   height: usize,
   stride: usize,
+  order: ChannelOrder,
   use_simd: bool,
 ) -> f32 {
   if !use_simd {
-    return scalar::Scalar::colorfulness(bgr, width, height, stride);
+    return scalar::Scalar::colorfulness(bgr, width, height, stride, order);
   }
 
   #[cfg(all(target_arch = "aarch64", not(miri)))]
   {
-    return unsafe { neon::colorfulness(bgr, width, height, stride) };
+    return unsafe { neon::colorfulness(bgr, width, height, stride, order) };
   }
 
   #[cfg(all(target_arch = "wasm32", target_feature = "simd128", not(miri)))]
   {
-    return unsafe { wasm_simd128::colorfulness(bgr, width, height, stride) };
+    return unsafe { wasm_simd128::colorfulness(bgr, width, height, stride, order) };
   }
 
   #[cfg(all(
@@ -817,13 +824,13 @@ pub(crate) fn colorfulness(
   ))]
   {
     if std::is_x86_feature_detected!("avx2") {
-      return unsafe { x86_avx2::colorfulness(bgr, width, height, stride) };
+      return unsafe { x86_avx2::colorfulness(bgr, width, height, stride, order) };
     }
     if std::is_x86_feature_detected!("sse4.1") {
-      return unsafe { x86_sse41::colorfulness(bgr, width, height, stride) };
+      return unsafe { x86_sse41::colorfulness(bgr, width, height, stride, order) };
     }
     if std::is_x86_feature_detected!("ssse3") {
-      return unsafe { x86_ssse3::colorfulness(bgr, width, height, stride) };
+      return unsafe { x86_ssse3::colorfulness(bgr, width, height, stride, order) };
     }
   }
 
@@ -834,7 +841,7 @@ pub(crate) fn colorfulness(
     not(miri),
   ))]
   {
-    return unsafe { x86_avx2::colorfulness(bgr, width, height, stride) };
+    return unsafe { x86_avx2::colorfulness(bgr, width, height, stride, order) };
   }
 
   #[cfg(all(
@@ -845,7 +852,7 @@ pub(crate) fn colorfulness(
     not(miri),
   ))]
   {
-    return unsafe { x86_sse41::colorfulness(bgr, width, height, stride) };
+    return unsafe { x86_sse41::colorfulness(bgr, width, height, stride, order) };
   }
 
   #[cfg(all(
@@ -857,10 +864,10 @@ pub(crate) fn colorfulness(
     not(miri),
   ))]
   {
-    return unsafe { x86_ssse3::colorfulness(bgr, width, height, stride) };
+    return unsafe { x86_ssse3::colorfulness(bgr, width, height, stride, order) };
   }
 
-  scalar::Scalar::colorfulness(bgr, width, height, stride)
+  scalar::Scalar::colorfulness(bgr, width, height, stride, order)
 }
 
 /// Population mean and variance of a single-plane `u8` image. Honours
@@ -944,6 +951,7 @@ pub(crate) fn plane_mean_variance(
 // -----------------------------------------------------------------------------
 
 mod scalar {
+  use super::ChannelOrder;
   use crate::round_32;
 
   /// Zero-sized namespace for the scalar BGR→HSV kernels.
@@ -955,6 +963,7 @@ mod scalar {
     // On aarch64 the planar function is unused (NEON wins); keep it around
     // as a correctness reference.
     #[cfg_attr(target_arch = "aarch64", allow(dead_code))]
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn bgr_to_hsv_planes(
       h_out: &mut [u8],
       s_out: &mut [u8],
@@ -963,17 +972,22 @@ mod scalar {
       width: u32,
       height: u32,
       stride: u32,
+      order: ChannelOrder,
     ) {
       let w = width as usize;
       let h = height as usize;
       let s = stride as usize;
+      let (b_off, r_off) = match order {
+        ChannelOrder::Bgr => (0, 2),
+        ChannelOrder::Rgb => (2, 0),
+      };
       for y in 0..h {
         let row = &src[y * s..y * s + w * 3];
         let dst_off = y * w;
         for x in 0..w {
-          let b = row[x * 3] as f32;
+          let b = row[x * 3 + b_off] as f32;
           let g = row[x * 3 + 1] as f32;
-          let r = row[x * 3 + 2] as f32;
+          let r = row[x * 3 + r_off] as f32;
           let (hue, sat, val) = Self::bgr_to_hsv_pixel(b, g, r);
           h_out[dst_off + x] = hue;
           s_out[dst_off + x] = sat;
@@ -1058,19 +1072,30 @@ mod scalar {
     // On aarch64 the NEON path wins; keep this as the correctness
     // reference for tests and the fallback elsewhere.
     #[cfg_attr(target_arch = "aarch64", allow(dead_code))]
-    pub(super) fn bgr_to_luma(out: &mut [u8], src: &[u8], width: u32, height: u32, stride: u32) {
+    pub(super) fn bgr_to_luma(
+      out: &mut [u8],
+      src: &[u8],
+      width: u32,
+      height: u32,
+      stride: u32,
+      order: ChannelOrder,
+    ) {
       let w = width as usize;
       let h = height as usize;
       let s = stride as usize;
+      let (b_off, r_off) = match order {
+        ChannelOrder::Bgr => (0, 2),
+        ChannelOrder::Rgb => (2, 0),
+      };
       for y in 0..h {
         let row_off = y * s;
         let dst_off = y * w;
         let row = &src[row_off..row_off + w * 3];
         let dst = &mut out[dst_off..dst_off + w];
         for x in 0..w {
-          let b = row[x * 3] as u32;
+          let b = row[x * 3 + b_off] as u32;
           let g = row[x * 3 + 1] as u32;
-          let r = row[x * 3 + 2] as u32;
+          let r = row[x * 3 + r_off] as u32;
           dst[x] = ((77 * r + 150 * g + 29 * b) >> 8) as u8;
         }
       }
@@ -1257,12 +1282,23 @@ mod scalar {
     /// `σ_rgyb + 0.3·μ_rgyb` where
     /// `σ_rgyb = √(σ²_rg + σ²_yb)` and `μ_rgyb = √(μ²_rg + μ²_yb)`.
     /// Empty inputs return 0.
-    pub(super) fn colorfulness(bgr: &[u8], w: usize, h: usize, stride: usize) -> f32 {
+    pub(super) fn colorfulness(
+      bgr: &[u8],
+      w: usize,
+      h: usize,
+      stride: usize,
+      order: ChannelOrder,
+    ) -> f32 {
       let n = w.saturating_mul(h);
       if n == 0 {
         return 0.0;
       }
       let n_f = n as f64;
+
+      let (b_off, r_off) = match order {
+        ChannelOrder::Bgr => (0, 2),
+        ChannelOrder::Rgb => (2, 0),
+      };
 
       // Welford-style streaming mean/M2 on rg and yb concurrently.
       let mut mean_rg: f64 = 0.0;
@@ -1273,11 +1309,11 @@ mod scalar {
 
       for y in 0..h {
         let row = &bgr[y * stride..y * stride + w * 3];
-        // BGR packed: row[3i] = B, row[3i+1] = G, row[3i+2] = R.
+        // BGR packed: row[3i + b_off] = B, row[3i+1] = G, row[3i + r_off] = R.
         for i in 0..w {
-          let b = row[3 * i] as f64;
+          let b = row[3 * i + b_off] as f64;
           let g = row[3 * i + 1] as f64;
-          let r = row[3 * i + 2] as f64;
+          let r = row[3 * i + r_off] as f64;
           let rg = r - g;
           let yb = 0.5 * (r + g) - b;
           k += 1;
@@ -1359,8 +1395,51 @@ mod tests {
       w as u32,
       h as u32,
       (w * 3) as u32,
+      ChannelOrder::Bgr,
     );
     assert!(vo.iter().any(|&v| v > 0));
+  }
+
+  // RGB byte order on the scalar path: the output must match
+  // running BGR with R/B bytes manually swapped per pixel.
+  #[test]
+  fn scalar_rgb_to_hsv_planes_matches_swapped_bgr() {
+    let (w, h) = (32, 16);
+    let bgr = make_bgr(w, h);
+    let mut rgb = bgr.clone();
+    for chunk in rgb.chunks_exact_mut(3) {
+      chunk.swap(0, 2);
+    }
+    let n = w * h;
+    let mut h_bgr = vec![0u8; n];
+    let mut s_bgr = vec![0u8; n];
+    let mut v_bgr = vec![0u8; n];
+    scalar::Scalar::bgr_to_hsv_planes(
+      &mut h_bgr,
+      &mut s_bgr,
+      &mut v_bgr,
+      &bgr,
+      w as u32,
+      h as u32,
+      (w * 3) as u32,
+      ChannelOrder::Bgr,
+    );
+    let mut h_rgb = vec![0u8; n];
+    let mut s_rgb = vec![0u8; n];
+    let mut v_rgb = vec![0u8; n];
+    scalar::Scalar::bgr_to_hsv_planes(
+      &mut h_rgb,
+      &mut s_rgb,
+      &mut v_rgb,
+      &rgb,
+      w as u32,
+      h as u32,
+      (w * 3) as u32,
+      ChannelOrder::Rgb,
+    );
+    assert_eq!(h_bgr, h_rgb);
+    assert_eq!(s_bgr, s_rgb);
+    assert_eq!(v_bgr, v_rgb);
   }
 
   #[test]
@@ -1448,10 +1527,58 @@ mod tests {
         w as u32,
         h as u32,
         (w * 3) as u32,
+        ChannelOrder::Bgr,
       );
     }
     // Sanity: V plane should have nonzero values for random input.
     assert!(vo.iter().any(|&v| v > 0));
+  }
+
+  // SSSE3 RGB path: must match the swapped-BGR scalar reference.
+  #[cfg(all(any(target_arch = "x86", target_arch = "x86_64"), feature = "std"))]
+  #[test]
+  fn ssse3_rgb_bgr_to_hsv_planes_matches_swapped() {
+    if !std::is_x86_feature_detected!("ssse3") {
+      return;
+    }
+    let (w, h) = (64, 16);
+    let bgr = make_bgr(w, h);
+    let mut rgb = bgr.clone();
+    for chunk in rgb.chunks_exact_mut(3) {
+      chunk.swap(0, 2);
+    }
+    let n = w * h;
+    let mut h_bgr = vec![0u8; n];
+    let mut s_bgr = vec![0u8; n];
+    let mut v_bgr = vec![0u8; n];
+    let mut h_rgb = vec![0u8; n];
+    let mut s_rgb = vec![0u8; n];
+    let mut v_rgb = vec![0u8; n];
+    unsafe {
+      x86_ssse3::bgr_to_hsv_planes(
+        &mut h_bgr,
+        &mut s_bgr,
+        &mut v_bgr,
+        &bgr,
+        w as u32,
+        h as u32,
+        (w * 3) as u32,
+        ChannelOrder::Bgr,
+      );
+      x86_ssse3::bgr_to_hsv_planes(
+        &mut h_rgb,
+        &mut s_rgb,
+        &mut v_rgb,
+        &rgb,
+        w as u32,
+        h as u32,
+        (w * 3) as u32,
+        ChannelOrder::Rgb,
+      );
+    }
+    assert_eq!(h_bgr, h_rgb);
+    assert_eq!(s_bgr, s_rgb);
+    assert_eq!(v_bgr, v_rgb);
   }
 
   #[cfg(all(any(target_arch = "x86", target_arch = "x86_64"), feature = "std"))]
@@ -1502,9 +1629,57 @@ mod tests {
         w as u32,
         h as u32,
         (w * 3) as u32,
+        ChannelOrder::Bgr,
       );
     }
     assert!(vo.iter().any(|&v| v > 0));
+  }
+
+  // AVX2 RGB path: must match the swapped-BGR run.
+  #[cfg(all(any(target_arch = "x86", target_arch = "x86_64"), feature = "std"))]
+  #[test]
+  fn avx2_rgb_bgr_to_hsv_planes_matches_swapped() {
+    if !std::is_x86_feature_detected!("avx2") {
+      return;
+    }
+    let (w, h) = (64, 16);
+    let bgr = make_bgr(w, h);
+    let mut rgb = bgr.clone();
+    for chunk in rgb.chunks_exact_mut(3) {
+      chunk.swap(0, 2);
+    }
+    let n = w * h;
+    let mut h_bgr = vec![0u8; n];
+    let mut s_bgr = vec![0u8; n];
+    let mut v_bgr = vec![0u8; n];
+    let mut h_rgb = vec![0u8; n];
+    let mut s_rgb = vec![0u8; n];
+    let mut v_rgb = vec![0u8; n];
+    unsafe {
+      x86_avx2::bgr_to_hsv_planes(
+        &mut h_bgr,
+        &mut s_bgr,
+        &mut v_bgr,
+        &bgr,
+        w as u32,
+        h as u32,
+        (w * 3) as u32,
+        ChannelOrder::Bgr,
+      );
+      x86_avx2::bgr_to_hsv_planes(
+        &mut h_rgb,
+        &mut s_rgb,
+        &mut v_rgb,
+        &rgb,
+        w as u32,
+        h as u32,
+        (w * 3) as u32,
+        ChannelOrder::Rgb,
+      );
+    }
+    assert_eq!(h_bgr, h_rgb);
+    assert_eq!(s_bgr, s_rgb);
+    assert_eq!(v_bgr, v_rgb);
   }
 
   // aarch64: call NEON bgr_to_hsv_planes directly.
@@ -1526,9 +1701,54 @@ mod tests {
         w as u32,
         h as u32,
         (w * 3) as u32,
+        ChannelOrder::Bgr,
       );
     }
     assert!(vo.iter().any(|&v| v > 0));
+  }
+
+  // NEON RGB path: must match the swapped-BGR run.
+  #[cfg(target_arch = "aarch64")]
+  #[test]
+  fn neon_rgb_bgr_to_hsv_planes_matches_swapped() {
+    let (w, h) = (64, 16);
+    let bgr = make_bgr(w, h);
+    let mut rgb = bgr.clone();
+    for chunk in rgb.chunks_exact_mut(3) {
+      chunk.swap(0, 2);
+    }
+    let n = w * h;
+    let mut h_bgr = vec![0u8; n];
+    let mut s_bgr = vec![0u8; n];
+    let mut v_bgr = vec![0u8; n];
+    let mut h_rgb = vec![0u8; n];
+    let mut s_rgb = vec![0u8; n];
+    let mut v_rgb = vec![0u8; n];
+    unsafe {
+      neon::bgr_to_hsv_planes(
+        &mut h_bgr,
+        &mut s_bgr,
+        &mut v_bgr,
+        &bgr,
+        w as u32,
+        h as u32,
+        (w * 3) as u32,
+        ChannelOrder::Bgr,
+      );
+      neon::bgr_to_hsv_planes(
+        &mut h_rgb,
+        &mut s_rgb,
+        &mut v_rgb,
+        &rgb,
+        w as u32,
+        h as u32,
+        (w * 3) as u32,
+        ChannelOrder::Rgb,
+      );
+    }
+    assert_eq!(h_bgr, h_rgb);
+    assert_eq!(s_bgr, s_rgb);
+    assert_eq!(v_bgr, v_rgb);
   }
 
   #[cfg(target_arch = "aarch64")]
@@ -1562,12 +1782,42 @@ mod tests {
     let green = [0u8, 255, 0];
     let blue = [255u8, 0, 0];
     let mut out = [0u8; 1];
-    scalar::Scalar::bgr_to_luma(&mut out, &red, 1, 1, 3);
+    scalar::Scalar::bgr_to_luma(&mut out, &red, 1, 1, 3, ChannelOrder::Bgr);
     assert_eq!(out[0], 76);
-    scalar::Scalar::bgr_to_luma(&mut out, &green, 1, 1, 3);
+    scalar::Scalar::bgr_to_luma(&mut out, &green, 1, 1, 3, ChannelOrder::Bgr);
     assert_eq!(out[0], 149);
-    scalar::Scalar::bgr_to_luma(&mut out, &blue, 1, 1, 3);
+    scalar::Scalar::bgr_to_luma(&mut out, &blue, 1, 1, 3, ChannelOrder::Bgr);
     assert_eq!(out[0], 28);
+  }
+
+  #[test]
+  fn scalar_rgb_to_luma_matches_swapped_bgr() {
+    // Same RGB-vs-swapped-BGR equivalence as for HSV.
+    let (w, h) = (16usize, 8usize);
+    let bgr = make_bgr(w, h);
+    let mut rgb = bgr.clone();
+    for chunk in rgb.chunks_exact_mut(3) {
+      chunk.swap(0, 2);
+    }
+    let mut out_bgr = vec![0u8; w * h];
+    let mut out_rgb = vec![0u8; w * h];
+    scalar::Scalar::bgr_to_luma(
+      &mut out_bgr,
+      &bgr,
+      w as u32,
+      h as u32,
+      (w * 3) as u32,
+      ChannelOrder::Bgr,
+    );
+    scalar::Scalar::bgr_to_luma(
+      &mut out_rgb,
+      &rgb,
+      w as u32,
+      h as u32,
+      (w * 3) as u32,
+      ChannelOrder::Rgb,
+    );
+    assert_eq!(out_bgr, out_rgb);
   }
 
   // Scalar-equivalence test: the scalar reference and every SIMD
@@ -1592,7 +1842,14 @@ mod tests {
       }
     }
     let mut out_scalar = vec![0u8; w * h];
-    scalar::Scalar::bgr_to_luma(&mut out_scalar, &src, w as u32, h as u32, stride as u32);
+    scalar::Scalar::bgr_to_luma(
+      &mut out_scalar,
+      &src,
+      w as u32,
+      h as u32,
+      stride as u32,
+      ChannelOrder::Bgr,
+    );
     let mut out_simd = vec![0u8; w * h];
     backend(&mut out_simd, &src, w as u32, h as u32, stride as u32);
     assert_eq!(out_simd, out_scalar, "SIMD backend disagrees with scalar");
@@ -1605,20 +1862,53 @@ mod tests {
   fn neon_bgr_to_luma_matches_scalar() {
     // Exactly 16 pixels wide — main loop only, no tail.
     assert_bgr_to_luma_equiv(16, 4, 16 * 3, |out, src, w, h, s| unsafe {
-      neon::bgr_to_luma(out, src, w, h, s);
+      neon::bgr_to_luma(out, src, w, h, s, ChannelOrder::Bgr);
     });
     // 17 pixels — one tail pixel per row.
     assert_bgr_to_luma_equiv(17, 4, 17 * 3, |out, src, w, h, s| unsafe {
-      neon::bgr_to_luma(out, src, w, h, s);
+      neon::bgr_to_luma(out, src, w, h, s, ChannelOrder::Bgr);
     });
     // Stride padding: 24 pixels per row, stride of 96 bytes.
     assert_bgr_to_luma_equiv(24, 5, 96, |out, src, w, h, s| unsafe {
-      neon::bgr_to_luma(out, src, w, h, s);
+      neon::bgr_to_luma(out, src, w, h, s, ChannelOrder::Bgr);
     });
     // Larger frame to catch any accumulator issues.
     assert_bgr_to_luma_equiv(257, 31, 257 * 3, |out, src, w, h, s| unsafe {
-      neon::bgr_to_luma(out, src, w, h, s);
+      neon::bgr_to_luma(out, src, w, h, s, ChannelOrder::Bgr);
     });
+  }
+
+  // NEON RGB byte-order path must match swapped-BGR.
+  #[cfg(target_arch = "aarch64")]
+  #[test]
+  fn neon_rgb_bgr_to_luma_matches_swapped() {
+    let (w, h) = (24usize, 8usize);
+    let bgr = make_bgr(w, h);
+    let mut rgb = bgr.clone();
+    for chunk in rgb.chunks_exact_mut(3) {
+      chunk.swap(0, 2);
+    }
+    let mut out_bgr = vec![0u8; w * h];
+    let mut out_rgb = vec![0u8; w * h];
+    unsafe {
+      neon::bgr_to_luma(
+        &mut out_bgr,
+        &bgr,
+        w as u32,
+        h as u32,
+        (w * 3) as u32,
+        ChannelOrder::Bgr,
+      );
+      neon::bgr_to_luma(
+        &mut out_rgb,
+        &rgb,
+        w as u32,
+        h as u32,
+        (w * 3) as u32,
+        ChannelOrder::Rgb,
+      );
+    }
+    assert_eq!(out_bgr, out_rgb);
   }
 
   // x86 SSSE3: call bgr_to_luma directly. Skips itself when the host
@@ -1631,17 +1921,53 @@ mod tests {
       return;
     }
     assert_bgr_to_luma_equiv(16, 4, 16 * 3, |out, src, w, h, s| unsafe {
-      x86_ssse3::bgr_to_luma(out, src, w, h, s);
+      x86_ssse3::bgr_to_luma(out, src, w, h, s, ChannelOrder::Bgr);
     });
     assert_bgr_to_luma_equiv(17, 4, 17 * 3, |out, src, w, h, s| unsafe {
-      x86_ssse3::bgr_to_luma(out, src, w, h, s);
+      x86_ssse3::bgr_to_luma(out, src, w, h, s, ChannelOrder::Bgr);
     });
     assert_bgr_to_luma_equiv(24, 5, 96, |out, src, w, h, s| unsafe {
-      x86_ssse3::bgr_to_luma(out, src, w, h, s);
+      x86_ssse3::bgr_to_luma(out, src, w, h, s, ChannelOrder::Bgr);
     });
     assert_bgr_to_luma_equiv(257, 31, 257 * 3, |out, src, w, h, s| unsafe {
-      x86_ssse3::bgr_to_luma(out, src, w, h, s);
+      x86_ssse3::bgr_to_luma(out, src, w, h, s, ChannelOrder::Bgr);
     });
+  }
+
+  // x86 SSSE3 RGB byte-order path must match swapped-BGR.
+  #[cfg(all(any(target_arch = "x86", target_arch = "x86_64"), feature = "std"))]
+  #[test]
+  fn ssse3_rgb_bgr_to_luma_matches_swapped() {
+    if !std::is_x86_feature_detected!("ssse3") {
+      return;
+    }
+    let (w, h) = (24usize, 8usize);
+    let bgr = make_bgr(w, h);
+    let mut rgb = bgr.clone();
+    for chunk in rgb.chunks_exact_mut(3) {
+      chunk.swap(0, 2);
+    }
+    let mut out_bgr = vec![0u8; w * h];
+    let mut out_rgb = vec![0u8; w * h];
+    unsafe {
+      x86_ssse3::bgr_to_luma(
+        &mut out_bgr,
+        &bgr,
+        w as u32,
+        h as u32,
+        (w * 3) as u32,
+        ChannelOrder::Bgr,
+      );
+      x86_ssse3::bgr_to_luma(
+        &mut out_rgb,
+        &rgb,
+        w as u32,
+        h as u32,
+        (w * 3) as u32,
+        ChannelOrder::Rgb,
+      );
+    }
+    assert_eq!(out_bgr, out_rgb);
   }
 
   // ---- clipping_count -------------------------------------------------------
@@ -1841,7 +2167,7 @@ mod tests {
     let w = 16usize;
     let h = 16usize;
     let data = vec![128u8; w * h * 3];
-    let c = scalar::Scalar::colorfulness(&data, w, h, w * 3);
+    let c = scalar::Scalar::colorfulness(&data, w, h, w * 3, ChannelOrder::Bgr);
     assert!(c.abs() < 1e-3, "expected ~0.0, got {c}");
   }
 
@@ -1856,7 +2182,7 @@ mod tests {
     for i in 0..(w * h) {
       data[i * 3 + 2] = 255;
     }
-    let c = scalar::Scalar::colorfulness(&data, w, h, w * 3);
+    let c = scalar::Scalar::colorfulness(&data, w, h, w * 3, ChannelOrder::Bgr);
     let expected = 0.3_f64 * (255.0_f64.powi(2) + 127.5_f64.powi(2)).sqrt();
     assert!(
       ((c as f64) - expected).abs() < 1e-2,
@@ -1878,14 +2204,17 @@ mod tests {
         data[y * stride + x * 3 + 2] = 128;
       }
     }
-    let c = scalar::Scalar::colorfulness(&data, w, h, stride);
+    let c = scalar::Scalar::colorfulness(&data, w, h, stride, ChannelOrder::Bgr);
     assert!(c.abs() < 1e-3, "padding leaked into reduction, got {c}");
   }
 
   #[test]
   fn scalar_colorfulness_empty_frame_is_zero() {
     let data = vec![0u8];
-    assert_eq!(scalar::Scalar::colorfulness(&data, 0, 0, 0), 0.0);
+    assert_eq!(
+      scalar::Scalar::colorfulness(&data, 0, 0, 0, ChannelOrder::Bgr),
+      0.0
+    );
   }
 
   #[test]
@@ -2104,7 +2433,7 @@ mod tests {
         data[base + 2] = (rng >> 24) as u8;
       }
     }
-    let scalar_out = scalar::Scalar::colorfulness(&data, w, h, stride);
+    let scalar_out = scalar::Scalar::colorfulness(&data, w, h, stride, ChannelOrder::Bgr);
     let simd_out = backend(&data, w, h, stride);
     // The integer two-pass formulation `E[X²] - E[X]²` produces
     // results that differ from Welford only by f64 rounding, well
@@ -2121,19 +2450,19 @@ mod tests {
   fn neon_colorfulness_matches_scalar() {
     // 16 wide = one vector iteration, zero tail.
     assert_colorfulness_equiv(16, 12, 48, |bgr, w, h, s| unsafe {
-      neon::colorfulness(bgr, w, h, s)
+      neon::colorfulness(bgr, w, h, s, ChannelOrder::Bgr)
     });
     // 17 wide → 1 chunk + 1 tail pixel.
     assert_colorfulness_equiv(17, 12, 51, |bgr, w, h, s| unsafe {
-      neon::colorfulness(bgr, w, h, s)
+      neon::colorfulness(bgr, w, h, s, ChannelOrder::Bgr)
     });
     // Stride-padded (sentinel 0xCC in padding must not leak).
     assert_colorfulness_equiv(24, 9, 128, |bgr, w, h, s| unsafe {
-      neon::colorfulness(bgr, w, h, s)
+      neon::colorfulness(bgr, w, h, s, ChannelOrder::Bgr)
     });
     // Larger frame — multiple chunks + tail per row.
     assert_colorfulness_equiv(259, 17, 259 * 3, |bgr, w, h, s| unsafe {
-      neon::colorfulness(bgr, w, h, s)
+      neon::colorfulness(bgr, w, h, s, ChannelOrder::Bgr)
     });
   }
 
@@ -2144,16 +2473,16 @@ mod tests {
       return;
     }
     assert_colorfulness_equiv(16, 12, 48, |bgr, w, h, s| unsafe {
-      x86_ssse3::colorfulness(bgr, w, h, s)
+      x86_ssse3::colorfulness(bgr, w, h, s, ChannelOrder::Bgr)
     });
     assert_colorfulness_equiv(17, 12, 51, |bgr, w, h, s| unsafe {
-      x86_ssse3::colorfulness(bgr, w, h, s)
+      x86_ssse3::colorfulness(bgr, w, h, s, ChannelOrder::Bgr)
     });
     assert_colorfulness_equiv(24, 9, 128, |bgr, w, h, s| unsafe {
-      x86_ssse3::colorfulness(bgr, w, h, s)
+      x86_ssse3::colorfulness(bgr, w, h, s, ChannelOrder::Bgr)
     });
     assert_colorfulness_equiv(259, 17, 259 * 3, |bgr, w, h, s| unsafe {
-      x86_ssse3::colorfulness(bgr, w, h, s)
+      x86_ssse3::colorfulness(bgr, w, h, s, ChannelOrder::Bgr)
     });
   }
 
@@ -2164,16 +2493,16 @@ mod tests {
       return;
     }
     assert_colorfulness_equiv(16, 12, 48, |bgr, w, h, s| unsafe {
-      x86_sse41::colorfulness(bgr, w, h, s)
+      x86_sse41::colorfulness(bgr, w, h, s, ChannelOrder::Bgr)
     });
     assert_colorfulness_equiv(17, 12, 51, |bgr, w, h, s| unsafe {
-      x86_sse41::colorfulness(bgr, w, h, s)
+      x86_sse41::colorfulness(bgr, w, h, s, ChannelOrder::Bgr)
     });
     assert_colorfulness_equiv(24, 9, 128, |bgr, w, h, s| unsafe {
-      x86_sse41::colorfulness(bgr, w, h, s)
+      x86_sse41::colorfulness(bgr, w, h, s, ChannelOrder::Bgr)
     });
     assert_colorfulness_equiv(259, 17, 259 * 3, |bgr, w, h, s| unsafe {
-      x86_sse41::colorfulness(bgr, w, h, s)
+      x86_sse41::colorfulness(bgr, w, h, s, ChannelOrder::Bgr)
     });
   }
 
@@ -2184,16 +2513,16 @@ mod tests {
       return;
     }
     assert_colorfulness_equiv(16, 12, 48, |bgr, w, h, s| unsafe {
-      x86_avx2::colorfulness(bgr, w, h, s)
+      x86_avx2::colorfulness(bgr, w, h, s, ChannelOrder::Bgr)
     });
     assert_colorfulness_equiv(17, 12, 51, |bgr, w, h, s| unsafe {
-      x86_avx2::colorfulness(bgr, w, h, s)
+      x86_avx2::colorfulness(bgr, w, h, s, ChannelOrder::Bgr)
     });
     assert_colorfulness_equiv(24, 9, 128, |bgr, w, h, s| unsafe {
-      x86_avx2::colorfulness(bgr, w, h, s)
+      x86_avx2::colorfulness(bgr, w, h, s, ChannelOrder::Bgr)
     });
     assert_colorfulness_equiv(259, 17, 259 * 3, |bgr, w, h, s| unsafe {
-      x86_avx2::colorfulness(bgr, w, h, s)
+      x86_avx2::colorfulness(bgr, w, h, s, ChannelOrder::Bgr)
     });
   }
 

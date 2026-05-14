@@ -2,8 +2,11 @@
 
 use core::arch::aarch64::*;
 
+use crate::frame::ChannelOrder;
+
 #[target_feature(enable = "neon")]
 #[allow(unused_unsafe)]
+#[allow(clippy::too_many_arguments)]
 pub(super) unsafe fn bgr_to_hsv_planes(
   h_out: &mut [u8],
   s_out: &mut [u8],
@@ -12,6 +15,7 @@ pub(super) unsafe fn bgr_to_hsv_planes(
   width: u32,
   height: u32,
   stride: u32,
+  order: ChannelOrder,
 ) {
   const LANES: usize = 16;
   let w = width as usize;
@@ -19,17 +23,26 @@ pub(super) unsafe fn bgr_to_hsv_planes(
   let s = stride as usize;
   let whole = w / LANES * LANES;
 
+  let (b_off, r_off) = match order {
+    ChannelOrder::Bgr => (0usize, 2usize),
+    ChannelOrder::Rgb => (2usize, 0usize),
+  };
+
   for y in 0..h {
     let row_base = y * s;
     let dst_off = y * w;
 
     let mut x = 0;
     while x < whole {
-      // Deinterleave 16 BGR pixels (48 bytes) into three u8x16 vectors.
-      let bgr = unsafe { vld3q_u8(src.as_ptr().add(row_base + x * 3)) };
-      let b = bgr.0;
-      let g = bgr.1;
-      let r = bgr.2;
+      // Deinterleave 16 packed pixels (48 bytes) into three u8x16 vectors.
+      // vld3q_u8 returns (.0, .1, .2) for the three channels in source
+      // order. For BGR input that is (B, G, R); for RGB it is (R, G, B),
+      // so we swap .0 and .2 to land back on (B, G, R) semantically.
+      let v = unsafe { vld3q_u8(src.as_ptr().add(row_base + x * 3)) };
+      let (b, g, r) = match order {
+        ChannelOrder::Bgr => (v.0, v.1, v.2),
+        ChannelOrder::Rgb => (v.2, v.1, v.0),
+      };
 
       // Per channel: u8x16 → two u16x8 halves.
       let b_lo16 = unsafe { vmovl_u8(vget_low_u8(b)) };
@@ -82,9 +95,9 @@ pub(super) unsafe fn bgr_to_hsv_planes(
     // Scalar tail.
     let row = &src[row_base..row_base + w * 3];
     while x < w {
-      let b = row[x * 3] as f32;
+      let b = row[x * 3 + b_off] as f32;
       let g = row[x * 3 + 1] as f32;
-      let r = row[x * 3 + 2] as f32;
+      let r = row[x * 3 + r_off] as f32;
       let (hue, sat, val) = super::scalar::Scalar::bgr_to_hsv_pixel(b, g, r);
       h_out[dst_off + x] = hue;
       s_out[dst_off + x] = sat;
@@ -349,12 +362,24 @@ pub(super) unsafe fn sobel(input: &[u8], mag: &mut [i32], dir: &mut [u8], w: usi
 /// Caller must ensure NEON is available (always true on aarch64).
 #[target_feature(enable = "neon")]
 #[allow(unused_unsafe)]
-pub(super) unsafe fn bgr_to_luma(out: &mut [u8], src: &[u8], width: u32, height: u32, stride: u32) {
+pub(super) unsafe fn bgr_to_luma(
+  out: &mut [u8],
+  src: &[u8],
+  width: u32,
+  height: u32,
+  stride: u32,
+  order: ChannelOrder,
+) {
   const LANES: usize = 16;
   let w = width as usize;
   let h = height as usize;
   let s = stride as usize;
   let whole = w / LANES * LANES;
+
+  let (b_off, r_off) = match order {
+    ChannelOrder::Bgr => (0usize, 2usize),
+    ChannelOrder::Rgb => (2usize, 0usize),
+  };
 
   // Splat the BT.601 coefficients once; same values for every row.
   let k_b = unsafe { vdup_n_u8(29) };
@@ -367,11 +392,12 @@ pub(super) unsafe fn bgr_to_luma(out: &mut [u8], src: &[u8], width: u32, height:
 
     let mut x = 0;
     while x < whole {
-      // Load and deinterleave 16 packed BGR pixels.
-      let bgr = unsafe { vld3q_u8(src.as_ptr().add(row_base + x * 3)) };
-      let b = bgr.0;
-      let g = bgr.1;
-      let r = bgr.2;
+      // Load and deinterleave 16 packed pixels.
+      let v = unsafe { vld3q_u8(src.as_ptr().add(row_base + x * 3)) };
+      let (b, g, r) = match order {
+        ChannelOrder::Bgr => (v.0, v.1, v.2),
+        ChannelOrder::Rgb => (v.2, v.1, v.0),
+      };
 
       // Low 8 lanes: acc_lo = 29·B + 150·G + 77·R, widening u8×u8→u16.
       let mut acc_lo = unsafe { vmull_u8(vget_low_u8(b), k_b) };
@@ -398,9 +424,9 @@ pub(super) unsafe fn bgr_to_luma(out: &mut [u8], src: &[u8], width: u32, height:
 
     // Scalar tail.
     while x < w {
-      let b = src[row_base + x * 3] as u32;
+      let b = src[row_base + x * 3 + b_off] as u32;
       let g = src[row_base + x * 3 + 1] as u32;
-      let r = src[row_base + x * 3 + 2] as u32;
+      let r = src[row_base + x * 3 + r_off] as u32;
       out[dst_off + x] = ((77 * r + 150 * g + 29 * b) >> 8) as u8;
       x += 1;
     }
@@ -746,7 +772,13 @@ pub(super) unsafe fn noise(luma: &[u8], w: usize, h: usize, s: usize) -> f32 {
 /// Caller must ensure NEON is available (always true on aarch64).
 #[target_feature(enable = "neon")]
 #[allow(unused_unsafe)]
-pub(super) unsafe fn colorfulness(bgr: &[u8], w: usize, h: usize, stride: usize) -> f32 {
+pub(super) unsafe fn colorfulness(
+  bgr: &[u8],
+  w: usize,
+  h: usize,
+  stride: usize,
+  order: ChannelOrder,
+) -> f32 {
   let n = w.saturating_mul(h);
   if n == 0 {
     return 0.0;
@@ -754,6 +786,11 @@ pub(super) unsafe fn colorfulness(bgr: &[u8], w: usize, h: usize, stride: usize)
 
   const LANES: usize = 16;
   let whole = w / LANES * LANES;
+
+  let (b_off, r_off) = match order {
+    ChannelOrder::Bgr => (0usize, 2usize),
+    ChannelOrder::Rgb => (2usize, 0usize),
+  };
 
   // All four accumulators are i64×2 so no realistic frame size
   // can overflow the running sums — biased 8K+ frames pushed an
@@ -774,9 +811,10 @@ pub(super) unsafe fn colorfulness(bgr: &[u8], w: usize, h: usize, stride: usize)
     let mut x = 0;
     while x < whole {
       let bgr_v = unsafe { vld3q_u8(bgr.as_ptr().add(row_base + x * 3)) };
-      let b = bgr_v.0;
-      let g = bgr_v.1;
-      let r = bgr_v.2;
+      let (b, g, r) = match order {
+        ChannelOrder::Bgr => (bgr_v.0, bgr_v.1, bgr_v.2),
+        ChannelOrder::Rgb => (bgr_v.2, bgr_v.1, bgr_v.0),
+      };
 
       // Low halves.
       let b_lo = unsafe { vreinterpretq_s16_u16(vmovl_u8(vget_low_u8(b))) };
@@ -843,9 +881,9 @@ pub(super) unsafe fn colorfulness(bgr: &[u8], w: usize, h: usize, stride: usize)
 
     // Scalar tail.
     while x < w {
-      let b = bgr[row_base + x * 3] as i32;
+      let b = bgr[row_base + x * 3 + b_off] as i32;
       let g = bgr[row_base + x * 3 + 1] as i32;
-      let r = bgr[row_base + x * 3 + 2] as i32;
+      let r = bgr[row_base + x * 3 + r_off] as i32;
       let rg = r - g;
       let u = r + g - 2 * b;
       tail_sum_rg += rg as i64;

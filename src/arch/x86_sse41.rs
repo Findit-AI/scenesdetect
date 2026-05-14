@@ -23,6 +23,8 @@ use core::arch::x86::*;
 #[cfg(target_arch = "x86_64")]
 use core::arch::x86_64::*;
 
+use crate::frame::ChannelOrder;
+
 // Same PSHUFB deinterleave tables as the SSSE3 backend; SSE4.1
 // implies SSSE3 so `_mm_shuffle_epi8` is available here. Kept
 // private to this module — duplicating 9 small constants is
@@ -167,7 +169,13 @@ pub(super) unsafe fn noise(luma: &[u8], w: usize, h: usize, s: usize) -> f32 {
 /// Caller must ensure SSE4.1 is available.
 #[target_feature(enable = "sse4.1")]
 #[allow(unused_unsafe)]
-pub(super) unsafe fn colorfulness(bgr: &[u8], w: usize, h: usize, stride: usize) -> f32 {
+pub(super) unsafe fn colorfulness(
+  bgr: &[u8],
+  w: usize,
+  h: usize,
+  stride: usize,
+  order: ChannelOrder,
+) -> f32 {
   let n = w.saturating_mul(h);
   if n == 0 {
     return 0.0;
@@ -176,17 +184,38 @@ pub(super) unsafe fn colorfulness(bgr: &[u8], w: usize, h: usize, stride: usize)
   const LANES: usize = 16;
   let whole = w / LANES * LANES;
 
-  let m_b0 = unsafe { _mm_loadu_si128(BLK0_B.as_ptr() as *const __m128i) };
+  let (m_b0, m_b1, m_b2, m_r0, m_r1, m_r2) = match order {
+    ChannelOrder::Bgr => unsafe {
+      (
+        _mm_loadu_si128(BLK0_B.as_ptr() as *const __m128i),
+        _mm_loadu_si128(BLK1_B.as_ptr() as *const __m128i),
+        _mm_loadu_si128(BLK2_B.as_ptr() as *const __m128i),
+        _mm_loadu_si128(BLK0_R.as_ptr() as *const __m128i),
+        _mm_loadu_si128(BLK1_R.as_ptr() as *const __m128i),
+        _mm_loadu_si128(BLK2_R.as_ptr() as *const __m128i),
+      )
+    },
+    ChannelOrder::Rgb => unsafe {
+      (
+        _mm_loadu_si128(BLK0_R.as_ptr() as *const __m128i),
+        _mm_loadu_si128(BLK1_R.as_ptr() as *const __m128i),
+        _mm_loadu_si128(BLK2_R.as_ptr() as *const __m128i),
+        _mm_loadu_si128(BLK0_B.as_ptr() as *const __m128i),
+        _mm_loadu_si128(BLK1_B.as_ptr() as *const __m128i),
+        _mm_loadu_si128(BLK2_B.as_ptr() as *const __m128i),
+      )
+    },
+  };
   let m_g0 = unsafe { _mm_loadu_si128(BLK0_G.as_ptr() as *const __m128i) };
-  let m_r0 = unsafe { _mm_loadu_si128(BLK0_R.as_ptr() as *const __m128i) };
-  let m_b1 = unsafe { _mm_loadu_si128(BLK1_B.as_ptr() as *const __m128i) };
   let m_g1 = unsafe { _mm_loadu_si128(BLK1_G.as_ptr() as *const __m128i) };
-  let m_r1 = unsafe { _mm_loadu_si128(BLK1_R.as_ptr() as *const __m128i) };
-  let m_b2 = unsafe { _mm_loadu_si128(BLK2_B.as_ptr() as *const __m128i) };
   let m_g2 = unsafe { _mm_loadu_si128(BLK2_G.as_ptr() as *const __m128i) };
-  let m_r2 = unsafe { _mm_loadu_si128(BLK2_R.as_ptr() as *const __m128i) };
   let zero = unsafe { _mm_setzero_si128() };
   let ones16 = unsafe { _mm_set1_epi16(1) };
+
+  let (b_off, r_off) = match order {
+    ChannelOrder::Bgr => (0usize, 2usize),
+    ChannelOrder::Rgb => (2usize, 0usize),
+  };
 
   let mut sum_rg = unsafe { _mm_setzero_si128() }; // i64×2 signed
   let mut sum_u = unsafe { _mm_setzero_si128() }; // i64×2 signed
@@ -281,9 +310,9 @@ pub(super) unsafe fn colorfulness(bgr: &[u8], w: usize, h: usize, stride: usize)
     }
 
     while x < w {
-      let b = bgr[row_base + x * 3] as i32;
+      let b = bgr[row_base + x * 3 + b_off] as i32;
       let g = bgr[row_base + x * 3 + 1] as i32;
-      let r = bgr[row_base + x * 3 + 2] as i32;
+      let r = bgr[row_base + x * 3 + r_off] as i32;
       let rg = r - g;
       let u = r + g - 2 * b;
       tail_sum_rg += rg as i64;
@@ -603,23 +632,51 @@ pub(super) unsafe fn sobel(input: &[u8], mag: &mut [i32], dir: &mut [u8], w: usi
 /// Caller must ensure SSE4.1 is available.
 #[target_feature(enable = "sse4.1")]
 #[allow(unused_unsafe)]
-pub(super) unsafe fn bgr_to_luma(out: &mut [u8], src: &[u8], width: u32, height: u32, stride: u32) {
+pub(super) unsafe fn bgr_to_luma(
+  out: &mut [u8],
+  src: &[u8],
+  width: u32,
+  height: u32,
+  stride: u32,
+  order: ChannelOrder,
+) {
   const LANES: usize = 16;
   let w = width as usize;
   let h = height as usize;
   let s = stride as usize;
   let whole = w / LANES * LANES;
 
-  let m_b0 = unsafe { _mm_loadu_si128(BLK0_B.as_ptr() as *const __m128i) };
+  let (m_b0, m_b1, m_b2, m_r0, m_r1, m_r2) = match order {
+    ChannelOrder::Bgr => unsafe {
+      (
+        _mm_loadu_si128(BLK0_B.as_ptr() as *const __m128i),
+        _mm_loadu_si128(BLK1_B.as_ptr() as *const __m128i),
+        _mm_loadu_si128(BLK2_B.as_ptr() as *const __m128i),
+        _mm_loadu_si128(BLK0_R.as_ptr() as *const __m128i),
+        _mm_loadu_si128(BLK1_R.as_ptr() as *const __m128i),
+        _mm_loadu_si128(BLK2_R.as_ptr() as *const __m128i),
+      )
+    },
+    ChannelOrder::Rgb => unsafe {
+      (
+        _mm_loadu_si128(BLK0_R.as_ptr() as *const __m128i),
+        _mm_loadu_si128(BLK1_R.as_ptr() as *const __m128i),
+        _mm_loadu_si128(BLK2_R.as_ptr() as *const __m128i),
+        _mm_loadu_si128(BLK0_B.as_ptr() as *const __m128i),
+        _mm_loadu_si128(BLK1_B.as_ptr() as *const __m128i),
+        _mm_loadu_si128(BLK2_B.as_ptr() as *const __m128i),
+      )
+    },
+  };
   let m_g0 = unsafe { _mm_loadu_si128(BLK0_G.as_ptr() as *const __m128i) };
-  let m_r0 = unsafe { _mm_loadu_si128(BLK0_R.as_ptr() as *const __m128i) };
-  let m_b1 = unsafe { _mm_loadu_si128(BLK1_B.as_ptr() as *const __m128i) };
   let m_g1 = unsafe { _mm_loadu_si128(BLK1_G.as_ptr() as *const __m128i) };
-  let m_r1 = unsafe { _mm_loadu_si128(BLK1_R.as_ptr() as *const __m128i) };
-  let m_b2 = unsafe { _mm_loadu_si128(BLK2_B.as_ptr() as *const __m128i) };
   let m_g2 = unsafe { _mm_loadu_si128(BLK2_G.as_ptr() as *const __m128i) };
-  let m_r2 = unsafe { _mm_loadu_si128(BLK2_R.as_ptr() as *const __m128i) };
   let zero = unsafe { _mm_setzero_si128() };
+
+  let (b_off, r_off) = match order {
+    ChannelOrder::Bgr => (0usize, 2usize),
+    ChannelOrder::Rgb => (2usize, 0usize),
+  };
 
   let k_b = unsafe { _mm_set1_epi16(29) };
   let k_g = unsafe { _mm_set1_epi16(150) };
@@ -689,9 +746,9 @@ pub(super) unsafe fn bgr_to_luma(out: &mut [u8], src: &[u8], width: u32, height:
     }
 
     while x < w {
-      let b = src[row_base + x * 3] as u32;
+      let b = src[row_base + x * 3 + b_off] as u32;
       let g = src[row_base + x * 3 + 1] as u32;
-      let r = src[row_base + x * 3 + 2] as u32;
+      let r = src[row_base + x * 3 + r_off] as u32;
       out[dst_off + x] = ((77 * r + 150 * g + 29 * b) >> 8) as u8;
       x += 1;
     }
@@ -1013,6 +1070,7 @@ pub(super) unsafe fn plane_mean_variance(plane: &[u8], w: usize, h: usize, s: us
 /// Caller must ensure SSE4.1 is available.
 #[target_feature(enable = "sse4.1")]
 #[allow(unused_unsafe)]
+#[allow(clippy::too_many_arguments)]
 pub(super) unsafe fn bgr_to_hsv_planes(
   h_out: &mut [u8],
   s_out: &mut [u8],
@@ -1021,6 +1079,7 @@ pub(super) unsafe fn bgr_to_hsv_planes(
   width: u32,
   height: u32,
   stride: u32,
+  order: ChannelOrder,
 ) {
   const LANES: usize = 16;
   let w = width as usize;
@@ -1028,16 +1087,37 @@ pub(super) unsafe fn bgr_to_hsv_planes(
   let s = stride as usize;
   let whole = w / LANES * LANES;
 
-  let m_b0 = unsafe { _mm_loadu_si128(BLK0_B.as_ptr() as *const __m128i) };
+  let (m_b0, m_b1, m_b2, m_r0, m_r1, m_r2) = match order {
+    ChannelOrder::Bgr => unsafe {
+      (
+        _mm_loadu_si128(BLK0_B.as_ptr() as *const __m128i),
+        _mm_loadu_si128(BLK1_B.as_ptr() as *const __m128i),
+        _mm_loadu_si128(BLK2_B.as_ptr() as *const __m128i),
+        _mm_loadu_si128(BLK0_R.as_ptr() as *const __m128i),
+        _mm_loadu_si128(BLK1_R.as_ptr() as *const __m128i),
+        _mm_loadu_si128(BLK2_R.as_ptr() as *const __m128i),
+      )
+    },
+    ChannelOrder::Rgb => unsafe {
+      (
+        _mm_loadu_si128(BLK0_R.as_ptr() as *const __m128i),
+        _mm_loadu_si128(BLK1_R.as_ptr() as *const __m128i),
+        _mm_loadu_si128(BLK2_R.as_ptr() as *const __m128i),
+        _mm_loadu_si128(BLK0_B.as_ptr() as *const __m128i),
+        _mm_loadu_si128(BLK1_B.as_ptr() as *const __m128i),
+        _mm_loadu_si128(BLK2_B.as_ptr() as *const __m128i),
+      )
+    },
+  };
   let m_g0 = unsafe { _mm_loadu_si128(BLK0_G.as_ptr() as *const __m128i) };
-  let m_r0 = unsafe { _mm_loadu_si128(BLK0_R.as_ptr() as *const __m128i) };
-  let m_b1 = unsafe { _mm_loadu_si128(BLK1_B.as_ptr() as *const __m128i) };
   let m_g1 = unsafe { _mm_loadu_si128(BLK1_G.as_ptr() as *const __m128i) };
-  let m_r1 = unsafe { _mm_loadu_si128(BLK1_R.as_ptr() as *const __m128i) };
-  let m_b2 = unsafe { _mm_loadu_si128(BLK2_B.as_ptr() as *const __m128i) };
   let m_g2 = unsafe { _mm_loadu_si128(BLK2_G.as_ptr() as *const __m128i) };
-  let m_r2 = unsafe { _mm_loadu_si128(BLK2_R.as_ptr() as *const __m128i) };
   let zero_i = unsafe { _mm_setzero_si128() };
+
+  let (b_off, r_off) = match order {
+    ChannelOrder::Bgr => (0usize, 2usize),
+    ChannelOrder::Rgb => (2usize, 0usize),
+  };
 
   for y in 0..h {
     let row_base = y * s;
@@ -1138,9 +1218,9 @@ pub(super) unsafe fn bgr_to_hsv_planes(
     // Scalar tail — single-pixel loop matches the SSSE3 backend.
     let row = &src[row_base..row_base + w * 3];
     while x < w {
-      let b = row[x * 3] as f32;
+      let b = row[x * 3 + b_off] as f32;
       let g = row[x * 3 + 1] as f32;
-      let r = row[x * 3 + 2] as f32;
+      let r = row[x * 3 + r_off] as f32;
       let (hue, sat, val) = super::scalar::Scalar::bgr_to_hsv_pixel(b, g, r);
       h_out[dst_off + x] = hue;
       s_out[dst_off + x] = sat;

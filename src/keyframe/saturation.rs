@@ -35,7 +35,7 @@
 //! assert!(sat_var >= 0.0);
 //! ```
 
-use crate::frame::{HsvFrame, RgbFrame};
+use crate::frame::{ChannelOrder, HsvFrame, RgbFrame};
 
 use std::vec::Vec;
 
@@ -44,7 +44,8 @@ use serde::{Deserialize, Serialize};
 
 /// Options for the saturation detector.
 ///
-/// Carries a single `use_simd` flag. Note its scope:
+/// Carries a `use_simd` flag and the input pixel byte order. Note the
+/// flag's scope:
 ///
 /// - On [`Detector::observe_rgb`], the flag **does** route through to
 ///   the internal BGR→HSV conversion, which dispatches to its hand-
@@ -56,10 +57,14 @@ use serde::{Deserialize, Serialize};
 /// So `use_simd = false` is the right setting for tests that want
 /// deterministic scalar output; `use_simd = true` (default) is correct
 /// for production.
+///
+/// `channel_order` selects whether [`Detector::observe_rgb`] interprets
+/// each packed pixel as `B, G, R` (default) or `R, G, B`.
 #[derive(Debug, Clone, Copy, PartialEq)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct Options {
   use_simd: bool,
+  channel_order: ChannelOrder,
 }
 
 impl Default for Options {
@@ -73,7 +78,10 @@ impl Options {
   /// Creates a new [`Options`] matching [`Options::default`].
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn new() -> Self {
-    Self { use_simd: true }
+    Self {
+      use_simd: true,
+      channel_order: ChannelOrder::Bgr,
+    }
   }
 
   /// Sets whether to dispatch to SIMD backends when available.
@@ -87,6 +95,21 @@ impl Options {
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn use_simd(&self) -> bool {
     self.use_simd
+  }
+
+  /// Sets the byte order of the packed input that
+  /// [`Detector::observe_rgb`] will receive. Defaults to
+  /// [`ChannelOrder::Bgr`].
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn with_channel_order(mut self, order: ChannelOrder) -> Self {
+    self.channel_order = order;
+    self
+  }
+
+  /// Returns the byte order the detector will read.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn channel_order(&self) -> ChannelOrder {
+    self.channel_order
   }
 }
 
@@ -141,10 +164,10 @@ impl Detector {
     )
   }
 
-  /// Convenience: internally converts `rgb` (expected to be BGR-ordered
-  /// per the crate convention) to HSV via
-  /// [`bgr_to_hsv_planes`](crate::frame::convert::bgr_to_hsv_planes),
-  /// then returns the S-plane variance.
+  /// Convenience: internally converts `rgb` to HSV via
+  /// [`bgr_to_hsv_planes`](crate::frame::convert::bgr_to_hsv_planes)
+  /// (honouring [`Options::channel_order`]), then returns the
+  /// S-plane variance.
   pub fn observe_rgb(&mut self, rgb: RgbFrame<'_>) -> f32 {
     let w = rgb.width();
     let h = rgb.height();
@@ -170,6 +193,7 @@ impl Detector {
       w,
       h,
       rgb.stride(),
+      self.opts.channel_order,
       self.opts.use_simd,
     );
 
@@ -320,7 +344,17 @@ mod tests {
     let mut h = vec![0u8; n];
     let mut s = vec![0u8; n];
     let mut v = vec![0u8; n];
-    crate::frame::convert::bgr_to_hsv_planes(&mut h, &mut s, &mut v, &bgr, w, ht, w * 3, false);
+    crate::frame::convert::bgr_to_hsv_planes(
+      &mut h,
+      &mut s,
+      &mut v,
+      &bgr,
+      w,
+      ht,
+      w * 3,
+      ChannelOrder::Bgr,
+      false,
+    );
 
     let mut det_hsv = Detector::new(Options::default().with_simd(false));
     let v_hsv = det_hsv.observe_hsv(tight_hsv(&h, &s, &v, w, ht));
@@ -328,6 +362,64 @@ mod tests {
     assert!(
       (v_rgb - v_hsv).abs() < 1e-2,
       "rgb path {v_rgb} != hsv path {v_hsv}"
+    );
+  }
+
+  #[test]
+  fn options_default_channel_order_is_bgr() {
+    assert_eq!(Options::default().channel_order(), ChannelOrder::Bgr);
+  }
+
+  #[test]
+  fn observe_rgb_with_rgb_order_matches_swapped_bgr() {
+    // Build a varying BGR frame, mirror it byte-swapped as RGB,
+    // run both through their respective detectors — the HSV path
+    // produces the same S-plane (and thus the same variance).
+    let (w, ht) = (24u32, 16u32);
+    let n = (w * ht) as usize;
+    let mut bgr = vec![0u8; n * 3];
+    for (i, chunk) in bgr.chunks_exact_mut(3).enumerate() {
+      match i % 4 {
+        0 => {
+          chunk[0] = 255;
+          chunk[1] = 0;
+          chunk[2] = 0;
+        }
+        1 => {
+          chunk[0] = 0;
+          chunk[1] = 255;
+          chunk[2] = 0;
+        }
+        2 => {
+          chunk[0] = 0;
+          chunk[1] = 0;
+          chunk[2] = 255;
+        }
+        _ => {
+          chunk[0] = 128;
+          chunk[1] = 128;
+          chunk[2] = 128;
+        }
+      }
+    }
+    let mut rgb = bgr.clone();
+    for chunk in rgb.chunks_exact_mut(3) {
+      chunk.swap(0, 2);
+    }
+    let bgr_frame = RgbFrame::new(&bgr, w, ht, w * 3, timestamp());
+    let rgb_frame = RgbFrame::new(&rgb, w, ht, w * 3, timestamp());
+
+    let mut det_bgr = Detector::new(Options::default().with_simd(false));
+    let mut det_rgb = Detector::new(
+      Options::default()
+        .with_simd(false)
+        .with_channel_order(ChannelOrder::Rgb),
+    );
+    let v_bgr = det_bgr.observe_rgb(bgr_frame);
+    let v_rgb = det_rgb.observe_rgb(rgb_frame);
+    assert!(
+      (v_bgr - v_rgb).abs() < 1e-3,
+      "channel-order parity broken: bgr={v_bgr} rgb={v_rgb}"
     );
   }
 
