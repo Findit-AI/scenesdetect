@@ -50,7 +50,7 @@ const BLK2_R: [i8; 16] = [-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, 0, 3, 6, 9, 12
 /// # Safety
 ///
 /// Caller must ensure SSE4.1 is available.
-#[target_feature(enable = "sse4.1")]
+#[target_feature(enable = "sse4.1", enable = "ssse3")]
 #[allow(unused_unsafe)]
 pub(super) unsafe fn noise(luma: &[u8], w: usize, h: usize, s: usize) -> f32 {
   if w < 3 || h < 3 {
@@ -167,7 +167,7 @@ pub(super) unsafe fn noise(luma: &[u8], w: usize, h: usize, s: usize) -> f32 {
 /// # Safety
 ///
 /// Caller must ensure SSE4.1 is available.
-#[target_feature(enable = "sse4.1")]
+#[target_feature(enable = "sse4.1", enable = "ssse3")]
 #[allow(unused_unsafe)]
 pub(super) unsafe fn colorfulness(
   bgr: &[u8],
@@ -368,7 +368,7 @@ pub(super) unsafe fn colorfulness(
 /// # Safety
 ///
 /// Caller must ensure SSE4.1 is available.
-#[target_feature(enable = "sse4.1")]
+#[target_feature(enable = "sse4.1", enable = "ssse3")]
 #[allow(unused_unsafe)]
 pub(super) unsafe fn gradient_anisotropy(mag: &[i32], dir: &[u8], w: usize, h: usize) -> f32 {
   if w < 3 || h < 3 {
@@ -479,7 +479,7 @@ pub(super) unsafe fn gradient_anisotropy(mag: &[i32], dir: &[u8], w: usize, h: u
 /// # Safety
 ///
 /// Caller must ensure SSE4.1 is available.
-#[target_feature(enable = "sse4.1")]
+#[target_feature(enable = "sse4.1", enable = "ssse3")]
 #[allow(unused_unsafe)]
 pub(super) unsafe fn mean_abs_diff(a: &[u8], b: &[u8], n: usize) -> f64 {
   const LANES: usize = 16;
@@ -524,7 +524,7 @@ pub(super) unsafe fn mean_abs_diff(a: &[u8], b: &[u8], n: usize) -> f64 {
 /// # Safety
 ///
 /// Caller must ensure SSE4.1 is available.
-#[target_feature(enable = "sse4.1")]
+#[target_feature(enable = "sse4.1", enable = "ssse3")]
 #[allow(unused_unsafe)]
 pub(super) unsafe fn sobel(input: &[u8], mag: &mut [i32], dir: &mut [u8], w: usize, h: usize) {
   mag.fill(0);
@@ -632,7 +632,7 @@ pub(super) unsafe fn sobel(input: &[u8], mag: &mut [i32], dir: &mut [u8], w: usi
 /// # Safety
 ///
 /// Caller must ensure SSE4.1 is available.
-#[target_feature(enable = "sse4.1")]
+#[target_feature(enable = "sse4.1", enable = "ssse3")]
 #[allow(unused_unsafe)]
 pub(super) unsafe fn bgr_to_luma(
   out: &mut [u8],
@@ -764,7 +764,7 @@ pub(super) unsafe fn bgr_to_luma(
 /// # Safety
 ///
 /// Caller must ensure SSE4.1 is available.
-#[target_feature(enable = "sse4.1")]
+#[target_feature(enable = "sse4.1", enable = "ssse3")]
 #[allow(unused_unsafe)]
 pub(super) unsafe fn clipping_count(src: &[u8], width: u32, height: u32, stride: u32) -> u64 {
   const LANES: usize = 16;
@@ -863,7 +863,7 @@ pub(super) unsafe fn clipping_count(src: &[u8], width: u32, height: u32, stride:
 /// # Safety
 ///
 /// Caller must ensure SSE4.1 is available.
-#[target_feature(enable = "sse4.1")]
+#[target_feature(enable = "sse4.1", enable = "ssse3")]
 #[allow(unused_unsafe)]
 pub(super) unsafe fn tenengrad(luma: &[u8], w: usize, h: usize, s: usize) -> f32 {
   if w < 3 || h < 3 {
@@ -980,7 +980,7 @@ pub(super) unsafe fn tenengrad(luma: &[u8], w: usize, h: usize, s: usize) -> f32
 /// # Safety
 ///
 /// Caller must ensure SSE4.1 is available.
-#[target_feature(enable = "sse4.1")]
+#[target_feature(enable = "sse4.1", enable = "ssse3")]
 #[allow(unused_unsafe)]
 pub(super) unsafe fn plane_mean_variance(plane: &[u8], w: usize, h: usize, s: usize) -> (f32, f32) {
   const LANES: usize = 16;
@@ -1072,7 +1072,7 @@ pub(super) unsafe fn plane_mean_variance(plane: &[u8], w: usize, h: usize, s: us
 /// # Safety
 ///
 /// Caller must ensure SSE4.1 is available.
-#[target_feature(enable = "sse4.1")]
+#[target_feature(enable = "sse4.1", enable = "ssse3")]
 #[allow(unused_unsafe)]
 #[allow(clippy::too_many_arguments)]
 pub(super) unsafe fn bgr_to_hsv_planes(
@@ -1222,7 +1222,7 @@ pub(super) unsafe fn bgr_to_hsv_planes(
 
 /// SSE4.1 `_mm_min_epi32`-based clamp. SSE4.1 adds packed-signed-i32
 /// min/max, removing the need for the SSE2 compare+blend idiom.
-#[target_feature(enable = "sse4.1")]
+#[target_feature(enable = "sse4.1", enable = "ssse3")]
 #[allow(unused_unsafe)]
 #[inline]
 unsafe fn clamp_i32_max_sse41(v: __m128i, max: i32) -> __m128i {
@@ -1232,7 +1232,7 @@ unsafe fn clamp_i32_max_sse41(v: __m128i, max: i32) -> __m128i {
 /// SSE4.1 packing helper (`_mm_packus_epi32` is SSE4.1; the SSSE3 path
 /// had to use `_mm_packs_epi32` because PACKUSDW didn't exist below
 /// SSE4.1).
-#[target_feature(enable = "sse4.1")]
+#[target_feature(enable = "sse4.1", enable = "ssse3")]
 #[allow(unused_unsafe)]
 #[inline]
 unsafe fn pack_quad_sse41(a: __m128i, b: __m128i, c: __m128i, d: __m128i) -> __m128i {
@@ -1245,7 +1245,7 @@ unsafe fn pack_quad_sse41(a: __m128i, b: __m128i, c: __m128i, d: __m128i) -> __m
 /// SSE4.1 branch-free 4-lane BGR→HSV core. Uses `_mm_blendv_ps` for the
 /// per-lane selects (single instruction, replaces the
 /// `(mask & t) | (!mask & f)` SSE2 idiom).
-#[target_feature(enable = "sse4.1")]
+#[target_feature(enable = "sse4.1", enable = "ssse3")]
 #[allow(unused_unsafe)]
 #[inline]
 unsafe fn bgr_to_hsv_f32x4_sse41(b: __m128, g: __m128, r: __m128) -> (__m128, __m128, __m128) {
