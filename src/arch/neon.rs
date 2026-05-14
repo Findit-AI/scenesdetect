@@ -669,6 +669,7 @@ pub(super) unsafe fn noise(luma: &[u8], w: usize, h: usize, s: usize) -> f32 {
   };
 
   let mut acc = unsafe { vdupq_n_s64(0) };
+  let mut tail_acc: i64 = 0;
 
   for y in 1..h - 1 {
     let prev = &luma[(y - 1) * s..];
@@ -727,16 +728,14 @@ pub(super) unsafe fn noise(luma: &[u8], w: usize, h: usize, s: usize) -> f32 {
       let b = p(1, 0);
       let br = p(1, 1);
       let lap = 4 * c - 2 * (t + b + l + r) + (tl + tr + bl + br);
-      let abs = lap.unsigned_abs() as i64;
-      let tail = unsafe { vsetq_lane_s64::<0>(abs, vdupq_n_s64(0)) };
-      acc = unsafe { vaddq_s64(acc, tail) };
+      tail_acc += lap.unsigned_abs() as i64;
       x += 1;
     }
   }
 
   let lo = unsafe { vgetq_lane_s64::<0>(acc) };
   let hi = unsafe { vgetq_lane_s64::<1>(acc) };
-  let total = lo + hi;
+  let total = lo + hi + tail_acc;
 
   // σₙ ≈ √(π/2) / 6 · (Σ|lap| / interior).
   const COEFF: f64 = 0.208_898_754_886_372_3;
