@@ -15,6 +15,8 @@ use core::arch::x86::*;
 #[cfg(target_arch = "x86_64")]
 use core::arch::x86_64::*;
 
+use crate::frame::ChannelOrder;
+
 // Shuffle masks for PSHUFB (`_mm_shuffle_epi8`). Each mask has one byte per
 // output lane: if high bit is set, output lane is zeroed; else low 4 bits
 // select the input byte. We use `-1` for "zero this lane".
@@ -59,6 +61,7 @@ const BLK2_R: [i8; 16] = [-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, 0, 3, 6, 9, 12
 #[allow(dead_code)] // AVX2 takes the BGR path when both are compiled
 #[target_feature(enable = "ssse3")]
 #[allow(unused_unsafe)]
+#[allow(clippy::too_many_arguments)]
 pub(super) unsafe fn bgr_to_hsv_planes(
   h_out: &mut [u8],
   s_out: &mut [u8],
@@ -67,6 +70,7 @@ pub(super) unsafe fn bgr_to_hsv_planes(
   width: u32,
   height: u32,
   stride: u32,
+  order: ChannelOrder,
 ) {
   const LANES: usize = 16;
   let w = width as usize;
@@ -74,16 +78,40 @@ pub(super) unsafe fn bgr_to_hsv_planes(
   let s = stride as usize;
   let whole = w / LANES * LANES;
 
-  let m_b0 = unsafe { _mm_loadu_si128(BLK0_B.as_ptr() as *const __m128i) };
+  // Channel-order branching: BGR keeps the BLK*_B masks gathering blue;
+  // RGB swaps the B/R mask roles so the "b" symbolic channel reads the
+  // R position and vice versa. The kernel math then runs unchanged.
+  let (m_b0, m_b1, m_b2, m_r0, m_r1, m_r2) = match order {
+    ChannelOrder::Bgr => unsafe {
+      (
+        _mm_loadu_si128(BLK0_B.as_ptr() as *const __m128i),
+        _mm_loadu_si128(BLK1_B.as_ptr() as *const __m128i),
+        _mm_loadu_si128(BLK2_B.as_ptr() as *const __m128i),
+        _mm_loadu_si128(BLK0_R.as_ptr() as *const __m128i),
+        _mm_loadu_si128(BLK1_R.as_ptr() as *const __m128i),
+        _mm_loadu_si128(BLK2_R.as_ptr() as *const __m128i),
+      )
+    },
+    ChannelOrder::Rgb => unsafe {
+      (
+        _mm_loadu_si128(BLK0_R.as_ptr() as *const __m128i),
+        _mm_loadu_si128(BLK1_R.as_ptr() as *const __m128i),
+        _mm_loadu_si128(BLK2_R.as_ptr() as *const __m128i),
+        _mm_loadu_si128(BLK0_B.as_ptr() as *const __m128i),
+        _mm_loadu_si128(BLK1_B.as_ptr() as *const __m128i),
+        _mm_loadu_si128(BLK2_B.as_ptr() as *const __m128i),
+      )
+    },
+  };
   let m_g0 = unsafe { _mm_loadu_si128(BLK0_G.as_ptr() as *const __m128i) };
-  let m_r0 = unsafe { _mm_loadu_si128(BLK0_R.as_ptr() as *const __m128i) };
-  let m_b1 = unsafe { _mm_loadu_si128(BLK1_B.as_ptr() as *const __m128i) };
   let m_g1 = unsafe { _mm_loadu_si128(BLK1_G.as_ptr() as *const __m128i) };
-  let m_r1 = unsafe { _mm_loadu_si128(BLK1_R.as_ptr() as *const __m128i) };
-  let m_b2 = unsafe { _mm_loadu_si128(BLK2_B.as_ptr() as *const __m128i) };
   let m_g2 = unsafe { _mm_loadu_si128(BLK2_G.as_ptr() as *const __m128i) };
-  let m_r2 = unsafe { _mm_loadu_si128(BLK2_R.as_ptr() as *const __m128i) };
   let zero_i = unsafe { _mm_setzero_si128() };
+
+  let (b_off, r_off) = match order {
+    ChannelOrder::Bgr => (0usize, 2usize),
+    ChannelOrder::Rgb => (2usize, 0usize),
+  };
 
   for y in 0..h {
     let row_base = y * s;
@@ -166,9 +194,9 @@ pub(super) unsafe fn bgr_to_hsv_planes(
     // Scalar tail.
     let row = &src[row_base..row_base + w * 3];
     while x < w {
-      let b = row[x * 3] as f32;
+      let b = row[x * 3 + b_off] as f32;
       let g = row[x * 3 + 1] as f32;
-      let r = row[x * 3 + 2] as f32;
+      let r = row[x * 3 + r_off] as f32;
       let (hue, sat, val) = super::scalar::Scalar::bgr_to_hsv_pixel(b, g, r);
       h_out[dst_off + x] = hue;
       s_out[dst_off + x] = sat;
@@ -445,24 +473,57 @@ pub(super) unsafe fn sobel(input: &[u8], mag: &mut [i32], dir: &mut [u8], w: usi
 /// Caller must ensure SSSE3 is available.
 #[target_feature(enable = "ssse3")]
 #[allow(unused_unsafe)]
-pub(super) unsafe fn bgr_to_luma(out: &mut [u8], src: &[u8], width: u32, height: u32, stride: u32) {
+pub(super) unsafe fn bgr_to_luma(
+  out: &mut [u8],
+  src: &[u8],
+  width: u32,
+  height: u32,
+  stride: u32,
+  order: ChannelOrder,
+) {
   const LANES: usize = 16;
   let w = width as usize;
   let h = height as usize;
   let s = stride as usize;
   let whole = w / LANES * LANES;
 
-  // Deinterleave masks (reused from bgr_to_hsv_planes).
-  let m_b0 = unsafe { _mm_loadu_si128(BLK0_B.as_ptr() as *const __m128i) };
+  // Channel-order branching: same pattern as bgr_to_hsv_planes. The
+  // BT.601 coefficients (k_b=29, k_g=150, k_r=77) stay attached to
+  // the symbolic b/g/r channels — once the mask routing is swapped,
+  // the symbolic "b" reads from the input's R position (for RGB
+  // input) and the coefficient is the blue weight 29, applied to
+  // the real blue lane.
+  let (m_b0, m_b1, m_b2, m_r0, m_r1, m_r2) = match order {
+    ChannelOrder::Bgr => unsafe {
+      (
+        _mm_loadu_si128(BLK0_B.as_ptr() as *const __m128i),
+        _mm_loadu_si128(BLK1_B.as_ptr() as *const __m128i),
+        _mm_loadu_si128(BLK2_B.as_ptr() as *const __m128i),
+        _mm_loadu_si128(BLK0_R.as_ptr() as *const __m128i),
+        _mm_loadu_si128(BLK1_R.as_ptr() as *const __m128i),
+        _mm_loadu_si128(BLK2_R.as_ptr() as *const __m128i),
+      )
+    },
+    ChannelOrder::Rgb => unsafe {
+      (
+        _mm_loadu_si128(BLK0_R.as_ptr() as *const __m128i),
+        _mm_loadu_si128(BLK1_R.as_ptr() as *const __m128i),
+        _mm_loadu_si128(BLK2_R.as_ptr() as *const __m128i),
+        _mm_loadu_si128(BLK0_B.as_ptr() as *const __m128i),
+        _mm_loadu_si128(BLK1_B.as_ptr() as *const __m128i),
+        _mm_loadu_si128(BLK2_B.as_ptr() as *const __m128i),
+      )
+    },
+  };
   let m_g0 = unsafe { _mm_loadu_si128(BLK0_G.as_ptr() as *const __m128i) };
-  let m_r0 = unsafe { _mm_loadu_si128(BLK0_R.as_ptr() as *const __m128i) };
-  let m_b1 = unsafe { _mm_loadu_si128(BLK1_B.as_ptr() as *const __m128i) };
   let m_g1 = unsafe { _mm_loadu_si128(BLK1_G.as_ptr() as *const __m128i) };
-  let m_r1 = unsafe { _mm_loadu_si128(BLK1_R.as_ptr() as *const __m128i) };
-  let m_b2 = unsafe { _mm_loadu_si128(BLK2_B.as_ptr() as *const __m128i) };
   let m_g2 = unsafe { _mm_loadu_si128(BLK2_G.as_ptr() as *const __m128i) };
-  let m_r2 = unsafe { _mm_loadu_si128(BLK2_R.as_ptr() as *const __m128i) };
   let zero = unsafe { _mm_setzero_si128() };
+
+  let (b_off, r_off) = match order {
+    ChannelOrder::Bgr => (0usize, 2usize),
+    ChannelOrder::Rgb => (2usize, 0usize),
+  };
 
   // Coefficient splats, u16 lanes.
   let k_b = unsafe { _mm_set1_epi16(29) };
@@ -535,9 +596,9 @@ pub(super) unsafe fn bgr_to_luma(out: &mut [u8], src: &[u8], width: u32, height:
 
     // Scalar tail.
     while x < w {
-      let b = src[row_base + x * 3] as u32;
+      let b = src[row_base + x * 3 + b_off] as u32;
       let g = src[row_base + x * 3 + 1] as u32;
-      let r = src[row_base + x * 3 + 2] as u32;
+      let r = src[row_base + x * 3 + r_off] as u32;
       out[dst_off + x] = ((77 * r + 150 * g + 29 * b) >> 8) as u8;
       x += 1;
     }
@@ -980,7 +1041,13 @@ pub(super) unsafe fn noise(luma: &[u8], w: usize, h: usize, s: usize) -> f32 {
 /// Caller must ensure SSSE3 is available.
 #[target_feature(enable = "ssse3")]
 #[allow(unused_unsafe)]
-pub(super) unsafe fn colorfulness(bgr: &[u8], w: usize, h: usize, stride: usize) -> f32 {
+pub(super) unsafe fn colorfulness(
+  bgr: &[u8],
+  w: usize,
+  h: usize,
+  stride: usize,
+  order: ChannelOrder,
+) -> f32 {
   let n = w.saturating_mul(h);
   if n == 0 {
     return 0.0;
@@ -989,17 +1056,38 @@ pub(super) unsafe fn colorfulness(bgr: &[u8], w: usize, h: usize, stride: usize)
   const LANES: usize = 16;
   let whole = w / LANES * LANES;
 
-  let m_b0 = unsafe { _mm_loadu_si128(BLK0_B.as_ptr() as *const __m128i) };
+  let (m_b0, m_b1, m_b2, m_r0, m_r1, m_r2) = match order {
+    ChannelOrder::Bgr => unsafe {
+      (
+        _mm_loadu_si128(BLK0_B.as_ptr() as *const __m128i),
+        _mm_loadu_si128(BLK1_B.as_ptr() as *const __m128i),
+        _mm_loadu_si128(BLK2_B.as_ptr() as *const __m128i),
+        _mm_loadu_si128(BLK0_R.as_ptr() as *const __m128i),
+        _mm_loadu_si128(BLK1_R.as_ptr() as *const __m128i),
+        _mm_loadu_si128(BLK2_R.as_ptr() as *const __m128i),
+      )
+    },
+    ChannelOrder::Rgb => unsafe {
+      (
+        _mm_loadu_si128(BLK0_R.as_ptr() as *const __m128i),
+        _mm_loadu_si128(BLK1_R.as_ptr() as *const __m128i),
+        _mm_loadu_si128(BLK2_R.as_ptr() as *const __m128i),
+        _mm_loadu_si128(BLK0_B.as_ptr() as *const __m128i),
+        _mm_loadu_si128(BLK1_B.as_ptr() as *const __m128i),
+        _mm_loadu_si128(BLK2_B.as_ptr() as *const __m128i),
+      )
+    },
+  };
   let m_g0 = unsafe { _mm_loadu_si128(BLK0_G.as_ptr() as *const __m128i) };
-  let m_r0 = unsafe { _mm_loadu_si128(BLK0_R.as_ptr() as *const __m128i) };
-  let m_b1 = unsafe { _mm_loadu_si128(BLK1_B.as_ptr() as *const __m128i) };
   let m_g1 = unsafe { _mm_loadu_si128(BLK1_G.as_ptr() as *const __m128i) };
-  let m_r1 = unsafe { _mm_loadu_si128(BLK1_R.as_ptr() as *const __m128i) };
-  let m_b2 = unsafe { _mm_loadu_si128(BLK2_B.as_ptr() as *const __m128i) };
   let m_g2 = unsafe { _mm_loadu_si128(BLK2_G.as_ptr() as *const __m128i) };
-  let m_r2 = unsafe { _mm_loadu_si128(BLK2_R.as_ptr() as *const __m128i) };
   let zero = unsafe { _mm_setzero_si128() };
   let ones16 = unsafe { _mm_set1_epi16(1) };
+
+  let (b_off, r_off) = match order {
+    ChannelOrder::Bgr => (0usize, 2usize),
+    ChannelOrder::Rgb => (2usize, 0usize),
+  };
 
   // SIMD accumulators. All four are i64×2; per-chunk i32×4
   // partials are sign-extended (sums, possibly negative) or
@@ -1103,9 +1191,9 @@ pub(super) unsafe fn colorfulness(bgr: &[u8], w: usize, h: usize, stride: usize)
 
     // Scalar tail.
     while x < w {
-      let b = bgr[row_base + x * 3] as i32;
+      let b = bgr[row_base + x * 3 + b_off] as i32;
       let g = bgr[row_base + x * 3 + 1] as i32;
-      let r = bgr[row_base + x * 3 + 2] as i32;
+      let r = bgr[row_base + x * 3 + r_off] as i32;
       let rg = r - g;
       let u = r + g - 2 * b;
       tail_sum_rg += rg as i64;
