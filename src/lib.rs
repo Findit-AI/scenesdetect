@@ -16,6 +16,11 @@ use libm::{
   sqrt as sqrt_64, sqrtf as sqrt_32,
 };
 
+// Shared SIMD kernels (BGR→HSV conversion, mean-abs-diff, Sobel). Used by
+// the content detector and by `frame::convert`. Crate-internal.
+#[cfg(any(feature = "std", feature = "alloc"))]
+mod arch;
+
 /// Histogram-based scene detector using YUV luma correlation.
 #[cfg(any(feature = "std", feature = "alloc"))]
 #[cfg_attr(docsrs, doc(cfg(any(feature = "std", feature = "alloc"))))]
@@ -42,6 +47,11 @@ pub mod content;
 #[cfg(any(feature = "std", feature = "alloc"))]
 #[cfg_attr(docsrs, doc(cfg(any(feature = "std", feature = "alloc"))))]
 pub mod adaptive;
+
+/// Per-frame quality scoring and shot-scoped keyframe selection.
+#[cfg(any(feature = "std", feature = "alloc"))]
+#[cfg_attr(docsrs, doc(cfg(any(feature = "std", feature = "alloc"))))]
+pub mod keyframe;
 
 /// Frame types for scene detection.
 pub mod frame;

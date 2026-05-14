@@ -14,6 +14,41 @@ use thiserror::Error;
 
 pub use mediatime::{TimeRange, Timebase, Timestamp};
 
+/// Color-space conversions for the frame types in this module.
+///
+/// Backed by the crate's SIMD kernels (NEON / SSSE3 / AVX2 / wasm-simd128)
+/// with a scalar fallback, runtime-dispatched on x86 when `std` is enabled.
+#[cfg(any(feature = "std", feature = "alloc"))]
+#[cfg_attr(docsrs, doc(cfg(any(feature = "std", feature = "alloc"))))]
+pub mod convert;
+
+// /// Adapters for the RGB-family frame types from the [`videoframe`] crate.
+// #[cfg(feature = "videoframe")]
+// #[cfg_attr(docsrs, doc(cfg(feature = "videoframe")))]
+// pub mod videoframe;
+
+/// The byte order of a packed 3-byte-per-pixel color frame.
+///
+/// [`RgbFrame`] itself is byte-order-agnostic — it only knows that each
+/// pixel is 3 contiguous bytes. Detectors that interpret individual
+/// channels (`Colorfulness`, `Saturation`, the HSV/luma converters)
+/// need to know which byte position holds which color channel.
+///
+/// The default is [`ChannelOrder::Bgr`] — that was the original crate
+/// convention. Callers feeding native-RGB data should explicitly pass
+/// [`ChannelOrder::Rgb`] (via the detector's `Options::channel_order`
+/// or the explicit `*_with_order` entry points) so the kernels read
+/// the channels from the right positions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum ChannelOrder {
+  /// First byte = blue, second = green, third = red.
+  #[default]
+  Bgr,
+  /// First byte = red, second = green, third = blue.
+  Rgb,
+}
+
 /// A frame containing YUV luma (Y-plane) data, along with its dimensions and
 /// presentation timestamp.
 ///

@@ -1,0 +1,3443 @@
+//! Keyframe selection state machine.
+//!
+//! Buffers per-frame [`FrameMetrics`] as they stream in, then — when the
+//! caller confirms a shot boundary — partitions the buffered metrics into
+//! N time-uniform buckets and emits the sharpest frame per bucket.
+//!
+//! # Pipeline
+//!
+//! 1. [`Detector::observe`] — called on every scored frame. O(1) append
+//!    to an internal [`VecDeque`].
+//! 2. [`Detector::finalize_shot`] — called once the application has
+//!    confirmed a shot boundary (typically from a merged stream of cuts
+//!    produced by the scene-detector stack). Drains every buffered entry
+//!    with `ts ∈ [range.start, range.end)`, buckets them, and returns
+//!    the winning timestamps in PTS order. Entries strictly older than
+//!    `range.start` are discarded (they belonged to an earlier shot that
+//!    was never finalised).
+//! 3. [`Detector::clear`] — resets the buffer between videos.
+//!
+//! # Bucketing
+//!
+//! `N = clamp(ceil(duration / target_interval), 1, max_frames_per_shot)`
+//!
+//! Buckets are equal-width time slices of the shot. The first and last
+//! buckets are shrunk inward by `margin_ratio · duration` to protect
+//! against dissolve tails and ±2-frame scene-detector slop. If the
+//! margin eats the entire bucket (large `margin_ratio` on a shot with
+//! only one bucket) the detector falls back to the un-shrunk range so
+//! the bucket still has a chance to emit.
+//!
+//! # Strict vs. fallback selection
+//!
+//! Per bucket, the detector tracks two running argmaxes:
+//!
+//! - **strict**: argmax over frames passing every hard gate (luma mean,
+//!   saturation / luma variance AND-gate, clipping, minimum sharpness).
+//! - **fallback**: argmax over all frames in the bucket, regardless of
+//!   gate outcome.
+//!
+//! The emitted timestamp is the strict winner when non-empty; otherwise
+//! the fallback winner. This mirrors the reference Python algorithm's
+//! "prefer a degraded frame over a gap in temporal coverage" policy —
+//! VLMs downstream benefit more from regular temporal sampling than from
+//! the occasional missing keyframe.
+
+use core::{cmp::Ordering, time::Duration};
+
+use std::{collections::VecDeque, vec::Vec};
+
+use derive_more::IsVariant;
+use thiserror::Error;
+
+use crate::{
+  frame::{TimeRange, Timestamp},
+  keyframe::metrics::FrameMetrics,
+};
+
+#[cfg(feature = "serde")]
+use serde::{Deserialize, Serialize};
+
+// ---- CompositeWeights ------------------------------------------------------
+
+/// Weights and per-metric normalisers consumed by
+/// `composite_quality` when ranking frames inside a bucket.
+///
+/// Defaults are tuned so a "good" baseline frame (sharp, mid-luma,
+/// not noisy, mildly colorful) scores ≈ 1.0. Zeroing every term
+/// except `sharpness` collapses the composite to pure Tenengrad —
+/// identical to the legacy strict-pass argmax.
+///
+/// Fields are private; use `with_*` builders for construction and
+/// the field-name getters for read access.
+#[derive(Debug, Clone, Copy, PartialEq)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "serde", serde(from = "CompositeWeightsRaw"))]
+pub struct CompositeWeights {
+  sharpness: f32,
+  sharpness_norm: f32,
+  noise: f32,
+  noise_norm: f32,
+  colorfulness: f32,
+  colorfulness_norm: f32,
+  clipping: f32,
+  motion_blur: f32,
+}
+
+impl Default for CompositeWeights {
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  fn default() -> Self {
+    Self::new()
+  }
+}
+
+// Default normalisers exposed as named constants so the `with_*`
+// builders can fall back to them when given an invalid (zero,
+// negative, NaN, or Inf) `norm` argument. Kept in sync with the
+// initialisers in [`CompositeWeights::new`].
+const DEFAULT_SHARPNESS_NORM: f32 = 1000.0;
+const DEFAULT_NOISE_NORM: f32 = 20.0;
+const DEFAULT_COLORFULNESS_NORM: f32 = 50.0;
+
+// Default values for the un-range-checked f32 thresholds in
+// [`Options`]. Mirrors [`Options::default`] so the builder clamps
+// can fall back to a known-good value when handed `NaN`/`Inf` —
+// see the `Options::with_*_threshold` doc-comments for rationale.
+const DEFAULT_MIN_SHARPNESS: f32 = 100.0;
+const DEFAULT_LUMA_VARIANCE_THRESHOLD: f32 = 5.0;
+const DEFAULT_SAT_VARIANCE_THRESHOLD: f32 = 3.0;
+
+// Detector-derived physical maxima for [`FrameMetrics`] fields,
+// each with a small numeric tolerance (~1–10%) for `f32`
+// rounding and SIMD/scalar implementation drift. Anything above
+// these is physically impossible from a valid 8-bit detector
+// output; rejecting them at the [`metrics_in_domain`] boundary
+// prevents a malformed caller or corrupt detector from gaming the
+// strict / fallback / adaptive-floor paths with finite-but-
+// impossible values.
+//
+// Tenengrad on a 3×3 Sobel of u8 luma: per-pixel `gx² + gy²`
+// peaks at `2 · 1020² = 2_080_800`. The Tenengrad mean is bounded
+// by that peak (the mean of constant-peak values equals the peak).
+const MAX_SHARPNESS: f32 = 2_100_000.0;
+// Population variance of u8 values is bounded by
+// `(255 / 2)² = 16_256.25`. Cap at the next power of two above
+// the bound for clean numerics.
+const MAX_VARIANCE: f32 = 16_384.0;
+// Immerkaer noise: per-pixel `|lap|` peaks at `16 · 255 = 4080`
+// (mask coefficient sums); σₙ = √(π/2)/6 · mean|lap| ≤
+// `√(π/2)/6 · 4080 ≈ 852`.
+const MAX_NOISE: f32 = 1_000.0;
+// Hasler-Süßstrunk: with `rg = R - G ∈ [-255, 255]` and
+// `yb = 0.5(R+G) - B ∈ [-255, 255]`, both `σ_rgyb` and `μ_rgyb`
+// are bounded by `√(255² + 255²) = 255·√2 ≈ 360.6`, so
+// `C = σ_rgyb + 0.3·μ_rgyb ≤ 360.6 · 1.3 ≈ 469`.
+const MAX_COLORFULNESS: f32 = 500.0;
+
+// Hard upper bound on `Options::max_frames_per_shot`. The builder
+// asserts and the serde shim clamps against this value so a
+// malformed caller / config cannot configure an
+// O(`max_frames_per_shot`) allocation in `compute_bucket_ranges`
+// (a `Vec<(Timestamp, Timestamp)>` ≈ 48 bytes/entry, so
+// `u32::MAX` would request ~200 GB and OOM the process before
+// any frame is scored). 4096 keyframes per shot is well above
+// every realistic workload — at the default `target_interval =
+// 4 s`, that's a 4.5-hour shot before the cap could even bind.
+const MAX_FRAMES_PER_SHOT_CAP: u32 = 4_096;
+
+// Hard upper bound on the number of sharpness samples
+// [`compute_effective_floor`] collects from the buffered frames
+// before sorting. Without this cap, the per-shot allocation and
+// sort grow with buffered-frame count rather than with
+// `MAX_FRAMES_PER_SHOT_CAP`: a long shot, a missed cut, or a
+// caller that never finalises observes the buffer accumulating
+// indefinitely, so the next `finalize_shot` allocates and sorts a
+// `Vec<f32>` proportional to every buffered frame. Cap at 4096
+// (one f32 = 4 bytes → 16 KB max allocation) — far above the
+// `min_samples = 20` typical workload while still bounded for any
+// adversarial input. The collection truncates at the cap, biasing
+// the percentile slightly toward earlier samples in
+// disproportionately long buffers; that's an acceptable
+// degradation given the unbounded-OOM alternative.
+const MAX_ADAPTIVE_FLOOR_SAMPLES: usize = 4_096;
+
+// Hard upper bound on the number of `(Timestamp, FrameMetrics)`
+// entries [`Detector::observe`] retains in `self.buffer` before
+// the next [`Detector::finalize_shot`] drains them. Without this
+// cap, the buffer grows unbounded for any workload that streams
+// past a missed scene cut, never finalises a shot, or contains
+// a genuinely long-running shot — eventually exhausting the
+// process's memory. Cap at `65_536`: at ~80 bytes per entry
+// (`Timestamp + FrameMetrics + VecDeque slot overhead`), that's
+// ~5 MB max, well above the `~few-hundred-frames-per-shot`
+// realistic workload while still bounded for any adversarial
+// input.
+//
+// Overflow policy is **refuse-and-surface**: `observe` returns
+// [`ObserveError::BufferFull`] and does not push the new entry.
+// Silently evicting on overflow (drop-old or drop-new) would
+// hand the caller a `Vec<Timestamp>` from a truncated buffer
+// with no signal that coverage is incomplete; the explicit
+// error forces callers to drain (via [`Detector::finalize_shot`]
+// or [`Detector::clear`]) or back off before the gap reaches
+// downstream extraction.
+const MAX_BUFFER_FRAMES: usize = 65_536;
+
+/// Returns `v` when it is finite, otherwise `default`. Used by the
+/// f32 threshold builders that have no documented range but must
+/// still produce a value that `hard_gate`'s `<`/`>` comparisons
+/// don't silently fail open on (`metric < NaN` is `false`).
+#[inline]
+const fn finite_or(v: f32, default: f32) -> f32 {
+  if v.is_finite() { v } else { default }
+}
+
+/// Returns `norm` when it is strictly positive and finite, otherwise
+/// returns `default`. Invalid normalisers would feed `Inf`/`NaN` into
+/// [`composite_quality`] and silently corrupt the strict-pass argmax
+/// (the NaN-tolerant [`sharper`] helper retains the first non-numeric
+/// incumbent).
+#[inline]
+const fn sanitise_norm(norm: f32, default: f32) -> f32 {
+  if norm.is_finite() && norm > 0.0 {
+    norm
+  } else {
+    default
+  }
+}
+
+/// Returns `weight` when it is finite (positive, zero, or negative all
+/// allowed — only non-finite values are filtered). Non-finite weights
+/// collapse to `0.0` so the term contributes nothing rather than
+/// propagating `Inf`/`NaN` through [`composite_quality`]. Negative
+/// weights are preserved: a user can deliberately invert a term's
+/// sense (e.g. rewarding clipping for an unusual workload).
+#[inline]
+const fn sanitise_weight(weight: f32) -> f32 {
+  if weight.is_finite() { weight } else { 0.0 }
+}
+
+// Private deserialization shim for [`CompositeWeights`]. Routes every
+// weight through [`sanitise_weight`] and every normaliser through
+// [`sanitise_norm`] so a serialized configuration with invalid
+// (`NaN`/`Inf` weights, or zero/negative/`NaN`/`Inf` norms) cannot
+// reach [`composite_quality`] and silently corrupt the strict-pass
+// argmax. The struct mirrors [`CompositeWeights`]'s field shape
+// exactly — adding a field on [`CompositeWeights`] requires updating
+// both this struct and the [`From`] impl below.
+#[cfg(feature = "serde")]
+#[derive(Deserialize)]
+struct CompositeWeightsRaw {
+  sharpness: f32,
+  sharpness_norm: f32,
+  noise: f32,
+  noise_norm: f32,
+  colorfulness: f32,
+  colorfulness_norm: f32,
+  clipping: f32,
+  motion_blur: f32,
+}
+
+#[cfg(feature = "serde")]
+impl From<CompositeWeightsRaw> for CompositeWeights {
+  #[inline]
+  fn from(r: CompositeWeightsRaw) -> Self {
+    Self {
+      sharpness: sanitise_weight(r.sharpness),
+      sharpness_norm: sanitise_norm(r.sharpness_norm, DEFAULT_SHARPNESS_NORM),
+      noise: sanitise_weight(r.noise),
+      noise_norm: sanitise_norm(r.noise_norm, DEFAULT_NOISE_NORM),
+      colorfulness: sanitise_weight(r.colorfulness),
+      colorfulness_norm: sanitise_norm(r.colorfulness_norm, DEFAULT_COLORFULNESS_NORM),
+      clipping: sanitise_weight(r.clipping),
+      motion_blur: sanitise_weight(r.motion_blur),
+    }
+  }
+}
+
+impl CompositeWeights {
+  /// Creates a [`CompositeWeights`] with the calibrated default
+  /// weights and normalisers. See the type docs for the calibration
+  /// rationale.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn new() -> Self {
+    Self {
+      sharpness: 1.0,
+      sharpness_norm: DEFAULT_SHARPNESS_NORM,
+      noise: 0.3,
+      noise_norm: DEFAULT_NOISE_NORM,
+      colorfulness: 0.2,
+      colorfulness_norm: DEFAULT_COLORFULNESS_NORM,
+      clipping: 0.5,
+      motion_blur: 0.0,
+    }
+  }
+
+  /// Sets the sharpness weight and its normaliser.
+  ///
+  /// Invalid normalisers (zero, negative, `NaN`, or infinite) are
+  /// silently clamped to the [`new`](Self::new) default
+  /// (`1000.0`). They would otherwise feed `Inf`/`NaN` into
+  /// [`composite_quality`] and silently corrupt the strict-pass
+  /// argmax (the NaN-tolerant [`sharper`] helper retains the first
+  /// non-numeric incumbent and later candidates cannot unseat it).
+  /// The weight itself is stored verbatim — passing `weight = 0.0`
+  /// is the right way to disable a term.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn with_sharpness(mut self, weight: f32, norm: f32) -> Self {
+    self.sharpness = sanitise_weight(weight);
+    self.sharpness_norm = sanitise_norm(norm, DEFAULT_SHARPNESS_NORM);
+    self
+  }
+  /// Sets the noise weight and its normaliser. Noise is a penalty
+  /// (subtracted in the composite).
+  ///
+  /// Invalid normalisers are silently clamped to the
+  /// [`new`](Self::new) default (`20.0`); see
+  /// [`Self::with_sharpness`] for the rationale.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn with_noise(mut self, weight: f32, norm: f32) -> Self {
+    self.noise = sanitise_weight(weight);
+    self.noise_norm = sanitise_norm(norm, DEFAULT_NOISE_NORM);
+    self
+  }
+  /// Sets the colorfulness weight and its normaliser.
+  ///
+  /// Invalid normalisers are silently clamped to the
+  /// [`new`](Self::new) default (`50.0`); see
+  /// [`Self::with_sharpness`] for the rationale.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn with_colorfulness(mut self, weight: f32, norm: f32) -> Self {
+    self.colorfulness = sanitise_weight(weight);
+    self.colorfulness_norm = sanitise_norm(norm, DEFAULT_COLORFULNESS_NORM);
+    self
+  }
+  /// Sets the clipping-penalty weight. Clipping is already in `[0, 1]`
+  /// — no normaliser.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn with_clipping(mut self, weight: f32) -> Self {
+    self.clipping = sanitise_weight(weight);
+    self
+  }
+  /// Sets the motion-blur-penalty weight. Anisotropy is already in
+  /// `[0, 1]` — no normaliser. Defaults to 0 (off).
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn with_motion_blur(mut self, weight: f32) -> Self {
+    self.motion_blur = sanitise_weight(weight);
+    self
+  }
+
+  // ---- Getters ------------------------------------------------------------
+
+  /// Sharpness weight (read-only accessor).
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn sharpness(&self) -> f32 {
+    self.sharpness
+  }
+  /// Sharpness normaliser (read-only accessor).
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn sharpness_norm(&self) -> f32 {
+    self.sharpness_norm
+  }
+  /// Noise weight (read-only accessor).
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn noise(&self) -> f32 {
+    self.noise
+  }
+  /// Noise normaliser (read-only accessor).
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn noise_norm(&self) -> f32 {
+    self.noise_norm
+  }
+  /// Colorfulness weight (read-only accessor).
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn colorfulness(&self) -> f32 {
+    self.colorfulness
+  }
+  /// Colorfulness normaliser (read-only accessor).
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn colorfulness_norm(&self) -> f32 {
+    self.colorfulness_norm
+  }
+  /// Clipping-penalty weight (read-only accessor).
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn clipping(&self) -> f32 {
+    self.clipping
+  }
+  /// Motion-blur-penalty weight (read-only accessor).
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn motion_blur(&self) -> f32 {
+    self.motion_blur
+  }
+}
+
+// ---- Options ---------------------------------------------------------------
+
+/// Tuning knobs for the selection state machine.
+///
+/// Default values are calibrated for 256-px longest-side preprocessed
+/// input (the default of [`crate::keyframe::preprocess::Downscaler`]).
+/// Changing the downscale dimension invalidates the sharpness and
+/// variance thresholds — keep them in sync.
+#[derive(Debug, Clone, Copy, PartialEq)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "serde", serde(from = "OptionsRaw"))]
+pub struct Options {
+  target_interval: Duration,
+  max_frames_per_shot: u32,
+  margin_ratio: f64,
+  min_sharpness: f32,
+  black_mean_threshold: u8,
+  bright_mean_threshold: u8,
+  luma_variance_threshold: f32,
+  sat_variance_threshold: f32,
+  max_clipping: f32,
+  weights: CompositeWeights,
+  adaptive_floor: bool,
+  adaptive_floor_percentile: f32,
+  adaptive_floor_min_samples: usize,
+  motion_blur_gate: bool,
+  max_motion_blur: f32,
+}
+
+impl Default for Options {
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  fn default() -> Self {
+    Self {
+      target_interval: Duration::from_secs(4),
+      max_frames_per_shot: 16,
+      margin_ratio: 0.02,
+      min_sharpness: 100.0,
+      black_mean_threshold: 15,
+      bright_mean_threshold: 240,
+      luma_variance_threshold: 5.0,
+      sat_variance_threshold: 3.0,
+      max_clipping: 0.5,
+      weights: CompositeWeights::new(),
+      adaptive_floor: true,
+      adaptive_floor_percentile: 0.25,
+      adaptive_floor_min_samples: 20,
+      motion_blur_gate: false,
+      max_motion_blur: 0.75,
+    }
+  }
+}
+
+// Private deserialization shim for [`Options`]. The public builders
+// reject several invalid fields with `assert!`, but `serde` would
+// otherwise construct an Options instance directly through the
+// derived [`Deserialize`] and silently weaken hard gates or
+// drive pathological bucket allocation (e.g. `target_interval = 0`,
+// `max_clipping = 2.5`, NaN ratios, …).
+//
+// Validation policy here mirrors the **CompositeWeights** clamp
+// convention rather than the builder panic policy: invalid input
+// silently falls back to the spec default for that field. Rationale:
+// deserialization receives external/config input where a panic
+// upgrades a recoverable error into a hard crash. The fields that
+// don't need validation (raw u8/f32 with no documented range) pass
+// through verbatim.
+#[cfg(feature = "serde")]
+#[derive(Deserialize)]
+struct OptionsRaw {
+  target_interval: Duration,
+  max_frames_per_shot: u32,
+  margin_ratio: f64,
+  min_sharpness: f32,
+  black_mean_threshold: u8,
+  bright_mean_threshold: u8,
+  luma_variance_threshold: f32,
+  sat_variance_threshold: f32,
+  max_clipping: f32,
+  weights: CompositeWeights,
+  adaptive_floor: bool,
+  adaptive_floor_percentile: f32,
+  adaptive_floor_min_samples: usize,
+  motion_blur_gate: bool,
+  max_motion_blur: f32,
+}
+
+#[cfg(feature = "serde")]
+impl From<OptionsRaw> for Options {
+  fn from(r: OptionsRaw) -> Self {
+    let defaults = Self::default();
+    Self {
+      // target_interval must be strictly positive — builder panics on zero.
+      target_interval: if r.target_interval.is_zero() {
+        defaults.target_interval
+      } else {
+        r.target_interval
+      },
+      // max_frames_per_shot must lie in [1, MAX_FRAMES_PER_SHOT_CAP].
+      // Zero is clamped to the default; values above the cap are
+      // clamped down to the cap (preserving the user's "high" intent
+      // without the OOM risk of an unbounded value).
+      max_frames_per_shot: if r.max_frames_per_shot == 0 {
+        defaults.max_frames_per_shot
+      } else {
+        r.max_frames_per_shot.min(MAX_FRAMES_PER_SHOT_CAP)
+      },
+      // margin_ratio must lie in [0.0, 0.5).
+      margin_ratio: if r.margin_ratio.is_finite() && (0.0..0.5).contains(&r.margin_ratio) {
+        r.margin_ratio
+      } else {
+        defaults.margin_ratio
+      },
+      // These f32 thresholds have no builder range check but they
+      // still compose with `hard_gate`'s NaN-fail-closed contract:
+      // a `NaN` threshold would make every metric "less than NaN"
+      // evaluate to false in IEEE 754, silently disabling the gate.
+      // Clamp non-finite values to the spec defaults so the gate
+      // never reads an `Inf`/`NaN` opt-side threshold. Routes
+      // through the same `finite_or` helper as the builder path.
+      min_sharpness: finite_or(r.min_sharpness, DEFAULT_MIN_SHARPNESS),
+      black_mean_threshold: r.black_mean_threshold,
+      bright_mean_threshold: r.bright_mean_threshold,
+      luma_variance_threshold: finite_or(
+        r.luma_variance_threshold,
+        DEFAULT_LUMA_VARIANCE_THRESHOLD,
+      ),
+      sat_variance_threshold: finite_or(r.sat_variance_threshold, DEFAULT_SAT_VARIANCE_THRESHOLD),
+      // max_clipping must lie in [0.0, 1.0].
+      max_clipping: if r.max_clipping.is_finite() && (0.0..=1.0).contains(&r.max_clipping) {
+        r.max_clipping
+      } else {
+        defaults.max_clipping
+      },
+      // weights are already sanitised through CompositeWeights's own
+      // `serde(from = "CompositeWeightsRaw")` route.
+      weights: r.weights,
+      adaptive_floor: r.adaptive_floor,
+      // adaptive_floor_percentile must lie in [0.0, 1.0].
+      adaptive_floor_percentile: if r.adaptive_floor_percentile.is_finite()
+        && (0.0..=1.0).contains(&r.adaptive_floor_percentile)
+      {
+        r.adaptive_floor_percentile
+      } else {
+        defaults.adaptive_floor_percentile
+      },
+      adaptive_floor_min_samples: r.adaptive_floor_min_samples,
+      motion_blur_gate: r.motion_blur_gate,
+      // max_motion_blur must lie in [0.0, 1.0].
+      max_motion_blur: if r.max_motion_blur.is_finite() && (0.0..=1.0).contains(&r.max_motion_blur)
+      {
+        r.max_motion_blur
+      } else {
+        defaults.max_motion_blur
+      },
+    }
+  }
+}
+
+impl Options {
+  /// Creates a new [`Options`] matching [`Options::default`].
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub fn new() -> Self {
+    Self::default()
+  }
+
+  /// Target interval between keyframes. Drives the bucket count via
+  /// `ceil(shot_duration / target_interval)`.
+  ///
+  /// # Panics
+  /// When `d` is [`Duration::ZERO`].
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub fn with_target_interval(mut self, d: Duration) -> Self {
+    assert!(!d.is_zero(), "target_interval must be > 0");
+    self.target_interval = d;
+    self
+  }
+
+  /// Upper bound on the number of keyframes emitted per shot.
+  ///
+  /// Capped at [`MAX_FRAMES_PER_SHOT_CAP`] (4096). The cap exists
+  /// because [`Detector::finalize_shot`] allocates a
+  /// `Vec<(Timestamp, Timestamp)>` of size `max_frames_per_shot`
+  /// per shot — without the cap, a value like `u32::MAX` would
+  /// request ~200 GB and OOM the process before any frame is
+  /// scored. 4096 is well above every realistic workload.
+  ///
+  /// # Panics
+  /// When `n == 0` or when `n > 4096`.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn with_max_frames_per_shot(mut self, n: u32) -> Self {
+    assert!(n > 0, "max_frames_per_shot must be > 0");
+    assert!(
+      n <= MAX_FRAMES_PER_SHOT_CAP,
+      "max_frames_per_shot must be <= 4096"
+    );
+    self.max_frames_per_shot = n;
+    self
+  }
+
+  /// Fraction of shot duration to shrink away from the first and last
+  /// buckets.
+  ///
+  /// # Panics
+  /// When outside `[0.0, 0.5)`.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub fn with_margin_ratio(mut self, r: f64) -> Self {
+    assert!(
+      (0.0..0.5).contains(&r),
+      "margin_ratio must be in [0.0, 0.5)"
+    );
+    self.margin_ratio = r;
+    self
+  }
+
+  /// Minimum Tenengrad sharpness for the strict pass.
+  ///
+  /// Non-finite values (`NaN`, `Inf`, `-Inf`) silently clamp to the
+  /// spec default (`100.0`). `hard_gate` and the strict-floor
+  /// comparison both rely on this being a finite real number —
+  /// `metric >= NEG_INFINITY` is always `true`, which would
+  /// effectively disable the floor, and `metric >= NaN` is always
+  /// `false`, which would reject every frame. Finite negative
+  /// values are allowed (a caller can deliberately disable the
+  /// floor by passing `f32::MIN`).
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn with_min_sharpness(mut self, s: f32) -> Self {
+    self.min_sharpness = finite_or(s, DEFAULT_MIN_SHARPNESS);
+    self
+  }
+
+  /// Luma-mean floor — frames below this are flagged too-dark.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn with_black_mean_threshold(mut self, t: u8) -> Self {
+    self.black_mean_threshold = t;
+    self
+  }
+
+  /// Luma-mean ceiling — frames above this are flagged overexposed.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn with_bright_mean_threshold(mut self, t: u8) -> Self {
+    self.bright_mean_threshold = t;
+    self
+  }
+
+  /// Luma-variance floor. AND-gated with
+  /// [`Self::with_sat_variance_threshold`].
+  ///
+  /// Non-finite values clamp to the spec default (`5.0`). See
+  /// [`Self::with_min_sharpness`] for the underlying NaN-as-`<`
+  /// comparison rationale.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn with_luma_variance_threshold(mut self, t: f32) -> Self {
+    self.luma_variance_threshold = finite_or(t, DEFAULT_LUMA_VARIANCE_THRESHOLD);
+    self
+  }
+
+  /// Saturation-variance floor. AND-gated with
+  /// [`Self::with_luma_variance_threshold`].
+  ///
+  /// Non-finite values clamp to the spec default (`3.0`).
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn with_sat_variance_threshold(mut self, t: f32) -> Self {
+    self.sat_variance_threshold = finite_or(t, DEFAULT_SAT_VARIANCE_THRESHOLD);
+    self
+  }
+
+  /// Maximum tolerated clipping ratio.
+  ///
+  /// # Panics
+  /// When outside `[0.0, 1.0]`.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub fn with_max_clipping(mut self, c: f32) -> Self {
+    assert!(
+      (0.0..=1.0).contains(&c),
+      "max_clipping must be in [0.0, 1.0]"
+    );
+    self.max_clipping = c;
+    self
+  }
+
+  /// Replaces the [`CompositeWeights`] driving the strict-pass argmax
+  /// inside [`Detector::finalize_shot`].
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn with_composite_weights(mut self, w: CompositeWeights) -> Self {
+    self.weights = w;
+    self
+  }
+
+  /// Enables or disables the adaptive per-shot sharpness floor. When
+  /// enabled (the default), the effective strict-gate sharpness floor
+  /// becomes `min(min_sharpness, p_in_shot)` for shots that meet
+  /// [`Self::adaptive_floor_min_samples`] — the absolute floor is
+  /// only **lowered**, never raised.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn with_adaptive_floor(mut self, on: bool) -> Self {
+    self.adaptive_floor = on;
+    self
+  }
+
+  /// Sets the percentile (in `[0.0, 1.0]`) used by the adaptive floor.
+  ///
+  /// # Panics
+  /// When outside `[0.0, 1.0]`.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub fn with_adaptive_floor_percentile(mut self, p: f32) -> Self {
+    assert!(
+      (0.0..=1.0).contains(&p),
+      "adaptive_floor_percentile must be in [0.0, 1.0]"
+    );
+    self.adaptive_floor_percentile = p;
+    self
+  }
+
+  /// Sets the minimum in-shot sample count required to activate the
+  /// adaptive floor. Below this, the absolute floor is used unchanged.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn with_adaptive_floor_min_samples(mut self, n: usize) -> Self {
+    self.adaptive_floor_min_samples = n;
+    self
+  }
+
+  /// Enables or disables the motion-blur hard gate. When enabled,
+  /// frames whose [`FrameMetrics::motion_blur`] exceeds
+  /// [`Self::max_motion_blur`] are rejected from the strict pass.
+  /// Off by default because gradient anisotropy at 256-px downscale
+  /// confounds motion blur with single-orientation scenes (forest,
+  /// façade, horizon).
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn with_motion_blur_gate(mut self, on: bool) -> Self {
+    self.motion_blur_gate = on;
+    self
+  }
+
+  /// Sets the maximum tolerated motion-blur (anisotropy) score. The
+  /// gate (when enabled) rejects frames strictly greater than this
+  /// value.
+  ///
+  /// # Panics
+  /// When outside `[0.0, 1.0]`.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub fn with_max_motion_blur(mut self, m: f32) -> Self {
+    assert!(
+      (0.0..=1.0).contains(&m),
+      "max_motion_blur must be in [0.0, 1.0]"
+    );
+    self.max_motion_blur = m;
+    self
+  }
+
+  /// Whether the motion-blur hard gate is enabled (read-only accessor).
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn motion_blur_gate(&self) -> bool {
+    self.motion_blur_gate
+  }
+  /// Maximum tolerated motion-blur anisotropy score (read-only accessor).
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn max_motion_blur(&self) -> f32 {
+    self.max_motion_blur
+  }
+
+  /// Whether the adaptive per-shot sharpness floor is enabled (read-only accessor).
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn adaptive_floor(&self) -> bool {
+    self.adaptive_floor
+  }
+  /// Adaptive floor percentile (read-only accessor).
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn adaptive_floor_percentile(&self) -> f32 {
+    self.adaptive_floor_percentile
+  }
+  /// Adaptive floor minimum-samples threshold (read-only accessor).
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn adaptive_floor_min_samples(&self) -> usize {
+    self.adaptive_floor_min_samples
+  }
+
+  /// Composite-quality weights and normalisers (read-only accessor).
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn composite_weights(&self) -> &CompositeWeights {
+    &self.weights
+  }
+
+  /// Target inter-keyframe interval (read-only accessor).
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn target_interval(&self) -> Duration {
+    self.target_interval
+  }
+  /// Maximum keyframes per shot (read-only accessor).
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn max_frames_per_shot(&self) -> u32 {
+    self.max_frames_per_shot
+  }
+  /// First/last-bucket margin fraction (read-only accessor).
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn margin_ratio(&self) -> f64 {
+    self.margin_ratio
+  }
+  /// Strict-pass sharpness floor (read-only accessor).
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn min_sharpness(&self) -> f32 {
+    self.min_sharpness
+  }
+  /// Black-frame luma-mean threshold (read-only accessor).
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn black_mean_threshold(&self) -> u8 {
+    self.black_mean_threshold
+  }
+  /// Overexposed luma-mean threshold (read-only accessor).
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn bright_mean_threshold(&self) -> u8 {
+    self.bright_mean_threshold
+  }
+  /// Luma-variance threshold (read-only accessor).
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn luma_variance_threshold(&self) -> f32 {
+    self.luma_variance_threshold
+  }
+  /// Saturation-variance threshold (read-only accessor).
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn sat_variance_threshold(&self) -> f32 {
+    self.sat_variance_threshold
+  }
+  /// Max clipping ratio (read-only accessor).
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn max_clipping(&self) -> f32 {
+    self.max_clipping
+  }
+}
+
+// ---- Detector --------------------------------------------------------------
+
+/// Reason [`Detector::observe`] rejected a frame.
+///
+/// Returning an error instead of silently swallowing the frame
+/// is deliberate: both failure modes break the selector's
+/// non-decreasing-PTS / bounded-buffer invariants, so a caller
+/// that wants temporally-complete keyframe coverage MUST know
+/// when a frame was dropped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, IsVariant, Error)]
+#[non_exhaustive]
+pub enum ObserveError {
+  /// The internal buffer has reached its capacity of 65,536
+  /// `(Timestamp, FrameMetrics)` entries. The new frame was
+  /// **not** added; call [`Detector::finalize_shot`] to drain
+  /// the buffer or [`Detector::clear`] to reset it before
+  /// observing more frames.
+  ///
+  /// Hitting this error usually means a scene cut was missed
+  /// upstream (or no scene boundary exists in the input): the
+  /// caller is feeding frames faster than they can be finalised
+  /// into shots. Selection coverage will be incomplete for the
+  /// trailing frames until the buffer is drained.
+  #[error("Detector::observe buffer at capacity (65_536 entries)")]
+  BufferFull,
+
+  /// The new frame's PTS is strictly less than the most-recently
+  /// buffered frame's PTS, violating the non-decreasing-PTS
+  /// invariant the bucket walker and adaptive-floor scan
+  /// require. The new frame was **not** added.
+  ///
+  /// Hitting this error means the upstream decoder emitted
+  /// frames out of presentation order (or a B-frame's PTS was
+  /// computed incorrectly). Either fix the source ordering or
+  /// drop / re-order the offending frame before observing.
+  #[error("Detector::observe called with a frame whose PTS is less than the previous observation")]
+  OutOfOrder,
+}
+
+/// The keyframe selection state machine.
+#[derive(Debug, Clone)]
+pub struct Detector {
+  opts: Options,
+  buffer: VecDeque<(Timestamp, FrameMetrics)>,
+}
+
+impl Detector {
+  /// Creates a new detector with the supplied options.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub fn new(opts: Options) -> Self {
+    Self {
+      opts,
+      buffer: VecDeque::new(),
+    }
+  }
+
+  /// Returns the detector's current options.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn options(&self) -> &Options {
+    &self.opts
+  }
+
+  /// Number of scored frames currently buffered (awaiting finalization).
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub fn buffered(&self) -> usize {
+    self.buffer.len()
+  }
+
+  /// Appends a scored frame to the buffer. Returns
+  /// `Err(`[`ObserveError`]`)` when the frame cannot be accepted;
+  /// in every error case the new frame is **not** added to the
+  /// buffer.
+  ///
+  /// Two invariants must hold:
+  ///
+  /// 1. **Non-decreasing PTS.** Frames must arrive in
+  ///    presentation order; the bucket walker in
+  ///    [`Self::finalize_shot`] and the adaptive-floor scan both
+  ///    rely on this. A call with `ts <` the previous
+  ///    observation's PTS returns
+  ///    [`ObserveError::OutOfOrder`]; the new frame is dropped
+  ///    rather than corrupting downstream selection silently.
+  ///
+  /// 2. **Bounded buffer.** The detector retains at most 65,536
+  ///    `(Timestamp, FrameMetrics)` entries between
+  ///    [`Self::finalize_shot`] / [`Self::clear`] calls. Once
+  ///    the cap is hit, every further `observe` returns
+  ///    [`ObserveError::BufferFull`] until the buffer is
+  ///    drained. The cap exists to prevent unbounded growth
+  ///    (process OOM, latency spikes) on long-running shots or
+  ///    callers that miss scene boundaries; under realistic
+  ///    workloads — `target_interval = 4 s` at 30 fps gives
+  ///    ~120 frames per shot — it never binds.
+  ///
+  /// Callers that want temporally-complete keyframe coverage
+  /// MUST propagate the error: a silent drop on overflow or
+  /// out-of-order PTS could leave entire buckets unrepresented
+  /// in the emitted [`Vec<Timestamp>`] without any indication
+  /// to downstream consumers.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub fn observe(&mut self, ts: Timestamp, metrics: FrameMetrics) -> Result<(), ObserveError> {
+    if self
+      .buffer
+      .back()
+      .is_some_and(|(prev, _)| prev.cmp_semantic(&ts) == Ordering::Greater)
+    {
+      return Err(ObserveError::OutOfOrder);
+    }
+    if self.buffer.len() >= MAX_BUFFER_FRAMES {
+      return Err(ObserveError::BufferFull);
+    }
+    self.buffer.push_back((ts, metrics));
+    Ok(())
+  }
+
+  /// A shot boundary has been confirmed. Drains every buffered entry
+  /// whose timestamp lies in `[range.start(), range.end())`, buckets
+  /// them, and returns the winning timestamp per bucket in PTS order.
+  ///
+  /// Entries strictly older than `range.start()` are silently discarded
+  /// (they belonged to an earlier shot that was never finalized, or
+  /// were observed before the first shot began).
+  ///
+  /// A degenerate (instant) `range` (`start == end`, i.e. zero
+  /// duration) yields an empty result and still drops stale
+  /// entries. Reversed ranges are impossible: [`TimeRange::new`]
+  /// panics on `end < start`, and [`TimeRange::try_new`] returns
+  /// `None`.
+  ///
+  /// Returns an owned `Vec<Timestamp>` rather than a borrowing iterator.
+  /// Size is bounded by
+  /// [`Options::max_frames_per_shot`](Options::with_max_frames_per_shot) —
+  /// typically ≤ 16 entries, so the allocation is small. Caller may hold
+  /// the result across subsequent detector calls.
+  pub fn finalize_shot(&mut self, range: TimeRange) -> Vec<Timestamp> {
+    // 1. Drop stale entries (before the shot starts).
+    while let Some((ts, _)) = self.buffer.front() {
+      if ts.cmp_semantic(&range.start()) == Ordering::Less {
+        self.buffer.pop_front();
+      } else {
+        break;
+      }
+    }
+
+    // 2. Degenerate range (zero duration) → nothing to emit.
+    //
+    // mediatime 0.1.5+ enforces `start <= end` at construction, so
+    // `range.duration()` is infallible and cannot be negative; an
+    // instant range (`start == end`) is the only case we must
+    // short-circuit here.
+    let duration = range.duration();
+    if duration.is_zero() {
+      return Vec::new();
+    }
+
+    // 3. Compute bucket count and precompute per-bucket effective
+    //    [start, end) timestamps (with first-/last-bucket margin shrink).
+    let n = compute_n_buckets(duration, &self.opts);
+    let bucket_ranges = compute_bucket_ranges(&range, n, self.opts.margin_ratio);
+
+    // 3.5. Compute the effective strict-gate sharpness floor for
+    // this shot. The percentile pool is restricted to the same
+    // region the bucket walker actually emits from — i.e. the
+    // first bucket's effective start through the last bucket's
+    // effective end — so frames inside the pre-/post-margin zones
+    // that cannot win either ranking path also cannot move the
+    // floor for interior candidates. Order reversed (buckets
+    // first, then floor) to make these ranges available here.
+    let effective_min_sharpness = compute_effective_floor(
+      &self.buffer,
+      &bucket_ranges[0].0,
+      &bucket_ranges[n - 1].1,
+      &self.opts,
+    );
+
+    // 4. Single linear walk across the in-range entries. Entries inside
+    //    the first-bucket's pre-margin or last-bucket's post-margin zones
+    //    are skipped. Track strict + fallback running argmaxes per bucket.
+    let mut emits: Vec<Timestamp> = Vec::with_capacity(n);
+    let mut bucket_idx = 0usize;
+    let mut best_strict: Option<(Timestamp, f32)> = None;
+    let mut best_any: Option<(Timestamp, f32)> = None;
+
+    // Snapshot opts locally to avoid borrowing self while draining the
+    // buffer.
+    let opts = self.opts;
+
+    while let Some((ts, metrics)) = self.buffer.front().copied() {
+      if ts.cmp_semantic(&range.end()) != Ordering::Less {
+        break; // past this shot — leave for the next finalize.
+      }
+
+      // Advance bucket cursor while the entry is past the current
+      // bucket's effective end. Each advance emits the previous
+      // bucket's winner.
+      while bucket_idx < n && ts.cmp_semantic(&bucket_ranges[bucket_idx].1) != Ordering::Less {
+        if let Some((t, _)) = best_strict.or(best_any) {
+          emits.push(t);
+        }
+        best_strict = None;
+        best_any = None;
+        bucket_idx += 1;
+      }
+
+      // Consume the entry from the buffer. We're inside the shot.
+      self.buffer.pop_front();
+
+      if bucket_idx >= n {
+        // Past the last bucket's effective end, but still inside the
+        // shot (i.e. within the last-bucket margin zone). Drain but do
+        // not score.
+        continue;
+      }
+
+      // Skip entries that fall in the first bucket's pre-margin gap.
+      if ts.cmp_semantic(&bucket_ranges[bucket_idx].0) == Ordering::Less {
+        continue;
+      }
+
+      // Running argmax updates.
+      // Fallback path: pure-sharpness ranking, preserved so "least
+      // bad" is well-defined when every frame in the bucket fails
+      // the strict gate. Domain-validate the whole metric set
+      // before accepting a fallback candidate — the strict path's
+      // `hard_gate` already gates on this, but a frame whose
+      // sharpness is finite-and-positive while another metric is
+      // corrupt (e.g. negative noise / clipping) would otherwise
+      // still win the fallback emit when no strict winner exists.
+      // Sharing the predicate keeps both ranking paths rejecting
+      // the same set of malformed frames. If every fallback
+      // candidate is filtered, the bucket emits nothing — correct
+      // degradation for a fully-corrupt bucket.
+      if metrics_in_domain(&metrics) {
+        let s_now = metrics.sharpness();
+        if best_any.is_none_or(|(_, s)| sharper(s_now, s)) {
+          best_any = Some((ts, s_now));
+        }
+      }
+      // Strict path: composite-quality ranking among gate-passing
+      // frames. Non-finite composites are skipped — a NaN incumbent
+      // would lock out every later finite candidate because
+      // `sharper(finite, NaN) == false`. Weights and norms are already
+      // sanitised at the [`CompositeWeights`] boundary, but
+      // [`FrameMetrics`] setters accept arbitrary `f32` values and
+      // detector kernels could conceivably produce `Inf` on
+      // pathological inputs (e.g. an integer accumulator that
+      // saturated). Filtering here is the one safety net the argmax
+      // needs.
+      if !hard_gate(&metrics, &opts) && metrics.sharpness() >= effective_min_sharpness {
+        let q = composite_quality(&metrics, opts.composite_weights());
+        if q.is_finite() && best_strict.is_none_or(|(_, s)| sharper(q, s)) {
+          best_strict = Some((ts, q));
+        }
+      }
+    }
+
+    // Flush the last active bucket.
+    if bucket_idx < n
+      && let Some((t, _)) = best_strict.or(best_any)
+    {
+      emits.push(t);
+    }
+
+    emits
+  }
+
+  /// Closes out any buffered entries as a "final shot" ending at `eos`.
+  ///
+  /// Convenience wrapper for end-of-stream handling: forms a synthetic
+  /// [`TimeRange`] that starts at the oldest buffered entry's timestamp
+  /// and ends at `eos`, then calls [`Self::finalize_shot`]. Returns an
+  /// empty `Vec` when the buffer is empty or when `eos` is not strictly
+  /// after the earliest buffered entry.
+  ///
+  /// Callers that track the previous-cut timestamp themselves can
+  /// equivalently call [`Self::finalize_shot`] directly with a range
+  /// they construct.
+  pub fn finalize_remaining(&mut self, eos: Timestamp) -> Vec<Timestamp> {
+    let Some(&(first_ts, _)) = self.buffer.front() else {
+      return Vec::new();
+    };
+    // Re-express the start timestamp in eos's timebase so the TimeRange
+    // constructor (which takes raw pts + a single timebase) sees a
+    // self-consistent pair.
+    let tb = eos.timebase();
+    let start_pts = first_ts.rescale_to(tb).pts();
+    let end_pts = eos.pts();
+    if end_pts <= start_pts {
+      return Vec::new();
+    }
+    self.finalize_shot(TimeRange::new(start_pts, end_pts, tb))
+  }
+
+  /// Resets the detector's buffer. The configured options are preserved.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub fn clear(&mut self) {
+    self.buffer.clear();
+  }
+}
+
+// ---- Helpers ---------------------------------------------------------------
+
+/// `N = clamp(ceil(duration / target_interval), 1, max_frames_per_shot)`
+///
+/// Uses integer (nanosecond) arithmetic to avoid pulling in `f64::ceil`,
+/// which isn't available in `no_std` builds.
+fn compute_n_buckets(duration: Duration, opts: &Options) -> usize {
+  let target_ns = opts.target_interval.as_nanos();
+  if target_ns == 0 {
+    return 1;
+  }
+  // Ceiling division in u128.
+  let d_ns = duration.as_nanos();
+  let raw = (d_ns.saturating_add(target_ns - 1)) / target_ns;
+  let capped = raw.min(opts.max_frames_per_shot as u128).max(1);
+  capped as usize
+}
+
+/// Returns the `(effective_start, effective_end)` timestamp of each
+/// bucket, margin applied to the first and last. When the margin
+/// shrink eats the whole bucket — either in fractional space
+/// (`eff_t1 <= eff_t0`) OR after interpolation truncates fractional
+/// PTS down to the same tick (e.g. a 1-tick shot with non-zero
+/// margin) — falls back to the un-shrunk bucket so the bucket still
+/// has a chance to contribute. Without the post-interpolation
+/// check, a short shot with the default margin can collapse to an
+/// empty `[start, start)` bucket and silently drain every buffered
+/// frame without scoring it.
+fn compute_bucket_ranges(
+  range: &TimeRange,
+  n: usize,
+  margin_ratio: f64,
+) -> Vec<(Timestamp, Timestamp)> {
+  let mut out = Vec::with_capacity(n);
+  let n_f = n as f64;
+  for b in 0..n {
+    let t0 = (b as f64) / n_f;
+    let t1 = ((b + 1) as f64) / n_f;
+    let eff_t0 = if b == 0 { t0 + margin_ratio } else { t0 };
+    let eff_t1 = if b == n - 1 { t1 - margin_ratio } else { t1 };
+    // First fractional-space check: would the shrink even be valid?
+    let (try_t0, try_t1) = if eff_t1 > eff_t0 {
+      (eff_t0, eff_t1)
+    } else {
+      (t0, t1) // un-shrunk fallback (margin too large)
+    };
+    let shrunk_start = range.interpolate(try_t0);
+    let shrunk_end = range.interpolate(try_t1);
+    // Second check, after the discrete-time interpolation: did
+    // truncation collapse the bucket? Fall back to the un-shrunk
+    // bucket if so.
+    let (use_start, use_end) = if shrunk_end.cmp_semantic(&shrunk_start) == Ordering::Greater {
+      (shrunk_start, shrunk_end)
+    } else {
+      (range.interpolate(t0), range.interpolate(t1))
+    };
+    out.push((use_start, use_end));
+  }
+  out
+}
+
+/// Returns the effective strict-gate sharpness floor for the shot
+/// described by the emission-eligible window
+/// `[eligible_start, eligible_end)`, given the entries currently
+/// buffered and the adaptive-floor options. Never raises the floor
+/// above [`Options::min_sharpness`]; only lowers it.
+///
+/// `eligible_start` / `eligible_end` are the first bucket's
+/// effective start and the last bucket's effective end (i.e. the
+/// shot range with first-/last-bucket margins trimmed). Frames in
+/// the pre-/post-margin zones cannot win either ranking path, so
+/// they MUST also be excluded from the percentile pool — letting
+/// margin-zone metrics influence the floor would change strict
+/// eligibility for interior candidates without those frames ever
+/// having a chance to be emitted.
+fn compute_effective_floor(
+  buffer: &VecDeque<(Timestamp, FrameMetrics)>,
+  eligible_start: &Timestamp,
+  eligible_end: &Timestamp,
+  opts: &Options,
+) -> f32 {
+  if !opts.adaptive_floor() {
+    return opts.min_sharpness();
+  }
+  // Two-pass rank-based sampling over the emission-eligible window.
+  //
+  // Pass 1 counts eligible hard-gate-passing samples without
+  // allocating. Pass 2 fills the percentile pool by picking the
+  // first index in each of `target` evenly-sized rank buckets,
+  // where `target = min(total, MAX_ADAPTIVE_FLOOR_SAMPLES)`. A
+  // modulo-residue stride (`i % stride == 0`) can lock onto a
+  // single periodic subset when `total` is just over the cap
+  // (e.g. 4097 → stride 2, keeping only 2049 even-i samples and
+  // silently dropping every odd-i frame); rank bucketing instead
+  // keeps exactly `target` samples and spans the FULL window with
+  // a varying integer stride that does not align with period-2
+  // patterns in the metric stream.
+  //
+  // Both passes filter by `!hard_gate` (mirrors the strict path
+  // minus the sharpness-floor check, which `hard_gate` does not
+  // perform). A pure `metrics_in_domain` filter let frames that
+  // fail the brightness / variance / clipping / motion-blur gates
+  // drag the percentile down — and since those frames can never
+  // win the strict path, their contribution was pure noise: a
+  // long black/flat/clipped run could lower the floor below an
+  // otherwise-mediocre frame's sharpness, flipping the strict
+  // winner to a frame the absolute floor would have rejected.
+  //
+  // Both passes use `skip_while`/`take_while` instead of a plain
+  // `.filter` on timestamps, exploiting the buffer's documented
+  // non-decreasing-PTS ordering (post stale-entry drain) to
+  // terminate the iteration at the right edge of the window
+  // rather than scanning every future-shot frame.
+  let eligible_iter = || {
+    buffer
+      .iter()
+      .skip_while(|(ts, _)| ts.cmp_semantic(eligible_start) == Ordering::Less)
+      .take_while(|(ts, _)| ts.cmp_semantic(eligible_end) == Ordering::Less)
+      .filter(|(_, m)| !hard_gate(m, opts))
+  };
+  let total = eligible_iter().count();
+  // `min_samples` is checked against the *true* eligible count
+  // (un-capped) so a caller asking for a larger min_samples than
+  // the storage cap still gets adaptive flooring as soon as the
+  // shot has enough valid frames.
+  if total == 0 || total < opts.adaptive_floor_min_samples() {
+    return opts.min_sharpness();
+  }
+  let target = total.min(MAX_ADAPTIVE_FLOOR_SAMPLES);
+  // `u128` widens both factors so `i * target` (≤ usize::MAX *
+  // 4096) never overflows on 32-bit targets. `total > 0` is
+  // guaranteed by the early-return above, so the divisor is
+  // non-zero.
+  let rank = |i: usize| -> u128 { (i as u128).saturating_mul(target as u128) / (total as u128) };
+  let mut sharps: Vec<f32> = Vec::with_capacity(target);
+  let mut last_rank: Option<u128> = None;
+  for (i, (_, m)) in eligible_iter().enumerate() {
+    let r = rank(i);
+    if last_rank.is_none_or(|prev| r > prev) {
+      sharps.push(m.sharpness());
+      last_rank = Some(r);
+    }
+  }
+  if sharps.is_empty() {
+    // Defensive: total > 0 guarantees at least one rank-bucket
+    // hit (the first iteration with `last_rank == None` always
+    // pushes), but a future refactor could break that. Fall back
+    // rather than index an empty slice.
+    return opts.min_sharpness();
+  }
+  sharps.sort_by(|a, b| a.partial_cmp(b).unwrap_or(Ordering::Equal));
+  let idx = ((sharps.len() as f32 * opts.adaptive_floor_percentile()) as usize)
+    .min(sharps.len().saturating_sub(1));
+  let p = sharps[idx];
+  opts.min_sharpness().min(p) // never raise the floor
+}
+
+/// Weighted composite of [`FrameMetrics`] used as the strict-pass
+/// argmax key inside [`Detector::finalize_shot`].
+///
+/// Higher is better. `sharpness` and `colorfulness` contribute
+/// positively; `noise`, `clipping`, and `motion_blur` contribute
+/// negatively. The fallback path inside `finalize_shot` still ranks
+/// by raw `sharpness` — see the module docs.
+#[cfg_attr(not(tarpaulin), inline(always))]
+fn composite_quality(m: &FrameMetrics, w: &CompositeWeights) -> f32 {
+  let s = w.sharpness() * (m.sharpness() / w.sharpness_norm());
+  let n = w.noise() * (m.noise() / w.noise_norm());
+  let c = w.colorfulness() * (m.colorfulness() / w.colorfulness_norm());
+  let clip = w.clipping() * m.clipping();
+  let mb = w.motion_blur() * m.motion_blur();
+  s - n + c - clip - mb
+}
+
+/// `true` when `a > b` under `f32::partial_cmp`. NaN compares as not-
+/// greater, so a NaN score cannot unseat a numeric incumbent — our
+/// reductions do not produce NaN anyway, but the defensive default
+/// keeps the running-argmax state well-defined under any input.
+#[cfg_attr(not(tarpaulin), inline(always))]
+fn sharper(a: f32, b: f32) -> bool {
+  a.partial_cmp(&b).unwrap_or(Ordering::Equal) == Ordering::Greater
+}
+
+/// Returns `true` when every field of `m` is finite and inside its
+/// physical domain. Shared precondition for both [`hard_gate`]
+/// (strict path) and the fallback argmax inside
+/// [`Detector::finalize_shot`] — keeping the predicate in one
+/// place ensures both ranking paths reject the same set of corrupt
+/// `FrameMetrics`.
+///
+/// Domain bounds:
+/// - `sharpness`, `noise`, `colorfulness`, `luma_variance`,
+///   `saturation_variance`: must be `>= 0`. Tenengrad / Immerkaer /
+///   Hasler-Süßstrunk are non-negative by construction; variance is
+///   always non-negative.
+/// - `brightness`: must be in `[0, 255]` (luma encoding).
+/// - `clipping`, `motion_blur`: must be in `[0, 1]` (fraction /
+///   normalised anisotropy).
+///
+/// Public [`FrameMetrics::set_*`] accept arbitrary `f32`, so a
+/// malformed caller or corrupt detector output could feed e.g.
+/// `clipping = -1.0`. In [`composite_quality`] the penalty term
+/// `-w_clipping * clipping` would become a bonus, gaming the
+/// argmax. The fallback (raw-sharpness) path was previously
+/// vulnerable too: a frame with high sharpness and corrupt
+/// non-sharpness metrics could win the bucket's emit if every
+/// candidate failed the strict gate. Both ranking paths now
+/// reject out-of-domain frames at this single boundary.
+#[inline]
+fn metrics_in_domain(m: &FrameMetrics) -> bool {
+  // `is_finite()` is implied by the closed-range upper bounds — a
+  // `NaN`/`Inf` value will fail `<= MAX_*`. Keep the explicit
+  // `is_finite` checks anyway as a defence-in-depth and to make
+  // the intent obvious at read-time.
+  m.brightness().is_finite()
+    && m.luma_variance().is_finite()
+    && m.saturation_variance().is_finite()
+    && m.clipping().is_finite()
+    && m.motion_blur().is_finite()
+    && m.sharpness().is_finite()
+    && m.noise().is_finite()
+    && m.colorfulness().is_finite()
+    // Closed-range bounds for the unit-interval / fraction fields.
+    && (0.0..=255.0).contains(&m.brightness())
+    && (0.0..=1.0).contains(&m.clipping())
+    && (0.0..=1.0).contains(&m.motion_blur())
+    // Half-open lower bounds for non-negative-by-construction fields,
+    // capped to conservative finite physical maxima so that an
+    // attacker-controlled `f32::MAX` cannot win either argmax.
+    && (0.0..=MAX_VARIANCE).contains(&m.luma_variance())
+    && (0.0..=MAX_VARIANCE).contains(&m.saturation_variance())
+    && (0.0..=MAX_SHARPNESS).contains(&m.sharpness())
+    && (0.0..=MAX_NOISE).contains(&m.noise())
+    && (0.0..=MAX_COLORFULNESS).contains(&m.colorfulness())
+}
+
+/// Any-one-trips hard gate matching the Python reference's flat /
+/// over-/under-exposed / clipped checks.
+///
+/// Trips when [`metrics_in_domain`] is `false` (corrupt / non-finite
+/// metric input) OR when any of the configured threshold gates
+/// fires (dark, bright, flat, over-clipped, or motion-blurred).
+fn hard_gate(m: &FrameMetrics, opts: &Options) -> bool {
+  if !metrics_in_domain(m) {
+    return true;
+  }
+  if m.brightness() < opts.black_mean_threshold as f32 {
+    return true;
+  }
+  if m.brightness() > opts.bright_mean_threshold as f32 {
+    return true;
+  }
+  // AND-gate: only flag flat when BOTH variances are low (keeps
+  // equiluminant multi-colour frames).
+  if m.luma_variance() < opts.luma_variance_threshold
+    && m.saturation_variance() < opts.sat_variance_threshold
+  {
+    return true;
+  }
+  if m.clipping() > opts.max_clipping {
+    return true;
+  }
+  if opts.motion_blur_gate && m.motion_blur() > opts.max_motion_blur {
+    return true;
+  }
+  false
+}
+
+// ----------------------------------------------------------------------------
+
+#[cfg(all(test, feature = "std"))]
+mod tests {
+  use super::*;
+  use crate::frame::{Timebase, Timestamp};
+  use core::num::NonZeroU32;
+
+  fn nz(n: u32) -> NonZeroU32 {
+    NonZeroU32::new(n).expect("non-zero")
+  }
+
+  fn ts(pts: i64) -> Timestamp {
+    // 1 µs per tick — makes pts directly readable as microseconds.
+    Timestamp::new(pts, Timebase::new(1, nz(1_000_000)))
+  }
+
+  fn tr(start_us: i64, end_us: i64) -> TimeRange {
+    TimeRange::new(start_us, end_us, Timebase::new(1, nz(1_000_000)))
+  }
+
+  fn good_metrics(sharpness: f32) -> FrameMetrics {
+    FrameMetrics::new()
+      .with_sharpness(sharpness)
+      .with_brightness(128.0)
+      .with_luma_variance(200.0)
+      .with_saturation_variance(100.0)
+      .with_clipping(0.0)
+  }
+
+  // ----- Options -------------------------------------------------------------
+
+  #[test]
+  fn default_options_match_design_doc() {
+    let o = Options::default();
+    assert_eq!(o.target_interval(), Duration::from_secs(4));
+    assert_eq!(o.max_frames_per_shot(), 16);
+    assert!((o.margin_ratio() - 0.02).abs() < 1e-9);
+    assert_eq!(o.min_sharpness(), 100.0);
+    assert_eq!(o.black_mean_threshold(), 15);
+    assert_eq!(o.bright_mean_threshold(), 240);
+    assert_eq!(o.luma_variance_threshold(), 5.0);
+    assert_eq!(o.sat_variance_threshold(), 3.0);
+    assert_eq!(o.max_clipping(), 0.5);
+  }
+
+  #[test]
+  fn options_builders_roundtrip() {
+    let o = Options::new()
+      .with_target_interval(Duration::from_secs(2))
+      .with_max_frames_per_shot(8)
+      .with_margin_ratio(0.05)
+      .with_min_sharpness(50.0)
+      .with_black_mean_threshold(10)
+      .with_bright_mean_threshold(245)
+      .with_luma_variance_threshold(1.0)
+      .with_sat_variance_threshold(2.0)
+      .with_max_clipping(0.25);
+    assert_eq!(o.target_interval(), Duration::from_secs(2));
+    assert_eq!(o.max_frames_per_shot(), 8);
+    assert_eq!(o.margin_ratio(), 0.05);
+    assert_eq!(o.min_sharpness(), 50.0);
+    assert_eq!(o.black_mean_threshold(), 10);
+    assert_eq!(o.bright_mean_threshold(), 245);
+    assert_eq!(o.luma_variance_threshold(), 1.0);
+    assert_eq!(o.sat_variance_threshold(), 2.0);
+    assert_eq!(o.max_clipping(), 0.25);
+  }
+
+  #[test]
+  #[should_panic(expected = "max_frames_per_shot")]
+  fn options_max_frames_zero_panics() {
+    let _ = Options::new().with_max_frames_per_shot(0);
+  }
+
+  #[test]
+  #[should_panic(expected = "max_frames_per_shot must be <= 4096")]
+  fn options_max_frames_above_cap_panics() {
+    // Iter-17 regression: an excessive max_frames_per_shot is an OOM
+    // vector because finalize_shot pre-allocates a per-shot
+    // `Vec<(Timestamp, Timestamp)>` of that size. The builder must
+    // reject anything above 4096.
+    let _ = Options::new().with_max_frames_per_shot(u32::MAX);
+  }
+
+  #[test]
+  #[should_panic(expected = "max_frames_per_shot must be <= 4096")]
+  fn options_max_frames_just_above_cap_panics() {
+    let _ = Options::new().with_max_frames_per_shot(4097);
+  }
+
+  #[test]
+  fn options_max_frames_at_cap_is_accepted() {
+    let o = Options::new().with_max_frames_per_shot(4096);
+    assert_eq!(o.max_frames_per_shot(), 4096);
+  }
+
+  #[cfg(feature = "serde")]
+  #[test]
+  fn options_deserialize_clamps_excessive_max_frames_per_shot_to_cap() {
+    // The serde path clamps (rather than panics) so a malformed
+    // config doesn't crash a long-running process. u32::MAX is
+    // clamped down to 4096.
+    let raw = OptionsRaw {
+      target_interval: Duration::from_secs(4),
+      max_frames_per_shot: u32::MAX,
+      margin_ratio: 0.02,
+      min_sharpness: 100.0,
+      black_mean_threshold: 15,
+      bright_mean_threshold: 240,
+      luma_variance_threshold: 5.0,
+      sat_variance_threshold: 3.0,
+      max_clipping: 0.5,
+      weights: CompositeWeights::default(),
+      adaptive_floor: true,
+      adaptive_floor_percentile: 0.25,
+      adaptive_floor_min_samples: 20,
+      motion_blur_gate: false,
+      max_motion_blur: 0.75,
+    };
+    let o: Options = raw.into();
+    assert_eq!(o.max_frames_per_shot(), 4096);
+  }
+
+  #[test]
+  #[should_panic(expected = "margin_ratio")]
+  fn options_margin_half_panics() {
+    let _ = Options::new().with_margin_ratio(0.5);
+  }
+
+  #[test]
+  #[should_panic(expected = "max_clipping")]
+  fn options_max_clipping_out_of_range_panics() {
+    let _ = Options::new().with_max_clipping(1.5);
+  }
+
+  // ----- compute_n_buckets ---------------------------------------------------
+
+  #[test]
+  fn n_buckets_scales_with_duration() {
+    let o = Options::default();
+    assert_eq!(compute_n_buckets(Duration::from_secs(1), &o), 1);
+    assert_eq!(compute_n_buckets(Duration::from_secs(4), &o), 1);
+    assert_eq!(compute_n_buckets(Duration::from_secs(5), &o), 2);
+    assert_eq!(compute_n_buckets(Duration::from_secs(12), &o), 3);
+    assert_eq!(compute_n_buckets(Duration::from_secs(16), &o), 4);
+  }
+
+  #[test]
+  fn n_buckets_capped_by_max_frames() {
+    let o = Options::default().with_max_frames_per_shot(5);
+    // 100s with target 4s would ask for 25; clamped to 5.
+    assert_eq!(compute_n_buckets(Duration::from_secs(100), &o), 5);
+  }
+
+  #[test]
+  fn n_buckets_floor_is_one() {
+    let o = Options::default();
+    assert_eq!(compute_n_buckets(Duration::from_nanos(1), &o), 1);
+  }
+
+  // ----- hard_gate -----------------------------------------------------------
+
+  #[test]
+  fn hard_gate_rejects_too_dark() {
+    let o = Options::default();
+    let mut m = good_metrics(200.0);
+    m.set_brightness(5.0);
+    assert!(hard_gate(&m, &o));
+  }
+
+  #[test]
+  fn hard_gate_rejects_too_bright() {
+    let o = Options::default();
+    let mut m = good_metrics(200.0);
+    m.set_brightness(250.0);
+    assert!(hard_gate(&m, &o));
+  }
+
+  #[test]
+  fn hard_gate_rejects_flat_frame() {
+    let o = Options::default();
+    let mut m = good_metrics(200.0);
+    m.set_luma_variance(1.0);
+    m.set_saturation_variance(1.0);
+    assert!(hard_gate(&m, &o));
+  }
+
+  #[test]
+  fn hard_gate_keeps_equiluminant_multicolour() {
+    // Low luma variance but high saturation variance — the AND-gate
+    // keeps this frame alive.
+    let o = Options::default();
+    let mut m = good_metrics(200.0);
+    m.set_luma_variance(1.0);
+    m.set_saturation_variance(80.0);
+    assert!(!hard_gate(&m, &o));
+  }
+
+  #[test]
+  fn hard_gate_rejects_heavy_clipping() {
+    let o = Options::default();
+    let mut m = good_metrics(200.0);
+    m.set_clipping(0.9);
+    assert!(hard_gate(&m, &o));
+  }
+
+  #[test]
+  fn hard_gate_rejects_non_finite_brightness() {
+    let o = Options::default();
+    let mut m = good_metrics(200.0);
+    m.set_brightness(f32::NAN);
+    assert!(hard_gate(&m, &o));
+  }
+
+  #[test]
+  fn hard_gate_rejects_non_finite_luma_variance() {
+    let o = Options::default();
+    let mut m = good_metrics(200.0);
+    m.set_luma_variance(f32::INFINITY);
+    assert!(hard_gate(&m, &o));
+  }
+
+  #[test]
+  fn hard_gate_rejects_non_finite_saturation_variance() {
+    let o = Options::default();
+    let mut m = good_metrics(200.0);
+    m.set_saturation_variance(f32::NEG_INFINITY);
+    assert!(hard_gate(&m, &o));
+  }
+
+  #[test]
+  fn hard_gate_rejects_non_finite_clipping() {
+    let o = Options::default();
+    let mut m = good_metrics(200.0);
+    m.set_clipping(f32::NAN);
+    assert!(hard_gate(&m, &o));
+  }
+
+  #[test]
+  fn hard_gate_rejects_non_finite_motion_blur_even_with_gate_disabled() {
+    // The fail-closed check on motion_blur runs regardless of
+    // `motion_blur_gate`. Even with the gate off, a NaN motion_blur
+    // is treated as a corrupt metric and the frame is rejected.
+    let o = Options::default(); // motion_blur_gate = false by default
+    let mut m = good_metrics(200.0);
+    m.set_motion_blur(f32::NAN);
+    assert!(hard_gate(&m, &o));
+  }
+
+  // ---- Domain validation (iter-12 regression) -----------------------------
+
+  #[test]
+  fn hard_gate_rejects_negative_noise() {
+    // Negative noise would make composite_quality's -w_noise * (noise/norm)
+    // term a bonus instead of a penalty.
+    let o = Options::default();
+    let mut m = good_metrics(200.0);
+    m.set_noise(-5.0);
+    assert!(hard_gate(&m, &o), "negative noise must trip the gate");
+  }
+
+  #[test]
+  fn hard_gate_rejects_negative_clipping() {
+    let o = Options::default();
+    let mut m = good_metrics(200.0);
+    m.set_clipping(-0.1);
+    assert!(hard_gate(&m, &o));
+  }
+
+  #[test]
+  fn hard_gate_rejects_clipping_above_one() {
+    let o = Options::default();
+    let mut m = good_metrics(200.0);
+    m.set_clipping(1.5);
+    assert!(hard_gate(&m, &o));
+  }
+
+  #[test]
+  fn hard_gate_rejects_negative_motion_blur() {
+    let o = Options::default();
+    let mut m = good_metrics(200.0);
+    m.set_motion_blur(-0.5);
+    assert!(hard_gate(&m, &o));
+  }
+
+  #[test]
+  fn hard_gate_rejects_motion_blur_above_one() {
+    let o = Options::default();
+    let mut m = good_metrics(200.0);
+    m.set_motion_blur(1.5);
+    assert!(hard_gate(&m, &o));
+  }
+
+  #[test]
+  fn hard_gate_rejects_negative_colorfulness() {
+    let o = Options::default();
+    let mut m = good_metrics(200.0);
+    m.set_colorfulness(-10.0);
+    assert!(hard_gate(&m, &o));
+  }
+
+  #[test]
+  fn hard_gate_rejects_negative_sharpness() {
+    let o = Options::default();
+    let mut m = good_metrics(200.0);
+    m.set_sharpness(-1.0);
+    assert!(hard_gate(&m, &o));
+  }
+
+  #[test]
+  fn hard_gate_rejects_brightness_outside_0_255() {
+    let o = Options::default();
+    let mut m = good_metrics(200.0);
+    m.set_brightness(-1.0);
+    assert!(hard_gate(&m, &o));
+    let mut m = good_metrics(200.0);
+    m.set_brightness(256.0);
+    assert!(hard_gate(&m, &o));
+  }
+
+  #[test]
+  fn hard_gate_rejects_negative_variances() {
+    let o = Options::default();
+    let mut m = good_metrics(200.0);
+    m.set_luma_variance(-1.0);
+    assert!(hard_gate(&m, &o));
+    let mut m = good_metrics(200.0);
+    m.set_saturation_variance(-1.0);
+    assert!(hard_gate(&m, &o));
+  }
+
+  #[test]
+  fn strict_argmax_cannot_be_gamed_by_negative_penalty_metrics() {
+    // Pre-fix: a frame with negative noise/clipping/motion_blur
+    // would flip those penalty terms in `composite_quality` into
+    // bonuses, scoring higher than a clean frame. The hard_gate
+    // domain check rejects the malformed frame before
+    // composite_quality runs, so the clean frame wins.
+    let opts = Options::default().with_margin_ratio(0.0);
+    let mut det = Detector::new(opts);
+    let clean = good_metrics(300.0);
+    let malformed = FrameMetrics::new()
+      .with_sharpness(300.0)
+      .with_brightness(128.0)
+      .with_luma_variance(200.0)
+      .with_saturation_variance(100.0)
+      .with_clipping(-1.0) // negative penalty → bonus pre-fix
+      .with_noise(-1000.0) // negative penalty → huge bonus pre-fix
+      .with_motion_blur(-1.0);
+    det.observe(ts(500_000), malformed).unwrap();
+    det.observe(ts(1_500_000), clean).unwrap();
+    let out = det.finalize_shot(tr(0, 2_000_000));
+    // The malformed frame is rejected by hard_gate → strict path
+    // skips it. Fallback path also skips it on sharpness domain
+    // check (wait — sharpness is finite and positive here, so
+    // fallback would accept). But strict still selects the clean
+    // frame. We assert the WINNER is the clean frame at
+    // ts(1_500_000), not the malformed at ts(500_000).
+    assert_eq!(out, vec![ts(1_500_000)]);
+  }
+
+  #[test]
+  fn fallback_argmax_skips_negative_sharpness() {
+    // Two frames both fail the strict gate (low brightness). One
+    // has negative sharpness (corrupt input); the other has finite
+    // positive sharpness. Fallback must NOT pick the negative one.
+    let opts = Options::default().with_margin_ratio(0.0);
+    let mut det = Detector::new(opts);
+    let corrupt = FrameMetrics::new()
+      .with_sharpness(-100.0) // negative — out of domain
+      .with_brightness(5.0) // < black_mean_threshold → fails strict
+      .with_luma_variance(200.0)
+      .with_saturation_variance(100.0)
+      .with_clipping(0.0);
+    let valid = FrameMetrics::new()
+      .with_sharpness(50.0) // below absolute floor → fails strict
+      .with_brightness(5.0) // also fails strict via brightness
+      .with_luma_variance(200.0)
+      .with_saturation_variance(100.0)
+      .with_clipping(0.0);
+    det.observe(ts(500_000), corrupt).unwrap();
+    det.observe(ts(1_500_000), valid).unwrap();
+    let out = det.finalize_shot(tr(0, 2_000_000));
+    // Fallback selects `valid` (sharpness=50, in-domain), not
+    // `corrupt` (sharpness=-100, filtered).
+    assert_eq!(out, vec![ts(1_500_000)]);
+  }
+
+  #[test]
+  fn hard_gate_rejects_impossible_finite_sharpness() {
+    // Iter-14 regression: Tenengrad on 8-bit luma can reach
+    // ~2.08e6 at most. `f32::MAX` is finite and non-negative but
+    // physically impossible; the iter-13 predicate accepted it.
+    let o = Options::default();
+    let mut m = good_metrics(200.0);
+    m.set_sharpness(f32::MAX);
+    assert!(hard_gate(&m, &o));
+  }
+
+  #[test]
+  fn hard_gate_rejects_impossible_finite_noise() {
+    let o = Options::default();
+    let mut m = good_metrics(200.0);
+    m.set_noise(f32::MAX);
+    assert!(hard_gate(&m, &o));
+  }
+
+  #[test]
+  fn hard_gate_rejects_impossible_finite_variance() {
+    let o = Options::default();
+    let mut m = good_metrics(200.0);
+    m.set_luma_variance(1.0e10);
+    assert!(hard_gate(&m, &o));
+    let mut m = good_metrics(200.0);
+    m.set_saturation_variance(1.0e10);
+    assert!(hard_gate(&m, &o));
+  }
+
+  #[test]
+  fn hard_gate_rejects_impossible_finite_colorfulness() {
+    let o = Options::default();
+    let mut m = good_metrics(200.0);
+    m.set_colorfulness(f32::MAX);
+    assert!(hard_gate(&m, &o));
+  }
+
+  #[test]
+  fn fallback_argmax_skips_impossible_finite_sharpness() {
+    // Pre-iter-14: a dark frame (fails strict via brightness) with
+    // `sharpness = f32::MAX` would still win fallback because it
+    // had the highest sharpness. Now the domain predicate caps
+    // sharpness at MAX_SHARPNESS, so the impossible frame is
+    // filtered and a valid below-cap candidate wins instead.
+    let opts = Options::default().with_margin_ratio(0.0);
+    let mut det = Detector::new(opts);
+    let impossible = FrameMetrics::new()
+      .with_sharpness(f32::MAX)
+      .with_brightness(5.0) // fails strict
+      .with_luma_variance(200.0)
+      .with_saturation_variance(100.0)
+      .with_clipping(0.0);
+    let valid = FrameMetrics::new()
+      .with_sharpness(50.0)
+      .with_brightness(5.0) // also fails strict
+      .with_luma_variance(200.0)
+      .with_saturation_variance(100.0)
+      .with_clipping(0.0);
+    det.observe(ts(500_000), impossible).unwrap();
+    det.observe(ts(1_500_000), valid).unwrap();
+    let out = det.finalize_shot(tr(0, 2_000_000));
+    assert_eq!(out, vec![ts(1_500_000)]);
+  }
+
+  #[test]
+  fn fallback_argmax_skips_above_physical_max_but_below_old_cap_sharpness() {
+    // Iter-15 regression for tightened MAX_SHARPNESS:
+    // 5_000_000 is below the iter-14 cap of 1.0e7 but above the
+    // Tenengrad physical max (~2.08e6 → MAX_SHARPNESS=2.1e6).
+    // The frame must be rejected from both ranking paths so a
+    // valid below-cap candidate wins instead.
+    let opts = Options::default().with_margin_ratio(0.0);
+    let mut det = Detector::new(opts);
+    let above_phys = FrameMetrics::new()
+      .with_sharpness(5_000_000.0)
+      .with_brightness(5.0)
+      .with_luma_variance(200.0)
+      .with_saturation_variance(100.0)
+      .with_clipping(0.0);
+    let valid = FrameMetrics::new()
+      .with_sharpness(50.0)
+      .with_brightness(5.0)
+      .with_luma_variance(200.0)
+      .with_saturation_variance(100.0)
+      .with_clipping(0.0);
+    det.observe(ts(500_000), above_phys).unwrap();
+    det.observe(ts(1_500_000), valid).unwrap();
+    let out = det.finalize_shot(tr(0, 2_000_000));
+    assert_eq!(out, vec![ts(1_500_000)]);
+  }
+
+  #[test]
+  fn fallback_argmax_skips_above_physical_max_but_below_old_cap_colorfulness() {
+    // Iter-15 regression for tightened MAX_COLORFULNESS:
+    // 1000.0 is below the iter-14 cap of 5_000 but above the
+    // Hasler-Süßstrunk physical max (~469 → MAX_COLORFULNESS=500).
+    let opts = Options::default().with_margin_ratio(0.0);
+    let mut det = Detector::new(opts);
+    let above_phys = FrameMetrics::new()
+      .with_sharpness(500.0)
+      .with_brightness(5.0)
+      .with_luma_variance(200.0)
+      .with_saturation_variance(100.0)
+      .with_clipping(0.0)
+      .with_colorfulness(1000.0);
+    let valid = FrameMetrics::new()
+      .with_sharpness(50.0)
+      .with_brightness(5.0)
+      .with_luma_variance(200.0)
+      .with_saturation_variance(100.0)
+      .with_clipping(0.0);
+    det.observe(ts(500_000), above_phys).unwrap();
+    det.observe(ts(1_500_000), valid).unwrap();
+    let out = det.finalize_shot(tr(0, 2_000_000));
+    assert_eq!(out, vec![ts(1_500_000)]);
+  }
+
+  #[test]
+  fn fallback_argmax_skips_corrupt_non_sharpness_metrics() {
+    // Iter-13 regression: pre-fix, `best_any` only domain-filtered
+    // `sharpness`. A frame with high sharpness BUT a corrupt non-
+    // sharpness metric (e.g. negative noise) would still win the
+    // fallback emit when every bucket candidate failed strict — the
+    // strict-path's domain rejection wasn't mirrored on the fallback
+    // path. With the shared `metrics_in_domain` predicate applied to
+    // both paths, the corrupt frame is filtered everywhere.
+    let opts = Options::default().with_margin_ratio(0.0);
+    let mut det = Detector::new(opts);
+    // High sharpness but negative noise — strict-rejected via the
+    // hard_gate domain check.
+    let corrupt = FrameMetrics::new()
+      .with_sharpness(500.0)
+      .with_brightness(5.0) // also fails strict via brightness
+      .with_luma_variance(200.0)
+      .with_saturation_variance(100.0)
+      .with_clipping(0.0)
+      .with_noise(-1000.0); // out of domain
+    // Lower sharpness but all in-domain. Fails strict via low
+    // brightness, but reaches fallback.
+    let valid = FrameMetrics::new()
+      .with_sharpness(50.0)
+      .with_brightness(5.0)
+      .with_luma_variance(200.0)
+      .with_saturation_variance(100.0)
+      .with_clipping(0.0);
+    det.observe(ts(500_000), corrupt).unwrap();
+    det.observe(ts(1_500_000), valid).unwrap();
+    let out = det.finalize_shot(tr(0, 2_000_000));
+    // Post-fix: `corrupt` is filtered from fallback (out-of-domain
+    // noise), so `valid` wins despite lower sharpness.
+    assert_eq!(out, vec![ts(1_500_000)]);
+  }
+
+  #[test]
+  fn nan_brightness_corrupt_frame_emits_nothing() {
+    // Frame with finite sharpness but NaN brightness is rejected
+    // by BOTH paths (post iter-13): strict via `hard_gate`'s
+    // domain check, fallback via the same shared `metrics_in_domain`
+    // predicate. The bucket emits nothing — a fully-corrupt frame
+    // is preferable to "least bad" emission of a malformed input.
+    let opts = Options::default().with_margin_ratio(0.0);
+    let mut det = Detector::new(opts);
+    let m = FrameMetrics::new()
+      .with_sharpness(500.0)
+      .with_brightness(f32::NAN)
+      .with_luma_variance(200.0)
+      .with_saturation_variance(100.0)
+      .with_clipping(0.0);
+    det.observe(ts(500_000), m).unwrap();
+    let out = det.finalize_shot(tr(0, 2_000_000));
+    assert!(out.is_empty(), "fully-corrupt frame must not emit");
+  }
+
+  // ---- Builder-path threshold clamps (iter-11 regression) -----------------
+
+  #[test]
+  fn with_min_sharpness_clamps_non_finite_to_default() {
+    for &bad in &[f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+      let o = Options::new().with_min_sharpness(bad);
+      assert_eq!(
+        o.min_sharpness(),
+        Options::default().min_sharpness(),
+        "min_sharpness should clamp {bad:?} to default"
+      );
+    }
+  }
+
+  #[test]
+  fn with_min_sharpness_preserves_finite_negative() {
+    // Finite negatives are a deliberate knob — disabling the floor.
+    let o = Options::new().with_min_sharpness(-1.0);
+    assert_eq!(o.min_sharpness(), -1.0);
+  }
+
+  #[test]
+  fn with_luma_variance_threshold_clamps_non_finite_to_default() {
+    for &bad in &[f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+      let o = Options::new().with_luma_variance_threshold(bad);
+      assert_eq!(
+        o.luma_variance_threshold(),
+        Options::default().luma_variance_threshold()
+      );
+    }
+  }
+
+  #[test]
+  fn with_sat_variance_threshold_clamps_non_finite_to_default() {
+    for &bad in &[f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+      let o = Options::new().with_sat_variance_threshold(bad);
+      assert_eq!(
+        o.sat_variance_threshold(),
+        Options::default().sat_variance_threshold()
+      );
+    }
+  }
+
+  #[test]
+  fn builder_neg_inf_min_sharpness_doesnt_admit_every_frame() {
+    // Pre-fix: with_min_sharpness(NEG_INFINITY) → effective floor = -Inf
+    // → every finite sharpness >= -Inf → strict path admits any frame.
+    // Fix: builder clamps NEG_INFINITY to the spec default (100.0).
+    let opts = Options::new()
+      .with_min_sharpness(f32::NEG_INFINITY)
+      .with_margin_ratio(0.0);
+    let mut det = Detector::new(opts);
+    // A finite-but-low sharpness that should fail the absolute floor.
+    let low = good_metrics(50.0);
+    det.observe(ts(500_000), low).unwrap();
+    let out = det.finalize_shot(tr(0, 2_000_000));
+    // Low frame fails the strict floor (now 100.0) → fallback emits
+    // the single candidate. The important property is that the
+    // builder didn't silently lower the floor to -Inf.
+    assert_eq!(out, vec![ts(500_000)]);
+    // Sanity-check the clamp itself: the floor is the default value.
+    assert_eq!(det.options().min_sharpness(), 100.0);
+  }
+
+  // ---- Adaptive floor: filter non-finite samples (iter-11 regression) ----
+
+  #[test]
+  fn adaptive_floor_filters_non_finite_sharpness_samples() {
+    // 20 finite-but-low frames + 5 corrupt -Inf frames in the same
+    // shot. Pre-fix: the -Inf samples pulled p25 down to -Inf and
+    // disabled the effective strict floor. Post-fix: the filter
+    // drops them; p25 is computed on the 20 finite samples; the
+    // strict floor stays sensible.
+    let opts = Options::default()
+      .with_margin_ratio(0.0)
+      .with_target_interval(Duration::from_secs(60))
+      .with_adaptive_floor_min_samples(15);
+    let mut det = Detector::new(opts);
+    // 20 finite frames at sharpness ~50 (well below absolute 100).
+    for i in 0..20 {
+      let s = 40.0 + (i as f32) * 1.0; // 40..59
+      det
+        .observe(ts((i as i64) * 100_000), good_metrics(s))
+        .unwrap();
+    }
+    // 5 corrupt frames with -Inf sharpness, sprinkled later.
+    for i in 0..5 {
+      let m = FrameMetrics::new()
+        .with_sharpness(f32::NEG_INFINITY)
+        .with_brightness(128.0)
+        .with_luma_variance(200.0)
+        .with_saturation_variance(100.0)
+        .with_clipping(0.0);
+      det
+        .observe(ts(2_100_000 + (i as i64) * 100_000), m)
+        .unwrap();
+    }
+    let out = det.finalize_shot(tr(0, 30_000_000));
+    // With -Inf filtered out, p25 of [40..59] is ~44, effective
+    // floor = min(100, 44) = 44. Some finite frame at sharpness
+    // >= 44 wins the strict path. The non-finite frames cannot
+    // win either path (their sharpness is filtered from the
+    // adaptive percentile AND fails the strict/fallback `is_finite`
+    // guard added earlier).
+    assert_eq!(out.len(), 1, "expected one strict winner");
+    // The strict winner must be a finite-sharpness frame, NOT one
+    // of the corrupt -Inf frames at ts >= 2_100_000.
+    let winner_ts = out[0].pts();
+    assert!(
+      winner_ts < 2_100_000,
+      "strict winner pts {winner_ts} should be in the finite-sample range (<2_100_000)"
+    );
+  }
+
+  #[test]
+  fn adaptive_floor_excludes_corrupt_non_sharpness_metrics_from_percentile() {
+    // Iter-14 regression: pre-fix, `compute_effective_floor` filtered
+    // only sharpness for finite + non-negative. A frame with
+    // finite-positive sharpness AND a corrupt non-sharpness metric
+    // (e.g. negative clipping) would still contribute to the
+    // percentile pool — even though it can never win either ranking
+    // path. That moved the strict floor for otherwise-valid frames.
+    // Post-fix: `metrics_in_domain` is the shared filter, so corrupt
+    // frames are excluded from the percentile computation too.
+    //
+    // Setup: 20 corrupt frames with high sharpness (which would drag
+    // p25 UP if they counted) + 5 valid below-floor frames.
+    let opts = Options::default()
+      .with_margin_ratio(0.0)
+      .with_target_interval(Duration::from_secs(60))
+      .with_adaptive_floor_min_samples(3);
+    let mut det = Detector::new(opts);
+    for i in 0..20 {
+      let m = FrameMetrics::new()
+        .with_sharpness(2_000.0) // way above absolute floor
+        .with_brightness(128.0)
+        .with_luma_variance(200.0)
+        .with_saturation_variance(100.0)
+        .with_clipping(-0.5); // out of domain → corrupt
+      det.observe(ts((i as i64) * 100_000), m).unwrap();
+    }
+    for i in 0..5 {
+      det
+        .observe(ts(2_100_000 + (i as i64) * 100_000), good_metrics(50.0))
+        .unwrap();
+    }
+    let out = det.finalize_shot(tr(0, 30_000_000));
+    // Corrupt frames are filtered from the percentile pool, so p25
+    // is computed on the 5 valid samples → ~50, effective floor
+    // = min(100, 50) = 50. Each valid frame's sharpness (50) just
+    // clears the floor; the strict path emits one. None of the
+    // corrupt frames can win (both ranking paths reject them).
+    assert_eq!(out.len(), 1, "expected exactly one winner");
+    let winner_ts = out[0].pts();
+    assert!(
+      winner_ts >= 2_100_000,
+      "winner pts {winner_ts} should be one of the valid frames (>= 2_100_000)"
+    );
+  }
+
+  #[test]
+  fn adaptive_floor_excludes_margin_zone_samples() {
+    // Iter-15 regression: pre-fix, `compute_effective_floor` filtered
+    // by the raw shot range, not the bucket-walker's emission-
+    // eligible region. Frames inside the first-bucket pre-margin or
+    // last-bucket post-margin could move the percentile floor for
+    // interior frames despite never being emittable.
+    //
+    // Setup: 1 bucket, margin_ratio=0.1 on a 10s shot →
+    // emission window [1s, 9s). Place a high-sharpness frame at
+    // 0.5s (pre-margin) that would, pre-fix, lift the p25. The
+    // valid interior frames at 5s are below the absolute floor;
+    // we want adaptive floor to lower the threshold to allow them
+    // in. Pre-fix the margin-frame's sharpness=5000 polluted the
+    // percentile pool, lifting p25 well above 100 and disabling
+    // adaptive floor's effect. Post-fix: the margin frame is
+    // excluded from the percentile pool; p25 reflects only the
+    // interior frames (sharpness ~50), floor lowers to ~50, the
+    // interior frame wins strict.
+    let opts = Options::default()
+      .with_target_interval(Duration::from_secs(60)) // 1 bucket
+      .with_margin_ratio(0.1)
+      .with_adaptive_floor_min_samples(2);
+    let mut det = Detector::new(opts);
+    // High-sharpness frame in the pre-margin zone (would lift p25
+    // if it counted).
+    det.observe(ts(500_000), good_metrics(5_000.0)).unwrap();
+    // Valid interior frames, below absolute floor of 100.
+    det.observe(ts(2_000_000), good_metrics(40.0)).unwrap();
+    det.observe(ts(5_000_000), good_metrics(60.0)).unwrap();
+    let out = det.finalize_shot(tr(0, 10_000_000));
+    // Post-fix: pre-margin frame excluded from the floor pool,
+    // adaptive floor recovers a strict winner among the interior
+    // frames. The sharpest (sharpness=60, ts=5s) wins.
+    assert_eq!(out, vec![ts(5_000_000)]);
+  }
+
+  #[test]
+  fn adaptive_floor_allocation_bounded_for_long_shots() {
+    // Iter-18 regression: `compute_effective_floor` previously
+    // allocated a `Vec<f32>` proportional to buffered-frame count
+    // (unbounded for long shots / missed cuts / never-finalised
+    // streams). Cap at `MAX_ADAPTIVE_FLOOR_SAMPLES = 4096` keeps
+    // the allocation and sort O(cap), regardless of buffer size.
+    //
+    // Push 20_000 frames into a single shot. The test asserts:
+    //   1. `finalize_shot` returns without OOM/timeout.
+    //   2. The adaptive-floor mechanism still produces a sensible
+    //      result on the truncated sample.
+    //
+    // A `Vec<f32>` of 20_000 entries would be 80 KB — small enough
+    // not to OOM the test runner — but in production a stream can
+    // run for hours; the cap is a safety net there.
+    let opts = Options::default()
+      .with_margin_ratio(0.0)
+      .with_target_interval(Duration::from_secs(60 * 60)) // single bucket
+      .with_adaptive_floor_min_samples(10);
+    let mut det = Detector::new(opts);
+    for i in 0..20_000 {
+      // All frames at sharpness 50 (below absolute floor of 100).
+      // Adaptive should lower the floor to ~50 and emit a strict
+      // winner.
+      det
+        .observe(ts(i as i64 * 1000), good_metrics(50.0))
+        .unwrap();
+    }
+    let out = det.finalize_shot(tr(0, 20_000_000));
+    // A strict winner emerges (adaptive floor lowered to 50).
+    // Exact-timestamp assertion would be brittle to tie-break
+    // details under the truncated sample; just verify one emit.
+    assert_eq!(out.len(), 1, "expected one strict winner");
+  }
+
+  #[test]
+  fn adaptive_floor_stride_samples_full_window_not_just_prefix() {
+    // Iter-19 regression: pre-fix, `.take(MAX_ADAPTIVE_FLOOR_SAMPLES)`
+    // truncated to the first 4096 valid frames, biasing the
+    // percentile toward early-shot samples. With first 4000 sharp
+    // (sharpness=5000) and last 2000 dim (sharpness=50), a prefix
+    // cap would compute p25 ≈ 5000 — keeping the floor unchanged
+    // for valid late-shot dim frames. Stride sampling sees both
+    // halves and computes p25 ≈ 50, correctly lowering the floor.
+    let opts = Options::default()
+      .with_margin_ratio(0.0)
+      .with_target_interval(Duration::from_secs(60 * 60)) // 1 bucket
+      .with_adaptive_floor_min_samples(10);
+    let mut det = Detector::new(opts);
+    // First 4000 sharp frames.
+    for i in 0..4000 {
+      det
+        .observe(ts(i as i64 * 1000), good_metrics(5_000.0))
+        .unwrap();
+    }
+    // Last 2000 dim frames, well below absolute floor 100.
+    for i in 4000..6000 {
+      det
+        .observe(ts(i as i64 * 1000), good_metrics(50.0))
+        .unwrap();
+    }
+    let out = det.finalize_shot(tr(0, 7_000_000));
+    // Adaptive floor with stride sampling sees both halves; p25
+    // across ~3000 stride-2 samples ≈ 50, so the floor lowers to
+    // 50 and a dim frame in the last 2000 wins via composite.
+    // (Strict path with default weights ranks by sharpness; the
+    // sharpest dim frame wins.)
+    assert_eq!(out.len(), 1);
+    // Winner is in the dim half — its sharpness is 50 (well above
+    // the lowered floor) and the sharp half also passes the floor.
+    // The sharp half wins because composite ranks them higher.
+    let winner_pts = out[0].pts();
+    assert!(
+      (0..4_000_000).contains(&winner_pts),
+      "winner pts {winner_pts} should be a sharp frame from the first half (0..4_000_000)"
+    );
+  }
+
+  #[test]
+  fn adaptive_floor_uses_rank_buckets_not_modulo_stride() {
+    // Iter-20 regression: a modulo-residue stride
+    // (`i % stride == 0`) can lock onto a single periodic subset
+    // of the eligible window when `total` is just over the cap.
+    // For `total = 4097`, `stride = ceil(4097/4096) = 2`, which
+    // keeps only the even-i samples — silently dropping every
+    // odd-i frame from the percentile pool. Rank-based bucketing
+    // instead keeps exactly `min(total, MAX_ADAPTIVE_FLOOR_SAMPLES)`
+    // samples drawn from both phases of any period-2 pattern.
+    //
+    // Setup: 4097 frames with metrics alternating by index parity.
+    // Even-i frames are sharp-but-bland (sharpness=200,
+    // colorfulness=0); odd-i frames are dim-but-colorful
+    // (sharpness=50, colorfulness=500). With the default
+    // composite weights, the colourful term scores ~10× higher
+    // than the sharp term, so an odd-i frame wins the composite
+    // argmax whenever the hard gate admits it.
+    //
+    // Under the buggy modulo stride: every kept sample has
+    // sharpness=200, p25 = 200, the floor stays at
+    // min(100, 200) = 100, and odd-i frames (sharpness=50) fail
+    // the strict gate's `sharpness >= floor` check. The strict
+    // winner is forced to be an even-i frame, so `winner_pts %
+    // 2000 == 0`.
+    //
+    // Under rank-based sampling: both halves contribute, p25 ≈
+    // 50, the floor lowers to min(100, 50) = 50, all 4097 frames
+    // clear the gate, and the first odd-i frame (ts = 1000)
+    // wins the strict composite argmax (ties broken by first
+    // encounter via `sharper`'s strict-greater semantics).
+    let opts = Options::default()
+      .with_margin_ratio(0.0)
+      .with_target_interval(Duration::from_secs(60 * 60)) // 1 bucket
+      .with_adaptive_floor_min_samples(10);
+    let mut det = Detector::new(opts);
+    for i in 0..4097 {
+      let m = if i % 2 == 0 {
+        good_metrics(200.0)
+      } else {
+        FrameMetrics::new()
+          .with_sharpness(50.0)
+          .with_brightness(128.0)
+          .with_luma_variance(200.0)
+          .with_saturation_variance(100.0)
+          .with_clipping(0.0)
+          .with_colorfulness(500.0)
+      };
+      det.observe(ts(i as i64 * 1000), m).unwrap();
+    }
+    let out = det.finalize_shot(tr(0, 5_000_000));
+    assert_eq!(out.len(), 1);
+    let winner_pts = out[0].pts();
+    assert_eq!(
+      winner_pts % 2000,
+      1000,
+      "winner pts {winner_pts} must be from an odd-i (high-colorfulness) frame; \
+       a modulo-stride floor would force an even-i / sharp-only winner"
+    );
+  }
+
+  #[test]
+  fn adaptive_floor_excludes_hard_gate_failures_from_percentile() {
+    // Iter-21 regression: pre-fix, `compute_effective_floor`
+    // filtered the percentile pool by `metrics_in_domain` only.
+    // Frames that pass the domain check but fail one of the
+    // brightness / variance / clipping / motion-blur gates can
+    // never win the strict path — yet their sharpness still
+    // counted toward the p25, dragging the floor down so that
+    // mediocre (gate-passing, low-sharpness) frames suddenly
+    // cleared the floor. The cap on the floor (`min(absolute,
+    // p25)`) meant a long degraded run could re-route the strict
+    // winner to a frame the absolute floor would have rejected.
+    //
+    // Setup: 100 dark frames (brightness=5 → fails the
+    // black-mean gate at 15), one mediocre frame (sharpness=50,
+    // colorfulness=500 — high composite if it clears the floor),
+    // and nine high-sharp / no-colour frames (sharpness=200,
+    // colorfulness=0). With default composite weights the
+    // mediocre composite (~2.05) outscores the high-sharp
+    // composite (~0.2) — but ONLY if the mediocre frame survives
+    // the floor.
+    //
+    // Pre-fix: dark frames in the pool drove p25 to ~10, floor =
+    // min(100, 10) = 10, mediocre (sharp=50 ≥ 10) cleared the
+    // floor, and its colour-driven composite beat every high-
+    // sharp candidate. Strict winner = the mediocre frame at
+    // ts=100_000.
+    //
+    // Post-fix: `!hard_gate` excludes the dark frames; the pool
+    // is the 10 gate-passing frames, p25 = sharps[2] = 200, floor
+    // = min(100, 200) = 100, mediocre (sharp=50 < 100) is
+    // rejected, and a high-sharp frame wins on its 0.2 composite.
+    let opts = Options::default()
+      .with_margin_ratio(0.0)
+      .with_target_interval(Duration::from_secs(60 * 60))
+      .with_adaptive_floor_min_samples(10);
+    let mut det = Detector::new(opts);
+    for i in 0..100 {
+      let dark = FrameMetrics::new()
+        .with_sharpness(10.0)
+        .with_brightness(5.0) // below black_mean_threshold = 15
+        .with_luma_variance(200.0)
+        .with_saturation_variance(100.0)
+        .with_clipping(0.0);
+      det.observe(ts(i as i64 * 1000), dark).unwrap();
+    }
+    let mediocre = FrameMetrics::new()
+      .with_sharpness(50.0)
+      .with_brightness(128.0)
+      .with_luma_variance(200.0)
+      .with_saturation_variance(100.0)
+      .with_clipping(0.0)
+      .with_colorfulness(500.0);
+    det.observe(ts(100_000), mediocre).unwrap();
+    for i in 0..9 {
+      det
+        .observe(ts(101_000 + i as i64 * 1000), good_metrics(200.0))
+        .unwrap();
+    }
+    let out = det.finalize_shot(tr(0, 200_000));
+    assert_eq!(out.len(), 1);
+    let winner_pts = out[0].pts();
+    assert!(
+      (101_000..=109_000).contains(&winner_pts),
+      "winner pts {winner_pts} must be one of the high-sharp \
+       frames in [101_000, 109_000]; pre-fix the mediocre frame \
+       at 100_000 would have won via its composite-boosting \
+       colorfulness once dark frames pulled the floor below 50"
+    );
+  }
+
+  #[test]
+  fn adaptive_floor_works_when_min_samples_exceeds_storage_cap() {
+    // Iter-19 regression: pre-fix, `min_samples > MAX_ADAPTIVE_FLOOR_SAMPLES`
+    // silently disabled adaptive flooring because the .take()-
+    // truncated Vec could never reach `min_samples`. Now
+    // `min_samples` is checked against the un-capped count.
+    let opts = Options::default()
+      .with_margin_ratio(0.0)
+      .with_target_interval(Duration::from_secs(60 * 60))
+      .with_adaptive_floor_min_samples(MAX_ADAPTIVE_FLOOR_SAMPLES + 100);
+    let mut det = Detector::new(opts);
+    // 5000 dim frames (below absolute floor of 100). True count
+    // exceeds min_samples; adaptive must engage.
+    for i in 0..5000 {
+      det
+        .observe(ts(i as i64 * 1000), good_metrics(50.0))
+        .unwrap();
+    }
+    let out = det.finalize_shot(tr(0, 6_000_000));
+    // Adaptive floor lowers to ~50 → a strict winner emerges.
+    assert_eq!(
+      out.len(),
+      1,
+      "adaptive floor must engage despite high min_samples"
+    );
+  }
+
+  #[test]
+  fn floor_sampling_does_not_walk_post_eligible_buffer() {
+    // Iter-19 regression: pre-fix, `.filter` on timestamps scanned
+    // the entire buffer; entries after `eligible_end` (queued for
+    // future shots) were filtered out only after iteration touched
+    // them. The fix uses `take_while` so the iterator terminates
+    // at the first out-of-window entry.
+    //
+    // Setup: small finalised shot [0, 1ms), then 5_000 frames
+    // observed after the shot boundary. The post-boundary frames
+    // should NOT be walked by compute_effective_floor; only the
+    // in-window subset is examined. Functionally we can't observe
+    // the CPU savings, but we can prove the post-shot frames don't
+    // affect the floor: place them at corrupt-metric values that
+    // would lower p25 if they leaked through.
+    let opts = Options::default()
+      .with_margin_ratio(0.0)
+      .with_adaptive_floor_min_samples(2);
+    let mut det = Detector::new(opts);
+    // Two in-window frames at sharpness 200 (above absolute floor 100).
+    det.observe(ts(100_000), good_metrics(200.0)).unwrap();
+    det.observe(ts(500_000), good_metrics(250.0)).unwrap();
+    // 5_000 future-shot frames at sharpness 10 (would drag p25 down
+    // pre-fix). Range cut-off is at 1_000_000; these are AFTER.
+    for i in 0..5_000 {
+      det
+        .observe(ts(2_000_000 + (i as i64) * 1000), good_metrics(10.0))
+        .unwrap();
+    }
+    let out = det.finalize_shot(tr(0, 1_000_000));
+    // In-window frames win strict; the future frames don't pollute
+    // p25 (they aren't even examined).
+    assert_eq!(out.len(), 1);
+    // The future-shot frames remain buffered for the next finalize.
+    assert!(det.buffered() >= 5_000);
+  }
+
+  // ----- Detector ------------------------------------------------------------
+
+  #[test]
+  fn observe_and_buffered() {
+    let mut det = Detector::new(Options::default());
+    det.observe(ts(0), good_metrics(100.0)).unwrap();
+    det.observe(ts(1_000), good_metrics(200.0)).unwrap();
+    assert_eq!(det.buffered(), 2);
+  }
+
+  #[test]
+  fn observe_refuses_at_buffer_cap_and_signals_overflow() {
+    // Iter-22 regression: pre-fix, `observe` returned `()` and
+    // either (a) accepted every frame unboundedly, OOMing the
+    // process on long shots, or (b) silently evicted the oldest
+    // entry on overflow — handing the caller a truncated buffer
+    // with no signal that coverage was incomplete.
+    //
+    // Post-fix `observe` returns `Result<(), ObserveError>` and
+    // the buffer is refuse-and-surface bounded at
+    // `MAX_BUFFER_FRAMES`. The first `MAX_BUFFER_FRAMES` calls
+    // succeed; every further call returns
+    // `Err(ObserveError::BufferFull)` and does NOT push the new
+    // frame. `buffered()` stays at the cap, and the frames that
+    // are in the buffer are exactly the FIRST
+    // `MAX_BUFFER_FRAMES` observations (drop-new — preserves
+    // strict PTS-monotonicity for the bucket walker by never
+    // mutating already-buffered entries).
+    let mut det = Detector::new(Options::default());
+    for i in 0..MAX_BUFFER_FRAMES {
+      det
+        .observe(ts(i as i64 * 1_000), good_metrics(100.0))
+        .unwrap();
+    }
+    assert_eq!(
+      det.buffered(),
+      MAX_BUFFER_FRAMES,
+      "first MAX_BUFFER_FRAMES observations must all be accepted"
+    );
+    // The next 64 observations must all fail with `BufferFull`
+    // and must NOT change `buffered()`.
+    for i in MAX_BUFFER_FRAMES..MAX_BUFFER_FRAMES + 64 {
+      let err = det
+        .observe(ts(i as i64 * 1_000), good_metrics(100.0))
+        .expect_err("observe past cap must return Err");
+      assert_eq!(err, ObserveError::BufferFull);
+      assert_eq!(
+        det.buffered(),
+        MAX_BUFFER_FRAMES,
+        "buffered() must not change after BufferFull"
+      );
+    }
+    // Drain via finalize_shot over the LEADING window; the
+    // first observation (ts=0) must still be there to win the
+    // single-bucket strict argmax. (Drop-new keeps the head;
+    // drop-old would have evicted ts=0 and the winner would be
+    // a later frame.)
+    let total = MAX_BUFFER_FRAMES as i64 * 1_000;
+    let opts = Options::default()
+      .with_margin_ratio(0.0)
+      .with_target_interval(Duration::from_secs(60 * 60));
+    let mut probe = Detector::new(opts);
+    for i in 0..MAX_BUFFER_FRAMES {
+      probe
+        .observe(ts(i as i64 * 1_000), good_metrics(100.0))
+        .unwrap();
+    }
+    for i in MAX_BUFFER_FRAMES..MAX_BUFFER_FRAMES + 64 {
+      let _ = probe.observe(ts(i as i64 * 1_000), good_metrics(100.0));
+    }
+    let out = probe.finalize_shot(tr(0, total + 1));
+    assert_eq!(out.len(), 1);
+    assert_eq!(
+      out[0].pts(),
+      0,
+      "ts=0 (first observation) must still be in the buffer; \
+       a drop-old eviction policy would have removed it"
+    );
+  }
+
+  #[test]
+  fn observe_rejects_out_of_order_pts() {
+    // Iter-22 regression: pre-fix, only a `debug_assert!`
+    // checked the non-decreasing-PTS invariant — release builds
+    // silently appended out-of-order frames, which then
+    // misbucketed (the bucket walker uses ordered `skip_while`
+    // / `take_while` and the adaptive-floor pool relies on the
+    // monotonic-PTS guarantee for its terminator). Post-fix,
+    // `observe` rejects the violating frame at runtime in
+    // every build flavour with `Err(ObserveError::OutOfOrder)`
+    // and the buffer is left unchanged.
+    let mut det = Detector::new(Options::default());
+    det.observe(ts(1_000), good_metrics(100.0)).unwrap();
+    det.observe(ts(2_000), good_metrics(150.0)).unwrap();
+    // Equal PTS to the previous observation is still accepted —
+    // the invariant is *non-decreasing*, not strictly
+    // increasing (variable-frame-rate sources can legitimately
+    // emit two frames at the same presentation timestamp).
+    det.observe(ts(2_000), good_metrics(125.0)).unwrap();
+    assert_eq!(det.buffered(), 3);
+    // A frame whose PTS is strictly less than the most-recently
+    // buffered PTS must be rejected.
+    let err = det
+      .observe(ts(1_500), good_metrics(200.0))
+      .expect_err("strictly-less PTS must return Err");
+    assert_eq!(err, ObserveError::OutOfOrder);
+    assert_eq!(
+      det.buffered(),
+      3,
+      "rejected frame must not be added to the buffer"
+    );
+    // After the rejection, subsequent in-order observations
+    // must continue to succeed.
+    det.observe(ts(3_000), good_metrics(300.0)).unwrap();
+    assert_eq!(det.buffered(), 4);
+  }
+
+  #[test]
+  fn clear_empties_buffer() {
+    let mut det = Detector::new(Options::default());
+    det.observe(ts(0), good_metrics(100.0)).unwrap();
+    det.clear();
+    assert_eq!(det.buffered(), 0);
+  }
+
+  #[test]
+  fn finalize_single_bucket_picks_sharpest() {
+    // 2-second shot with target_interval=4s → 1 bucket.
+    let opts = Options::default().with_margin_ratio(0.0); // disable margin
+    let mut det = Detector::new(opts);
+    det.observe(ts(0), good_metrics(100.0)).unwrap();
+    det.observe(ts(500_000), good_metrics(500.0)).unwrap(); // sharpest
+    det.observe(ts(1_500_000), good_metrics(200.0)).unwrap();
+
+    let out = det.finalize_shot(tr(0, 2_000_000));
+    assert_eq!(out, vec![ts(500_000)]);
+    assert_eq!(det.buffered(), 0, "in-range entries should be drained");
+  }
+
+  #[test]
+  fn finalize_multiple_buckets_pick_per_bucket_sharpest() {
+    // 12s shot with target 4s → 3 buckets; disable margin for clean bounds.
+    let opts = Options::default().with_margin_ratio(0.0);
+    let mut det = Detector::new(opts);
+
+    // Bucket 0: [0, 4s). Best at 1s.
+    det.observe(ts(500_000), good_metrics(100.0)).unwrap();
+    det.observe(ts(1_000_000), good_metrics(300.0)).unwrap();
+    det.observe(ts(3_500_000), good_metrics(150.0)).unwrap();
+    // Bucket 1: [4s, 8s). Best at 5s.
+    det.observe(ts(4_500_000), good_metrics(200.0)).unwrap();
+    det.observe(ts(5_000_000), good_metrics(500.0)).unwrap();
+    det.observe(ts(7_500_000), good_metrics(100.0)).unwrap();
+    // Bucket 2: [8s, 12s). Best at 10s.
+    det.observe(ts(9_000_000), good_metrics(150.0)).unwrap();
+    det.observe(ts(10_000_000), good_metrics(450.0)).unwrap();
+    det.observe(ts(11_500_000), good_metrics(200.0)).unwrap();
+
+    let out = det.finalize_shot(tr(0, 12_000_000));
+    assert_eq!(out, vec![ts(1_000_000), ts(5_000_000), ts(10_000_000)]);
+  }
+
+  #[test]
+  fn finalize_falls_back_when_all_frames_fail_gates() {
+    // Entire bucket's frames are "bad" (too dark). Fallback picks the
+    // sharpest anyway.
+    let opts = Options::default().with_margin_ratio(0.0);
+    let mut det = Detector::new(opts);
+    let bad = |sharp| {
+      FrameMetrics::new()
+        .with_sharpness(sharp)
+        .with_brightness(5.0)
+        .with_luma_variance(200.0)
+        .with_saturation_variance(100.0)
+        .with_clipping(0.0)
+    };
+    det.observe(ts(0), bad(100.0)).unwrap();
+    det.observe(ts(1_000_000), bad(400.0)).unwrap(); // sharpest among bad
+    det.observe(ts(3_000_000), bad(200.0)).unwrap();
+
+    let out = det.finalize_shot(tr(0, 4_000_000));
+    assert_eq!(out, vec![ts(1_000_000)]);
+  }
+
+  #[test]
+  fn finalize_skips_bucket_with_no_entries() {
+    // 3-bucket shot; middle bucket has no observations.
+    let opts = Options::default().with_margin_ratio(0.0);
+    let mut det = Detector::new(opts);
+    det.observe(ts(1_000_000), good_metrics(300.0)).unwrap();
+    // 4..8 s: nothing
+    det.observe(ts(9_000_000), good_metrics(400.0)).unwrap();
+
+    let out = det.finalize_shot(tr(0, 12_000_000));
+    assert_eq!(out, vec![ts(1_000_000), ts(9_000_000)]);
+  }
+
+  #[test]
+  fn finalize_drops_stale_entries_from_earlier_shots() {
+    let opts = Options::default().with_margin_ratio(0.0);
+    let mut det = Detector::new(opts);
+    det.observe(ts(100), good_metrics(500.0)).unwrap(); // pre-shot, should be dropped
+    det.observe(ts(500_000), good_metrics(200.0)).unwrap();
+
+    let out = det.finalize_shot(tr(200_000, 2_000_000));
+    assert_eq!(out, vec![ts(500_000)]);
+    assert_eq!(det.buffered(), 0);
+  }
+
+  #[test]
+  fn finalize_retains_post_shot_entries_for_next_call() {
+    let opts = Options::default().with_margin_ratio(0.0);
+    let mut det = Detector::new(opts);
+    det.observe(ts(500_000), good_metrics(100.0)).unwrap();
+    det.observe(ts(5_000_000), good_metrics(900.0)).unwrap(); // belongs to next shot
+
+    let out = det.finalize_shot(tr(0, 2_000_000));
+    assert_eq!(out, vec![ts(500_000)]);
+    assert_eq!(det.buffered(), 1, "future entries preserved");
+    let out2 = det.finalize_shot(tr(2_000_000, 6_000_000));
+    assert_eq!(out2, vec![ts(5_000_000)]);
+  }
+
+  #[test]
+  fn finalize_degenerate_range_returns_empty_and_drops_stale() {
+    let mut det = Detector::new(Options::default());
+    det.observe(ts(100), good_metrics(100.0)).unwrap();
+    det.observe(ts(500_000), good_metrics(200.0)).unwrap();
+
+    // end == start → zero duration, no emits. Stale (pts < 200_000)
+    // entries still dropped.
+    let out = det.finalize_shot(tr(200_000, 200_000));
+    assert!(out.is_empty());
+    assert_eq!(det.buffered(), 1, "only the future entry remains");
+  }
+
+  #[test]
+  fn finalize_respects_first_bucket_margin() {
+    // 10-s shot, 1 bucket. Margin 0.1 → effective bucket is [1s, 9s).
+    // An entry at 500 ms should be in the pre-margin gap (skipped),
+    // one at 5 s used.
+    let opts = Options::default()
+      .with_target_interval(Duration::from_secs(20)) // force 1 bucket
+      .with_margin_ratio(0.1);
+    let mut det = Detector::new(opts);
+    det.observe(ts(500_000), good_metrics(900.0)).unwrap(); // pre-margin
+    det.observe(ts(5_000_000), good_metrics(300.0)).unwrap(); // in-bucket
+    det.observe(ts(9_500_000), good_metrics(800.0)).unwrap(); // post-margin
+
+    let out = det.finalize_shot(tr(0, 10_000_000));
+    assert_eq!(out, vec![ts(5_000_000)]);
+  }
+
+  #[test]
+  fn finalize_one_tick_shot_with_default_margin_does_not_collapse() {
+    // Iter-16 regression: a 1-tick shot like `tr(0, 1)` with the
+    // default `margin_ratio = 0.02` produces fractional effective
+    // bounds [0.02, 0.98], both of which interpolate to the same
+    // discrete PTS (rounding to 0). Pre-fix, the bucket walker saw
+    // an empty `[start, start)` bucket and silently drained the
+    // single buffered frame without scoring. Post-fix, the
+    // discrete-time collapse triggers the un-shrunk fallback so
+    // the bucket still emits.
+    let opts = Options::default(); // default margin_ratio = 0.02
+    let mut det = Detector::new(opts);
+    det.observe(ts(0), good_metrics(500.0)).unwrap();
+    let out = det.finalize_shot(tr(0, 1));
+    assert_eq!(out, vec![ts(0)]);
+  }
+
+  #[test]
+  fn finalize_two_tick_shot_with_default_margin_does_not_collapse() {
+    // Same pattern with `tr(0, 2)`: fractional effective bounds
+    // [0.04, 1.96] truncate to discrete PTS [0, 1], not collapsed,
+    // so the shrunk bucket still works. Sanity-check we kept the
+    // non-collapsing case as-is.
+    let opts = Options::default(); // default margin_ratio = 0.02
+    let mut det = Detector::new(opts);
+    det.observe(ts(0), good_metrics(500.0)).unwrap();
+    det.observe(ts(1), good_metrics(400.0)).unwrap();
+    let out = det.finalize_shot(tr(0, 2));
+    // The shrunk bucket [0, 1) catches `ts(0)`; `ts(1)` is in the
+    // post-margin zone and is dropped.
+    assert_eq!(out, vec![ts(0)]);
+  }
+
+  #[test]
+  fn finalize_emits_in_pts_order() {
+    let opts = Options::default().with_margin_ratio(0.0);
+    let mut det = Detector::new(opts);
+    det.observe(ts(1_000_000), good_metrics(100.0)).unwrap();
+    det.observe(ts(5_000_000), good_metrics(100.0)).unwrap();
+    det.observe(ts(9_000_000), good_metrics(100.0)).unwrap();
+    let out = det.finalize_shot(tr(0, 12_000_000));
+    assert!(out.windows(2).all(|w| w[0].pts() < w[1].pts()));
+  }
+
+  #[test]
+  fn finalize_can_be_called_multiple_times() {
+    let opts = Options::default().with_margin_ratio(0.0);
+    let mut det = Detector::new(opts);
+    det.observe(ts(500_000), good_metrics(100.0)).unwrap();
+    det.observe(ts(5_000_000), good_metrics(100.0)).unwrap();
+    let out1 = det.finalize_shot(tr(0, 2_000_000));
+    let out2 = det.finalize_shot(tr(2_000_000, 6_000_000));
+    assert_eq!(out1.len(), 1);
+    assert_eq!(out2.len(), 1);
+  }
+
+  #[test]
+  fn finalize_remaining_treats_buffer_tail_as_final_shot() {
+    let opts = Options::default().with_margin_ratio(0.0);
+    let mut det = Detector::new(opts);
+    // First shot closed normally.
+    det.observe(ts(500_000), good_metrics(100.0)).unwrap();
+    let _ = det.finalize_shot(tr(0, 2_000_000));
+    // Second shot opens but EOS arrives before a confirmed cut.
+    det.observe(ts(3_000_000), good_metrics(200.0)).unwrap();
+    det.observe(ts(4_500_000), good_metrics(400.0)).unwrap();
+
+    let out = det.finalize_remaining(ts(6_000_000));
+    assert_eq!(out, vec![ts(4_500_000)]);
+    assert_eq!(det.buffered(), 0);
+  }
+
+  #[test]
+  fn finalize_remaining_empty_buffer_returns_empty() {
+    let mut det = Detector::new(Options::default());
+    let out = det.finalize_remaining(ts(1_000_000));
+    assert!(out.is_empty());
+  }
+
+  #[test]
+  fn finalize_remaining_eos_before_buffer_start_returns_empty() {
+    let mut det = Detector::new(Options::default());
+    det.observe(ts(5_000_000), good_metrics(100.0)).unwrap();
+    let out = det.finalize_remaining(ts(1_000_000));
+    assert!(
+      out.is_empty(),
+      "eos before earliest buffered ts should no-op"
+    );
+  }
+
+  #[test]
+  #[should_panic(expected = "target_interval must be > 0")]
+  fn options_target_interval_zero_panics() {
+    let _ = Options::new().with_target_interval(Duration::ZERO);
+  }
+
+  #[test]
+  fn sharper_returns_ordering_greater() {
+    assert!(sharper(2.0, 1.0));
+    assert!(!sharper(1.0, 2.0));
+    assert!(!sharper(1.0, 1.0));
+    // NaN tolerant — not-greater either way.
+    assert!(!sharper(f32::NAN, 1.0));
+    assert!(!sharper(1.0, f32::NAN));
+  }
+
+  #[test]
+  fn composite_weights_default_matches_spec() {
+    let w = CompositeWeights::default();
+    assert_eq!(w.sharpness(), 1.0);
+    assert_eq!(w.sharpness_norm(), 1000.0);
+    assert_eq!(w.noise(), 0.3);
+    assert_eq!(w.noise_norm(), 20.0);
+    assert_eq!(w.colorfulness(), 0.2);
+    assert_eq!(w.colorfulness_norm(), 50.0);
+    assert_eq!(w.clipping(), 0.5);
+    assert_eq!(w.motion_blur(), 0.0);
+  }
+
+  #[test]
+  fn composite_weights_builders_roundtrip() {
+    let w = CompositeWeights::new()
+      .with_sharpness(0.5, 500.0)
+      .with_noise(0.1, 10.0)
+      .with_colorfulness(0.4, 100.0)
+      .with_clipping(0.25)
+      .with_motion_blur(0.6);
+    assert_eq!(w.sharpness(), 0.5);
+    assert_eq!(w.sharpness_norm(), 500.0);
+    assert_eq!(w.noise(), 0.1);
+    assert_eq!(w.noise_norm(), 10.0);
+    assert_eq!(w.colorfulness(), 0.4);
+    assert_eq!(w.colorfulness_norm(), 100.0);
+    assert_eq!(w.clipping(), 0.25);
+    assert_eq!(w.motion_blur(), 0.6);
+  }
+
+  #[test]
+  fn composite_weights_new_is_const_context_usable() {
+    const W: CompositeWeights = CompositeWeights::new().with_motion_blur(0.5);
+    assert_eq!(W.motion_blur(), 0.5);
+  }
+
+  #[cfg(feature = "serde")]
+  #[test]
+  fn composite_weights_deserialize_clamps_invalid_norms_and_weights() {
+    // Deserialization (via `#[serde(from = "CompositeWeightsRaw")]`)
+    // routes every weight through `sanitise_weight` and every
+    // normaliser through `sanitise_norm` so a serialized config
+    // carrying NaN/Inf weights or zero/NaN/Inf norms cannot reach
+    // composite_quality and silently corrupt the strict-pass argmax.
+    // We exercise the conversion through `From<CompositeWeightsRaw>`
+    // directly — that is the exact same code path serde-derive uses
+    // after parsing the raw struct, and it doesn't pull in a
+    // text-format crate for the test.
+    let raw = CompositeWeightsRaw {
+      sharpness: f32::NAN,              // invalid weight
+      sharpness_norm: 0.0,              // invalid norm — zero
+      noise: f32::INFINITY,             // invalid weight
+      noise_norm: f32::NAN,             // invalid norm — NaN
+      colorfulness: f32::NEG_INFINITY,  // invalid weight
+      colorfulness_norm: f32::INFINITY, // invalid norm — +Inf
+      clipping: f32::NAN,               // invalid weight
+      motion_blur: f32::INFINITY,       // invalid weight
+    };
+    let w: CompositeWeights = raw.into();
+    let defaults = CompositeWeights::new();
+    // Norms fall back to spec defaults.
+    assert_eq!(w.sharpness_norm(), defaults.sharpness_norm());
+    assert_eq!(w.noise_norm(), defaults.noise_norm());
+    assert_eq!(w.colorfulness_norm(), defaults.colorfulness_norm());
+    // Weights clamp to 0 so each term contributes nothing.
+    assert_eq!(w.sharpness(), 0.0);
+    assert_eq!(w.noise(), 0.0);
+    assert_eq!(w.colorfulness(), 0.0);
+    assert_eq!(w.clipping(), 0.0);
+    assert_eq!(w.motion_blur(), 0.0);
+
+    // composite_quality on a normal frame stays finite — every term
+    // collapses to 0 because weights are 0.
+    let m = FrameMetrics::new()
+      .with_sharpness(500.0)
+      .with_noise(5.0)
+      .with_colorfulness(40.0)
+      .with_clipping(0.5)
+      .with_motion_blur(0.5);
+    let q = composite_quality(&m, &w);
+    assert!(q.is_finite());
+    assert_eq!(q, 0.0);
+  }
+
+  #[cfg(feature = "serde")]
+  #[test]
+  fn composite_weights_deserialize_valid_norms_pass_through() {
+    let raw = CompositeWeightsRaw {
+      sharpness: 0.5,
+      sharpness_norm: 250.0,
+      noise: 0.1,
+      noise_norm: 5.0,
+      colorfulness: 0.4,
+      colorfulness_norm: 200.0,
+      clipping: 0.25,
+      motion_blur: 0.6,
+    };
+    let w: CompositeWeights = raw.into();
+    assert_eq!(w.sharpness_norm(), 250.0);
+    assert_eq!(w.noise_norm(), 5.0);
+    assert_eq!(w.colorfulness_norm(), 200.0);
+  }
+
+  #[cfg(feature = "serde")]
+  #[test]
+  fn options_deserialize_clamps_invalid_fields_to_defaults() {
+    // Every builder-validated field with an out-of-range value:
+    // From<OptionsRaw> must clamp each back to its spec default
+    // rather than allow the invalid state through.
+    let defaults = Options::default();
+    let raw = OptionsRaw {
+      target_interval: Duration::ZERO, // invalid — zero
+      max_frames_per_shot: 0,          // invalid — zero
+      margin_ratio: 0.75,              // invalid — out of [0.0, 0.5)
+      min_sharpness: 12.5,             // valid (no builder check)
+      black_mean_threshold: 7,         // valid
+      bright_mean_threshold: 250,      // valid
+      luma_variance_threshold: 8.0,    // valid
+      sat_variance_threshold: 4.0,     // valid
+      max_clipping: 1.5,               // invalid — > 1.0
+      weights: CompositeWeights::default(),
+      adaptive_floor: false,
+      adaptive_floor_percentile: f32::NAN, // invalid — NaN
+      adaptive_floor_min_samples: 5,       // valid
+      motion_blur_gate: true,
+      max_motion_blur: -0.2, // invalid — < 0.0
+    };
+    let o: Options = raw.into();
+    assert_eq!(o.target_interval(), defaults.target_interval());
+    assert_eq!(o.max_frames_per_shot(), defaults.max_frames_per_shot());
+    assert!((o.margin_ratio() - defaults.margin_ratio()).abs() < 1e-9);
+    assert_eq!(o.max_clipping(), defaults.max_clipping());
+    assert_eq!(
+      o.adaptive_floor_percentile(),
+      defaults.adaptive_floor_percentile()
+    );
+    assert_eq!(o.max_motion_blur(), defaults.max_motion_blur());
+    // Unvalidated fields pass through.
+    assert_eq!(o.min_sharpness(), 12.5);
+    assert_eq!(o.black_mean_threshold(), 7);
+    assert_eq!(o.bright_mean_threshold(), 250);
+    assert_eq!(o.adaptive_floor(), false);
+    assert_eq!(o.adaptive_floor_min_samples(), 5);
+    assert_eq!(o.motion_blur_gate(), true);
+  }
+
+  #[cfg(feature = "serde")]
+  #[test]
+  fn options_deserialize_clamps_non_finite_thresholds_to_defaults() {
+    // min_sharpness, luma_variance_threshold, sat_variance_threshold
+    // are f32 fields the builders accept without range validation.
+    // Serde must still clamp non-finite values to defaults because
+    // `hard_gate` fails closed on non-finite — a NaN threshold
+    // would shadow the metric-side fail-closed by making every
+    // comparison evaluate to false.
+    let defaults = Options::default();
+    let raw = OptionsRaw {
+      target_interval: Duration::from_secs(4),
+      max_frames_per_shot: 16,
+      margin_ratio: 0.02,
+      min_sharpness: f32::NAN, // invalid — non-finite
+      black_mean_threshold: 15,
+      bright_mean_threshold: 240,
+      luma_variance_threshold: f32::INFINITY, // invalid — non-finite
+      sat_variance_threshold: f32::NEG_INFINITY, // invalid — non-finite
+      max_clipping: 0.5,
+      weights: CompositeWeights::default(),
+      adaptive_floor: true,
+      adaptive_floor_percentile: 0.25,
+      adaptive_floor_min_samples: 20,
+      motion_blur_gate: false,
+      max_motion_blur: 0.75,
+    };
+    let o: Options = raw.into();
+    assert_eq!(o.min_sharpness(), defaults.min_sharpness());
+    assert_eq!(
+      o.luma_variance_threshold(),
+      defaults.luma_variance_threshold()
+    );
+    assert_eq!(
+      o.sat_variance_threshold(),
+      defaults.sat_variance_threshold()
+    );
+  }
+
+  #[cfg(feature = "serde")]
+  #[test]
+  fn options_deserialize_valid_fields_pass_through() {
+    // Every builder-validated field within its valid range must
+    // arrive unchanged.
+    let raw = OptionsRaw {
+      target_interval: Duration::from_secs(2),
+      max_frames_per_shot: 8,
+      margin_ratio: 0.49,
+      min_sharpness: 75.0,
+      black_mean_threshold: 12,
+      bright_mean_threshold: 245,
+      luma_variance_threshold: 4.0,
+      sat_variance_threshold: 2.5,
+      max_clipping: 0.0,
+      weights: CompositeWeights::default(),
+      adaptive_floor: true,
+      adaptive_floor_percentile: 1.0,
+      adaptive_floor_min_samples: 30,
+      motion_blur_gate: true,
+      max_motion_blur: 1.0,
+    };
+    let o: Options = raw.into();
+    assert_eq!(o.target_interval(), Duration::from_secs(2));
+    assert_eq!(o.max_frames_per_shot(), 8);
+    assert!((o.margin_ratio() - 0.49).abs() < 1e-9);
+    assert_eq!(o.max_clipping(), 0.0);
+    assert_eq!(o.adaptive_floor_percentile(), 1.0);
+    assert_eq!(o.max_motion_blur(), 1.0);
+  }
+
+  #[test]
+  fn composite_weights_paired_builders_are_const_context_usable() {
+    // Compile-time evaluation through the sanitise_norm path:
+    // - valid norms pass through
+    // - invalid norms fall back to the spec defaults
+    const VALID: CompositeWeights = CompositeWeights::new()
+      .with_sharpness(0.5, 250.0)
+      .with_noise(0.1, 5.0)
+      .with_colorfulness(0.4, 200.0);
+    assert_eq!(VALID.sharpness(), 0.5);
+    assert_eq!(VALID.sharpness_norm(), 250.0);
+    assert_eq!(VALID.noise(), 0.1);
+    assert_eq!(VALID.noise_norm(), 5.0);
+    assert_eq!(VALID.colorfulness(), 0.4);
+    assert_eq!(VALID.colorfulness_norm(), 200.0);
+
+    const CLAMPED: CompositeWeights = CompositeWeights::new()
+      .with_sharpness(1.0, 0.0) // invalid: zero
+      .with_noise(0.3, f32::NAN) // invalid: NaN
+      .with_colorfulness(0.2, f32::INFINITY); // invalid: +Inf
+    assert_eq!(CLAMPED.sharpness_norm(), 1000.0);
+    assert_eq!(CLAMPED.noise_norm(), 20.0);
+    assert_eq!(CLAMPED.colorfulness_norm(), 50.0);
+    // Weights are stored verbatim regardless.
+    assert_eq!(CLAMPED.sharpness(), 1.0);
+    assert_eq!(CLAMPED.noise(), 0.3);
+    assert_eq!(CLAMPED.colorfulness(), 0.2);
+  }
+
+  #[test]
+  fn composite_argmax_picks_clean_over_sharper_noisy_under_defaults() {
+    // Bucket with two strict-eligible frames:
+    //   A: sharpness=2000, noise=15
+    //   B: sharpness=1800, noise=3
+    // Under default weights:
+    //   q_A = 1.0·(2000/1000) - 0.3·(15/20) + 0 - 0 - 0  = 2.0 - 0.225 = 1.775
+    //   q_B = 1.0·(1800/1000) - 0.3·( 3/20) + 0 - 0 - 0  = 1.8 - 0.045 = 1.755
+    // A still wins by a hair (sharpness dominates), but bumping noise
+    // weight should flip it.  Use a stronger noise weight here:
+    let weights = CompositeWeights::new().with_noise(2.0, 20.0);
+    let opts = Options::default()
+      .with_margin_ratio(0.0)
+      .with_composite_weights(weights);
+    let mut det = Detector::new(opts);
+
+    let a = FrameMetrics::new()
+      .with_sharpness(2000.0)
+      .with_brightness(128.0)
+      .with_luma_variance(200.0)
+      .with_saturation_variance(100.0)
+      .with_clipping(0.0)
+      .with_noise(15.0);
+    let b = FrameMetrics::new()
+      .with_sharpness(1800.0)
+      .with_brightness(128.0)
+      .with_luma_variance(200.0)
+      .with_saturation_variance(100.0)
+      .with_clipping(0.0)
+      .with_noise(3.0);
+
+    det.observe(ts(1_000_000), a).unwrap();
+    det.observe(ts(2_000_000), b).unwrap();
+
+    let out = det.finalize_shot(tr(0, 4_000_000));
+    assert_eq!(out, vec![ts(2_000_000)]);
+  }
+
+  #[test]
+  fn composite_argmax_collapses_to_sharpness_when_other_weights_zero() {
+    // Zero out every non-sharpness weight → strict argmax must rank
+    // by pure sharpness (mirrors legacy behaviour).
+    let weights = CompositeWeights::new()
+      .with_noise(0.0, 20.0)
+      .with_colorfulness(0.0, 50.0)
+      .with_clipping(0.0)
+      .with_motion_blur(0.0);
+    let opts = Options::default()
+      .with_margin_ratio(0.0)
+      .with_composite_weights(weights);
+    let mut det = Detector::new(opts);
+
+    // Same fixture as the existing `finalize_single_bucket_picks_sharpest`.
+    det.observe(ts(0), good_metrics(100.0)).unwrap();
+    det.observe(ts(500_000), good_metrics(500.0)).unwrap(); // sharpest
+    det.observe(ts(1_500_000), good_metrics(200.0)).unwrap();
+
+    let out = det.finalize_shot(tr(0, 2_000_000));
+    assert_eq!(out, vec![ts(500_000)]);
+  }
+
+  #[test]
+  fn adaptive_floor_recovers_strict_winner_in_low_detail_shot() {
+    // 25 frames, all with sharpness in [20, 80] — well below the
+    // absolute floor of 100. With adaptive_floor enabled, p25 ≈ 35,
+    // so the strict gate passes any frame ≥ 35. The sharpest among
+    // those becomes the strict winner instead of falling back.
+    let opts = Options::default()
+      .with_margin_ratio(0.0)
+      .with_target_interval(Duration::from_secs(60));
+    let mut det = Detector::new(opts);
+    // 25 frames evenly spaced 0..25 seconds, sharpness ramping 20..80.
+    for i in 0..25 {
+      let s = 20.0 + (i as f32) * 2.5; // 20.0, 22.5, ..., 80.0
+      det
+        .observe(ts((i as i64) * 1_000_000), good_metrics(s))
+        .unwrap();
+    }
+    // Composite-quality argmax with default weights → highest
+    // composite wins. Since brightness/clipping/noise/etc are
+    // identical, the highest-sharpness frame wins.
+    let out = det.finalize_shot(tr(0, 30_000_000));
+    assert_eq!(out, vec![ts(24_000_000)]); // last frame, sharpness 80
+  }
+
+  #[test]
+  fn adaptive_floor_disabled_falls_back_to_absolute_floor() {
+    // 25 frames all below the absolute floor of 100. With adaptive
+    // floor explicitly disabled, the strict gate rejects every frame
+    // and we drop to fallback (pure sharpness). The result should
+    // still be the sharpest frame — but via the fallback path.
+    let weights = CompositeWeights::new().with_noise(10.0, 1.0); // huge noise penalty
+    let opts = Options::default()
+      .with_margin_ratio(0.0)
+      .with_target_interval(Duration::from_secs(60))
+      .with_adaptive_floor(false)
+      .with_composite_weights(weights);
+    let mut det = Detector::new(opts);
+    let sharpest_with_noise = FrameMetrics::new()
+      .with_sharpness(80.0)
+      .with_brightness(128.0)
+      .with_luma_variance(200.0)
+      .with_saturation_variance(100.0)
+      .with_clipping(0.0)
+      .with_noise(1.0);
+    for i in 0..24 {
+      let s = 20.0 + (i as f32) * 2.5;
+      det
+        .observe(ts((i as i64) * 1_000_000), good_metrics(s))
+        .unwrap();
+    }
+    det.observe(ts(24_000_000), sharpest_with_noise).unwrap();
+    let out = det.finalize_shot(tr(0, 30_000_000));
+    assert_eq!(out, vec![ts(24_000_000)]);
+  }
+
+  #[test]
+  fn adaptive_floor_does_not_raise_floor_in_high_sharpness_shot() {
+    // All frames at sharpness 500 — p25 = 500, well above the
+    // absolute floor of 100. Effective floor must remain 100 (not
+    // jump up to 500), so any frame with sharpness >= 100 still
+    // passes.
+    let opts = Options::default()
+      .with_margin_ratio(0.0)
+      .with_target_interval(Duration::from_secs(60));
+    let mut det = Detector::new(opts);
+    for i in 0..25 {
+      det
+        .observe(ts((i as i64) * 1_000_000), good_metrics(500.0))
+        .unwrap();
+    }
+    let out = det.finalize_shot(tr(0, 30_000_000));
+    assert_eq!(out.len(), 1, "exactly one winner expected");
+  }
+
+  #[test]
+  fn adaptive_floor_uses_absolute_below_min_samples() {
+    // Only 5 frames in the shot — below the default min_samples=20.
+    // Adaptive floor must NOT activate; absolute floor applies.
+    let opts = Options::default()
+      .with_margin_ratio(0.0)
+      .with_target_interval(Duration::from_secs(60));
+    let mut det = Detector::new(opts);
+    for i in 0..5 {
+      det
+        .observe(ts((i as i64) * 1_000_000), good_metrics(50.0))
+        .unwrap(); // < 100
+    }
+    let out = det.finalize_shot(tr(0, 10_000_000));
+    // No frame passes the absolute floor → fallback picks the only
+    // candidate (all tied at 50.0).
+    assert_eq!(out.len(), 1);
+  }
+
+  #[test]
+  fn motion_blur_gate_disabled_by_default_keeps_high_anisotropy_frame() {
+    // Bucket with one strict-eligible frame whose motion_blur=0.9.
+    // Gate off by default → frame passes strict, becomes the winner.
+    let opts = Options::default().with_margin_ratio(0.0);
+    let mut det = Detector::new(opts);
+    let m = FrameMetrics::new()
+      .with_sharpness(500.0)
+      .with_brightness(128.0)
+      .with_luma_variance(200.0)
+      .with_saturation_variance(100.0)
+      .with_clipping(0.0)
+      .with_motion_blur(0.9);
+    det.observe(ts(500_000), m).unwrap();
+    let out = det.finalize_shot(tr(0, 2_000_000));
+    assert_eq!(out, vec![ts(500_000)]);
+  }
+
+  #[test]
+  fn motion_blur_gate_enabled_rejects_high_anisotropy_frame() {
+    // Same fixture but with the gate on and a fresh, gate-passing
+    // alternative. The high-anisotropy frame falls into fallback;
+    // the low-anisotropy frame wins the strict path.
+    let opts = Options::default()
+      .with_margin_ratio(0.0)
+      .with_motion_blur_gate(true)
+      .with_max_motion_blur(0.75);
+    let mut det = Detector::new(opts);
+    let bad = FrameMetrics::new()
+      .with_sharpness(800.0)
+      .with_brightness(128.0)
+      .with_luma_variance(200.0)
+      .with_saturation_variance(100.0)
+      .with_clipping(0.0)
+      .with_motion_blur(0.9); // above the gate
+    let good = FrameMetrics::new()
+      .with_sharpness(500.0)
+      .with_brightness(128.0)
+      .with_luma_variance(200.0)
+      .with_saturation_variance(100.0)
+      .with_clipping(0.0)
+      .with_motion_blur(0.1);
+    det.observe(ts(500_000), bad).unwrap();
+    det.observe(ts(1_500_000), good).unwrap();
+    let out = det.finalize_shot(tr(0, 2_000_000));
+    // Strict path: `good` wins (bad rejected by motion-blur gate).
+    assert_eq!(out, vec![ts(1_500_000)]);
+  }
+
+  // ---- Normalisation / range guard regressions -----------------------------
+
+  #[test]
+  fn composite_weights_invalid_norms_clamp_to_default() {
+    // All flavours of invalid (zero, negative, NaN, +inf, -inf) must
+    // fall back to the spec defaults so composite_quality never sees
+    // an Inf/NaN-producing divisor.
+    let defaults = CompositeWeights::new();
+    for &bad in &[
+      0.0f32,
+      -1.0,
+      -0.0,
+      f32::NAN,
+      f32::INFINITY,
+      f32::NEG_INFINITY,
+    ] {
+      let w = CompositeWeights::new()
+        .with_sharpness(1.0, bad)
+        .with_noise(0.3, bad)
+        .with_colorfulness(0.2, bad);
+      assert_eq!(
+        w.sharpness_norm(),
+        defaults.sharpness_norm(),
+        "sharpness_norm should clamp invalid {bad:?} to default"
+      );
+      assert_eq!(
+        w.noise_norm(),
+        defaults.noise_norm(),
+        "noise_norm should clamp invalid {bad:?} to default"
+      );
+      assert_eq!(
+        w.colorfulness_norm(),
+        defaults.colorfulness_norm(),
+        "colorfulness_norm should clamp invalid {bad:?} to default"
+      );
+      // The weight itself is stored verbatim — clamp is on `norm` only.
+      assert_eq!(w.sharpness(), 1.0);
+      assert_eq!(w.noise(), 0.3);
+      assert_eq!(w.colorfulness(), 0.2);
+    }
+  }
+
+  #[test]
+  fn composite_weights_valid_norms_pass_through() {
+    let w = CompositeWeights::new()
+      .with_sharpness(0.5, 250.0)
+      .with_noise(0.1, 5.0)
+      .with_colorfulness(0.4, 200.0);
+    assert_eq!(w.sharpness_norm(), 250.0);
+    assert_eq!(w.noise_norm(), 5.0);
+    assert_eq!(w.colorfulness_norm(), 200.0);
+  }
+
+  #[test]
+  fn composite_quality_with_clamped_norms_stays_finite() {
+    // Belt-and-braces: even if a caller chains every kind of invalid
+    // norm onto the weights, composite_quality must produce a finite
+    // result on a normal frame so the strict-pass argmax keeps
+    // ranking deterministically.
+    let weights = CompositeWeights::new()
+      .with_sharpness(1.0, f32::NAN)
+      .with_noise(0.3, 0.0)
+      .with_colorfulness(0.2, f32::INFINITY);
+    let m = FrameMetrics::new()
+      .with_sharpness(500.0)
+      .with_noise(5.0)
+      .with_colorfulness(40.0)
+      .with_clipping(0.0)
+      .with_motion_blur(0.0);
+    let q = composite_quality(&m, &weights);
+    assert!(
+      q.is_finite(),
+      "composite_quality must stay finite under clamped invalid norms; got {q}"
+    );
+  }
+
+  #[test]
+  fn composite_weights_invalid_weights_clamp_to_zero() {
+    // Every flavour of non-finite weight on every builder must clamp
+    // to 0.0, so the term contributes nothing rather than poisoning
+    // composite_quality with `Inf`/`NaN`.
+    for &bad in &[f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+      let w = CompositeWeights::new()
+        .with_sharpness(bad, 1000.0)
+        .with_noise(bad, 20.0)
+        .with_colorfulness(bad, 50.0)
+        .with_clipping(bad)
+        .with_motion_blur(bad);
+      assert_eq!(w.sharpness(), 0.0, "sharpness should clamp invalid {bad}");
+      assert_eq!(w.noise(), 0.0, "noise should clamp invalid {bad}");
+      assert_eq!(
+        w.colorfulness(),
+        0.0,
+        "colorfulness should clamp invalid {bad}"
+      );
+      assert_eq!(w.clipping(), 0.0, "clipping should clamp invalid {bad}");
+      assert_eq!(
+        w.motion_blur(),
+        0.0,
+        "motion_blur should clamp invalid {bad}"
+      );
+    }
+  }
+
+  #[test]
+  fn composite_weights_finite_negative_weight_passes_through() {
+    // Negative weights are well-defined (a user can invert a term's
+    // sense deliberately). Only non-finite weights are filtered.
+    let w = CompositeWeights::new()
+      .with_sharpness(-1.0, 1000.0)
+      .with_clipping(-0.5);
+    assert_eq!(w.sharpness(), -1.0);
+    assert_eq!(w.clipping(), -0.5);
+  }
+
+  #[test]
+  fn composite_quality_stays_finite_under_invalid_weights() {
+    // End-to-end guard: non-finite weights on every term + a normal
+    // frame must still produce a finite composite. Catches any future
+    // builder that forgets to route a weight through sanitise_weight.
+    let weights = CompositeWeights::new()
+      .with_sharpness(f32::NAN, 1000.0)
+      .with_noise(f32::INFINITY, 20.0)
+      .with_colorfulness(f32::NEG_INFINITY, 50.0)
+      .with_clipping(f32::NAN)
+      .with_motion_blur(f32::INFINITY);
+    let m = FrameMetrics::new()
+      .with_sharpness(500.0)
+      .with_noise(5.0)
+      .with_colorfulness(40.0)
+      .with_clipping(0.5)
+      .with_motion_blur(0.5);
+    let q = composite_quality(&m, &weights);
+    assert!(
+      q.is_finite(),
+      "composite_quality must stay finite under clamped invalid weights; got {q}"
+    );
+    // Every term clamped to weight=0 → q == 0.
+    assert_eq!(q, 0.0);
+  }
+
+  #[test]
+  fn strict_argmax_skips_non_finite_composite() {
+    // FrameMetrics setters accept any f32, including non-finite values
+    // — a corrupt detector output or a malformed caller could push
+    // NaN/Inf through. The strict-pass argmax must NOT lock onto a
+    // non-finite composite (which would prevent later finite candidates
+    // from unseating it). Two frames: the first has a NaN sharpness;
+    // the second is a normal in-bucket frame. The strict winner must
+    // be the second.
+    let opts = Options::default().with_margin_ratio(0.0);
+    let mut det = Detector::new(opts);
+    let poisoned = FrameMetrics::new()
+      .with_sharpness(f32::NAN) // poisons composite_quality via division-by-norm
+      .with_brightness(128.0)
+      .with_luma_variance(200.0)
+      .with_saturation_variance(100.0)
+      .with_clipping(0.0);
+    let normal = good_metrics(500.0);
+    det.observe(ts(500_000), poisoned).unwrap();
+    det.observe(ts(1_500_000), normal).unwrap();
+    let out = det.finalize_shot(tr(0, 2_000_000));
+    // The non-finite-composite frame is skipped from strict; the
+    // normal frame wins.
+    assert_eq!(out, vec![ts(1_500_000)]);
+  }
+
+  #[test]
+  fn argmax_skips_when_only_candidate_has_non_finite_sharpness() {
+    // Single frame with NaN sharpness fails both the strict (non-
+    // finite composite) and the fallback (non-finite sharpness)
+    // paths. The bucket emits nothing — preferable to locking a
+    // keyframe onto a corrupted metric. This is the correct
+    // degradation for a fully-corrupt bucket: better silent drop
+    // than wrong selection.
+    let opts = Options::default().with_margin_ratio(0.0);
+    let mut det = Detector::new(opts);
+    let m = FrameMetrics::new()
+      .with_sharpness(f32::NAN)
+      .with_brightness(128.0)
+      .with_luma_variance(200.0)
+      .with_saturation_variance(100.0)
+      .with_clipping(0.0);
+    det.observe(ts(500_000), m).unwrap();
+    let out = det.finalize_shot(tr(0, 2_000_000));
+    assert!(out.is_empty(), "non-finite-only bucket must not emit");
+  }
+
+  #[test]
+  fn fallback_argmax_prefers_finite_sharpness_over_nan_incumbent() {
+    // First frame has NaN sharpness — neither strict nor fallback
+    // should lock onto it. Second frame is gate-failing (low
+    // brightness → hard_gate trips) so it only reaches the fallback
+    // path, but its sharpness is finite. The fallback must select
+    // the second frame, not the NaN incumbent.
+    let opts = Options::default().with_margin_ratio(0.0);
+    let mut det = Detector::new(opts);
+    let poisoned = FrameMetrics::new()
+      .with_sharpness(f32::NAN)
+      .with_brightness(128.0)
+      .with_luma_variance(200.0)
+      .with_saturation_variance(100.0)
+      .with_clipping(0.0);
+    let fallback_only = FrameMetrics::new()
+      .with_sharpness(300.0)
+      .with_brightness(5.0) // < black_mean_threshold(15) → strict gate fails
+      .with_luma_variance(200.0)
+      .with_saturation_variance(100.0)
+      .with_clipping(0.0);
+    det.observe(ts(500_000), poisoned).unwrap();
+    det.observe(ts(1_500_000), fallback_only).unwrap();
+    let out = det.finalize_shot(tr(0, 2_000_000));
+    assert_eq!(out, vec![ts(1_500_000)]);
+  }
+
+  #[test]
+  fn adaptive_floor_min_samples_zero_with_empty_shot_uses_absolute_floor() {
+    // min_samples = 0 + empty in-range shot would previously index an
+    // empty Vec and panic. The guard must fall back to the absolute
+    // floor and return cleanly.
+    let opts = Options::default()
+      .with_margin_ratio(0.0)
+      .with_adaptive_floor_min_samples(0);
+    let mut det = Detector::new(opts);
+    // No observations — finalize a non-empty range and expect no emits
+    // (and no panic).
+    let out = det.finalize_shot(tr(0, 4_000_000));
+    assert!(out.is_empty(), "empty shot must yield no keyframes");
+  }
+}

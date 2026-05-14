@@ -7,7 +7,7 @@ homepage = "https://github.com/findit-ai/scenesdetect"
 documentation = "https://docs.rs/scenesdetect"
 description = "Scene/shot cut detection ported from PySceneDetect — Sans-I/O streaming API with SIMD-accelerated detectors for histogram, pHash, threshold, content, and adaptive algorithms."
 license = "MIT OR Apache-2.0"
-rust-version = "1.85.0"
+rust-version = "1.95.0"
 
 [[bench]]
 path = "benches/histogram.rs"
@@ -36,18 +36,42 @@ harness = false
 
 [features]
 default = ["std"]
-alloc = ["libm"]
-std = ["thiserror/default"]
+alloc = ["libm", "dep:fast_image_resize", "fast_image_resize/no_std"]
+std = ["thiserror/default", "dep:fast_image_resize", "fast_image_resize/std"]
 
 serde = ["dep:serde", "dep:humantime-serde"]
+videoframe = [
+  "alloc",
+  "dep:half",
+  "dep:videoframe",
+  "videoframe/rgb",
+  "videoframe/rgb-float",
+  "videoframe/rgb-legacy",
+]
 
 [dependencies]
 derive_more = { version = "2", default-features = false, features = ["is_variant", "display"] }
 thiserror = { version = "2", default-features = false }
 
+# mediatime 0.1.5 dropped the `Option<Duration>` from
+# `TimeRange::duration` in favour of a bare `Duration`, with
+# `TimeRange::new` panicking on `end < start` (and
+# `TimeRange::try_new` as the fallible variant). `Detector::
+# finalize_shot` now short-circuits on `duration.is_zero()`
+# instead of the old `None` arm.
 mediatime = { version = "0.1", default-features = false }
 
 libm = { version = "0.2", optional = true, default-features = false }
+
+# Gated on `alloc` or `std`: the only consumer is `keyframe::preprocess::Downscaler`,
+# which itself only compiles under `alloc`/`std` (see `lib.rs`). Pulling
+# `fast_image_resize` in unconditionally breaks `cargo check
+# --no-default-features` because the dependency's own build requires one of
+# its float feature flags.
+fast_image_resize = { version = "6", default-features = false, optional = true }
+
+half = { version = "2", optional = true, default-features = false }
+videoframe = { version = "0.2", optional = true, default-features = false }
 
 serde = { version = "1", default-features = false, features = [
   "derive",
@@ -57,6 +81,10 @@ humantime-serde = { version = "1", default-features = false, optional = true }
 [dev-dependencies]
 criterion = "0.8"
 tempfile = "3"
+# JSON form used in `#[cfg(feature = "serde")]` round-trip tests
+# (forward-compat checks for legacy payloads that predate newer
+# Options fields). Test-only — not pulled into library builds.
+serde_json = "1"
 
 [profile.bench]
 opt-level = 3
@@ -72,7 +100,10 @@ rpath = false
 all-features = true
 rustdoc-args = ["--cfg", "docsrs"]
 
-[lints.rust]
+[lints]
+workspace = true
+
+[workspace.lints.rust]
 rust_2018_idioms = "warn"
 single_use_lifetimes = "warn"
 unexpected_cfgs = { level = "warn", check-cfg = [

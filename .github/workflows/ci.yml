@@ -56,7 +56,7 @@ jobs:
     - name: Install cargo-hack
       run: cargo install cargo-hack
     - name: Apply clippy lints
-      run: cargo hack clippy --each-feature
+      run: cargo hack clippy --each-feature -- -D warnings
 
   # Run tests on some extra platforms
   cross:
