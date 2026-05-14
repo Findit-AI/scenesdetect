@@ -715,7 +715,13 @@ pub(super) unsafe fn gradient_anisotropy(mag: &[i32], dir: &[u8], w: usize, h: u
 pub(super) unsafe fn mean_abs_diff(a: &[u8], b: &[u8], n: usize) -> f64 {
   const LANES: usize = 32;
   let whole = n / LANES * LANES;
-  let mut acc = unsafe { _mm256_setzero_si256() }; // u64×4 (each lane gets one partial)
+  // u64×4 accumulator. `_mm256_sad_epu8` produces per-128-bit-half partial
+  // sums in i32 lanes 0 and 8 (zeroed elsewhere); `_mm256_add_epi64`
+  // accumulates them across iterations. Each 64-bit lane therefore
+  // accumulates many per-chunk partial sums over the loop, bounded by
+  // `8 · 255 = 2040` per chunk × iterations — `i64::MAX / 2040 ≈ 4.5·10¹⁵`
+  // iterations, so wrapping is unreachable on any realistic input.
+  let mut acc = unsafe { _mm256_setzero_si256() };
 
   let mut i = 0;
   while i < whole {

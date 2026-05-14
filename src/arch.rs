@@ -41,6 +41,21 @@ mod neon;
 //   - the matching `target_feature` is set at compile time (no-std dispatch).
 // Without either gate, the functions would compile but nothing calls them,
 // producing dead-code warnings under `-D warnings`.
+//
+// Per-tier SSSE3 requirement: the AVX2 backend module is the highest tier
+// but a subset of its kernels (`bgr_to_hsv_planes`, `bgr_to_luma`,
+// `colorfulness`, `clipping_count`) use 128-bit SSSE3 `pshufb` for the BGR
+// deinterleave inside their AVX2 bodies. Those four dispatchers gate the
+// AVX2 branch on `is_x86_feature_detected!("avx2") && is_x86_feature_detected!("ssse3")`
+// (and the compile-time mirror `target_feature = "avx2", target_feature = "ssse3"`).
+// The other six AVX2 kernels (`noise`, `gradient_anisotropy`,
+// `mean_abs_diff`, `sobel`, `tenengrad`, `plane_mean_variance`) use only
+// pure-AVX2 intrinsics and stay on the single-feature gate. The rule —
+// "AVX2 entry needs an SSSE3 co-check IFF that kernel's AVX2 body uses
+// pshufb" — is checked at the call site rather than enforced structurally,
+// because lifting it into the module gate would over-restrict the
+// pure-AVX2 kernels. Future AVX2 kernels that take a packed-RGB/BGR input
+// and use SSSE3 deinterleave intrinsics MUST add the SSSE3 co-check.
 #[cfg(all(
   any(target_arch = "x86", target_arch = "x86_64"),
   any(feature = "std", target_feature = "ssse3"),

@@ -245,10 +245,11 @@ impl LumaConverter {
 
   /// Converts the packed-pixel input to luma and returns a
   /// [`LumaFrame`] borrowing from this converter's scratch. Reads
-  /// channel positions according to [`Self::channel_order`].
-  pub fn run<'a>(&'a mut self, bgr: RgbFrame<'_>) -> LumaFrame<'a> {
-    let w = bgr.width();
-    let h = bgr.height();
+  /// channel positions according to [`Self::channel_order`] — `src`
+  /// may carry either BGR or RGB byte order.
+  pub fn run<'a>(&'a mut self, src: RgbFrame<'_>) -> LumaFrame<'a> {
+    let w = src.width();
+    let h = src.height();
     let size = (w as usize)
       .checked_mul(h as usize)
       .expect("luma plane size fits in usize");
@@ -259,15 +260,15 @@ impl LumaConverter {
 
     crate::frame::convert::bgr_to_luma_with_order(
       &mut self.scratch[..size],
-      bgr.data(),
+      src.data(),
       w,
       h,
-      bgr.stride(),
+      src.stride(),
       self.channel_order,
       self.use_simd,
     );
 
-    LumaFrame::new(&self.scratch[..size], w, h, w, bgr.timestamp())
+    LumaFrame::new(&self.scratch[..size], w, h, w, src.timestamp())
   }
 }
 
@@ -327,10 +328,11 @@ impl HsvConverter {
 
   /// Converts the packed-pixel input to planar HSV and returns an
   /// [`HsvFrame`] borrowing from this converter's scratch. Reads
-  /// channel positions according to [`Self::channel_order`].
-  pub fn run<'a>(&'a mut self, bgr: RgbFrame<'_>) -> HsvFrame<'a> {
-    let w = bgr.width();
-    let h = bgr.height();
+  /// channel positions according to [`Self::channel_order`] — `src`
+  /// may carry either BGR or RGB byte order.
+  pub fn run<'a>(&'a mut self, src: RgbFrame<'_>) -> HsvFrame<'a> {
+    let w = src.width();
+    let h = src.height();
     let size = (w as usize)
       .checked_mul(h as usize)
       .expect("HSV plane size fits in usize");
@@ -349,10 +351,10 @@ impl HsvConverter {
       &mut self.h[..size],
       &mut self.s[..size],
       &mut self.v[..size],
-      bgr.data(),
+      src.data(),
       w,
       h,
-      bgr.stride(),
+      src.stride(),
       self.channel_order,
       self.use_simd,
     );
@@ -364,7 +366,7 @@ impl HsvConverter {
       w,
       h,
       w,
-      bgr.timestamp(),
+      src.timestamp(),
     )
   }
 }

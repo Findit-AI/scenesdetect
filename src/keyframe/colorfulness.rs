@@ -40,14 +40,20 @@ use crate::frame::{ChannelOrder, RgbFrame};
 use serde::{Deserialize, Serialize};
 
 /// Options for the colorfulness detector.
+///
+/// # Serde forward compatibility
+///
+/// Every new field added to this struct MUST carry
+/// `#[cfg_attr(feature = "serde", serde(default))]`. Without it,
+/// existing serialised payloads from an older crate version fail
+/// to deserialise on upgrade. The field's `Default` value should
+/// match the behaviour the absent-field config implicitly had —
+/// e.g. `channel_order` defaults to `ChannelOrder::Bgr`, matching
+/// the pre-feature BGR-only behaviour.
 #[derive(Debug, Clone, Copy, PartialEq)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct Options {
   use_simd: bool,
-  // `serde(default)` keeps pre-`channel_order` payloads
-  // deserializing (they fall back to `ChannelOrder::Bgr`, matching the
-  // pre-existing internal behaviour). Without this, upgrading the
-  // crate would break any stored config.
   #[cfg_attr(feature = "serde", serde(default))]
   channel_order: ChannelOrder,
 }

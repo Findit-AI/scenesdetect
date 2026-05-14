@@ -77,11 +77,15 @@ pub fn bgr_to_hsv_planes(
   );
 }
 
-/// Order-aware variant of [`bgr_to_hsv_planes`]. Takes an explicit
-/// [`ChannelOrder`] so callers can pass either BGR-ordered or RGB-ordered
-/// `src` data. The `bgr_to_hsv_planes` shim above is the BGR-default
-/// thin wrapper kept for source compatibility with pre-`ChannelOrder`
-/// releases.
+/// Order-aware variant of [`bgr_to_hsv_planes`].
+///
+/// `src` carries either **BGR** or **RGB** byte order per the
+/// `order` parameter — `ChannelOrder::Bgr` reads `(B, G, R)`
+/// at byte positions 0/1/2 per pixel, `ChannelOrder::Rgb`
+/// reads `(R, G, B)`. The HSV math is otherwise identical
+/// (we just route the correct byte through the kernel's `b`
+/// and `r` lanes). The legacy BGR-only [`bgr_to_hsv_planes`]
+/// shim above forwards to this with `ChannelOrder::Bgr`.
 #[inline]
 #[allow(clippy::too_many_arguments)]
 pub fn bgr_to_hsv_planes_with_order(
@@ -183,11 +187,16 @@ pub fn bgr_to_luma(
   bgr_to_luma_with_order(out, src, width, height, stride, ChannelOrder::Bgr, use_simd);
 }
 
-/// Order-aware variant of [`bgr_to_luma`]. Takes an explicit
-/// [`ChannelOrder`] so callers can pass either BGR-ordered or RGB-ordered
-/// `src` data. The `bgr_to_luma` shim above is the BGR-default thin
-/// wrapper kept for source compatibility with pre-`ChannelOrder`
-/// releases.
+/// Order-aware variant of [`bgr_to_luma`].
+///
+/// `src` carries either **BGR** or **RGB** byte order per the
+/// `order` parameter — `ChannelOrder::Bgr` reads `(B, G, R)`
+/// at byte positions 0/1/2 per pixel, `ChannelOrder::Rgb`
+/// reads `(R, G, B)`. Coefficients `(29, 150, 77)` stay
+/// pinned to the symbolic `(B, G, R)` channels; the dispatch
+/// just routes the correct byte through. The legacy BGR-only
+/// [`bgr_to_luma`] shim above forwards to this with
+/// `ChannelOrder::Bgr`.
 #[inline]
 pub fn bgr_to_luma_with_order(
   out: &mut [u8],
