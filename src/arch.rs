@@ -482,9 +482,9 @@ pub(crate) fn tenengrad(
 
 /// Immerkaer (1996) fast noise variance estimator. Returns σₙ (the
 /// estimated per-pixel additive-Gaussian noise standard deviation) in
-/// 0-255 space. Dispatches to scalar today; the parameter shape
-/// matches the SIMD-ladder convention so future backends slot in
-/// without changing the signature.
+/// 0-255 space.
+///
+/// Dispatch matrix mirrors [`tenengrad`].
 #[cfg_attr(not(tarpaulin), inline(always))]
 #[allow(unreachable_code)]
 pub(crate) fn noise(
@@ -498,17 +498,59 @@ pub(crate) fn noise(
     return scalar::Scalar::noise(luma, width, height, stride);
   }
 
-  // SIMD backends not yet implemented — scalar path.
+  #[cfg(all(target_arch = "aarch64", not(miri)))]
+  {
+    // SAFETY: NEON is part of the base ARMv8-A ISA.
+    return unsafe { neon::noise(luma, width, height, stride) };
+  }
+
+  #[cfg(all(target_arch = "wasm32", target_feature = "simd128", not(miri)))]
+  {
+    // SAFETY: simd128 target feature enabled at compile time.
+    return unsafe { wasm_simd128::noise(luma, width, height, stride) };
+  }
+
+  #[cfg(all(
+    any(target_arch = "x86", target_arch = "x86_64"),
+    feature = "std",
+    not(miri)
+  ))]
+  {
+    if std::is_x86_feature_detected!("ssse3") {
+      // SAFETY: runtime-checked above.
+      return unsafe { x86_ssse3::noise(luma, width, height, stride) };
+    }
+  }
+
+  #[cfg(all(
+    any(target_arch = "x86", target_arch = "x86_64"),
+    not(feature = "std"),
+    target_feature = "ssse3",
+    not(miri),
+  ))]
+  {
+    // SAFETY: target feature enabled at compile time.
+    return unsafe { x86_ssse3::noise(luma, width, height, stride) };
+  }
+
   scalar::Scalar::noise(luma, width, height, stride)
 }
 
 /// Magnitude-weighted gradient-direction concentration. Returns an
 /// anisotropy score in `[0, 1]` — 0 = isotropic gradients, 1 = a single
-/// dominant direction. Dispatches to scalar today; signature preserved
-/// for future SIMD backends.
+/// dominant direction.
 ///
 /// Inputs are the magnitude and quantized-direction planes produced by
-/// [`sobel`].
+/// [`sobel`]. `mag.len()` and `dir.len()` MUST each be at least
+/// `width * height`; this is a public-API precondition because the
+/// SIMD backends use raw pointer loads with no bounds checks. The
+/// dispatcher panics on a too-short slice rather than relying on the
+/// scalar path's bounds-checked indexing to catch it (UB would
+/// otherwise be reachable from the safe-Rust
+/// [`MotionBlur::observe_sobel`](crate::keyframe::motion_blur::MotionBlur::observe_sobel)
+/// entry point).
+///
+/// Dispatch matrix mirrors [`tenengrad`].
 #[cfg_attr(not(tarpaulin), inline(always))]
 #[allow(unreachable_code)]
 pub(crate) fn gradient_anisotropy(
@@ -518,15 +560,68 @@ pub(crate) fn gradient_anisotropy(
   height: usize,
   use_simd: bool,
 ) -> f32 {
+  // Validate slice lengths BEFORE any SIMD dispatch. The SIMD
+  // backends read 4 i32 mag values (SSSE3) or 8 i32 mag values +
+  // 8 dir bytes (NEON, wasm) per chunk via raw pointer loads;
+  // an undersized slice would be unchecked OOB reads / UB. The
+  // scalar path would panic via bounds-checked indexing on the
+  // same inputs — fail uniformly and explicitly here.
+  let n = width
+    .checked_mul(height)
+    .expect("gradient_anisotropy: width*height overflows usize");
+  assert!(
+    mag.len() >= n,
+    "gradient_anisotropy: mag.len()={} but width*height={n}",
+    mag.len()
+  );
+  assert!(
+    dir.len() >= n,
+    "gradient_anisotropy: dir.len()={} but width*height={n}",
+    dir.len()
+  );
+
   if !use_simd {
     return scalar::Scalar::gradient_anisotropy(mag, dir, width, height);
   }
+
+  #[cfg(all(target_arch = "aarch64", not(miri)))]
+  {
+    return unsafe { neon::gradient_anisotropy(mag, dir, width, height) };
+  }
+
+  #[cfg(all(target_arch = "wasm32", target_feature = "simd128", not(miri)))]
+  {
+    return unsafe { wasm_simd128::gradient_anisotropy(mag, dir, width, height) };
+  }
+
+  #[cfg(all(
+    any(target_arch = "x86", target_arch = "x86_64"),
+    feature = "std",
+    not(miri)
+  ))]
+  {
+    if std::is_x86_feature_detected!("ssse3") {
+      return unsafe { x86_ssse3::gradient_anisotropy(mag, dir, width, height) };
+    }
+  }
+
+  #[cfg(all(
+    any(target_arch = "x86", target_arch = "x86_64"),
+    not(feature = "std"),
+    target_feature = "ssse3",
+    not(miri),
+  ))]
+  {
+    return unsafe { x86_ssse3::gradient_anisotropy(mag, dir, width, height) };
+  }
+
   scalar::Scalar::gradient_anisotropy(mag, dir, width, height)
 }
 
 /// Hasler-Süßstrunk colourfulness metric on packed 24-bit BGR.
-/// See the scalar kernel for the formula. Dispatches to scalar
-/// today; signature preserved for future SIMD backends.
+/// See the scalar kernel for the formula.
+///
+/// Dispatch matrix mirrors [`tenengrad`].
 #[cfg_attr(not(tarpaulin), inline(always))]
 #[allow(unreachable_code)]
 pub(crate) fn colorfulness(
@@ -539,6 +634,38 @@ pub(crate) fn colorfulness(
   if !use_simd {
     return scalar::Scalar::colorfulness(bgr, width, height, stride);
   }
+
+  #[cfg(all(target_arch = "aarch64", not(miri)))]
+  {
+    return unsafe { neon::colorfulness(bgr, width, height, stride) };
+  }
+
+  #[cfg(all(target_arch = "wasm32", target_feature = "simd128", not(miri)))]
+  {
+    return unsafe { wasm_simd128::colorfulness(bgr, width, height, stride) };
+  }
+
+  #[cfg(all(
+    any(target_arch = "x86", target_arch = "x86_64"),
+    feature = "std",
+    not(miri)
+  ))]
+  {
+    if std::is_x86_feature_detected!("ssse3") {
+      return unsafe { x86_ssse3::colorfulness(bgr, width, height, stride) };
+    }
+  }
+
+  #[cfg(all(
+    any(target_arch = "x86", target_arch = "x86_64"),
+    not(feature = "std"),
+    target_feature = "ssse3",
+    not(miri),
+  ))]
+  {
+    return unsafe { x86_ssse3::colorfulness(bgr, width, height, stride) };
+  }
+
   scalar::Scalar::colorfulness(bgr, width, height, stride)
 }
 
@@ -1628,6 +1755,257 @@ mod tests {
     assert_tenengrad_equiv(257, 31, 257, |luma, w, h, s| unsafe {
       x86_ssse3::tenengrad(luma, w, h, s)
     });
+  }
+
+  // ---- noise ----------------------------------------------------------------
+
+  /// Builds a luma plane with a fixed-seed random pattern; padding is
+  /// `0xAA` to catch stride misuse.
+  fn assert_noise_equiv<F: FnOnce(&[u8], usize, usize, usize) -> f32>(
+    w: usize,
+    h: usize,
+    stride: usize,
+    backend: F,
+  ) {
+    let mut data = vec![0xAAu8; stride * h];
+    let mut rng = 0xC0FFEE_u32;
+    for y in 0..h {
+      for x in 0..w {
+        rng = rng.wrapping_mul(1664525).wrapping_add(1013904223);
+        data[y * stride + x] = (rng >> 24) as u8;
+      }
+    }
+    let scalar_out = scalar::Scalar::noise(&data, w, h, stride);
+    let simd_out = backend(&data, w, h, stride);
+    // Both paths use identical i64 accumulators and the same f64
+    // `COEFF * Σ / interior` scaling, so f32 agreement should be
+    // tight.
+    let rel = (simd_out - scalar_out).abs() / scalar_out.abs().max(1.0);
+    assert!(
+      rel < 1e-4,
+      "SIMD noise disagrees with scalar: simd={simd_out} scalar={scalar_out} rel={rel}"
+    );
+  }
+
+  #[cfg(target_arch = "aarch64")]
+  #[test]
+  fn neon_noise_matches_scalar() {
+    // 10 wide → interior 8 wide (one vector iteration, zero tail).
+    assert_noise_equiv(10, 10, 10, |luma, w, h, s| unsafe {
+      neon::noise(luma, w, h, s)
+    });
+    // 11 wide → interior 9, one tail pixel per row.
+    assert_noise_equiv(11, 10, 11, |luma, w, h, s| unsafe {
+      neon::noise(luma, w, h, s)
+    });
+    // Stride-padded — sentinel 0xAA in the padding must not leak.
+    assert_noise_equiv(24, 12, 64, |luma, w, h, s| unsafe {
+      neon::noise(luma, w, h, s)
+    });
+    // Larger frame — multiple vector iterations + tail per row.
+    assert_noise_equiv(257, 31, 257, |luma, w, h, s| unsafe {
+      neon::noise(luma, w, h, s)
+    });
+  }
+
+  #[cfg(all(any(target_arch = "x86", target_arch = "x86_64"), feature = "std"))]
+  #[test]
+  fn ssse3_noise_matches_scalar() {
+    if !std::is_x86_feature_detected!("ssse3") {
+      return;
+    }
+    assert_noise_equiv(10, 10, 10, |luma, w, h, s| unsafe {
+      x86_ssse3::noise(luma, w, h, s)
+    });
+    assert_noise_equiv(11, 10, 11, |luma, w, h, s| unsafe {
+      x86_ssse3::noise(luma, w, h, s)
+    });
+    assert_noise_equiv(24, 12, 64, |luma, w, h, s| unsafe {
+      x86_ssse3::noise(luma, w, h, s)
+    });
+    assert_noise_equiv(257, 31, 257, |luma, w, h, s| unsafe {
+      x86_ssse3::noise(luma, w, h, s)
+    });
+  }
+
+  // ---- colorfulness ---------------------------------------------------------
+
+  /// Builds a packed BGR plane with a fixed-seed random pattern.
+  /// Padding bytes (between `w*3` and `stride`) are set to `0xCC`
+  /// so a SIMD load that reads past the pixel area trips the
+  /// equivalence assertion.
+  fn assert_colorfulness_equiv<F: FnOnce(&[u8], usize, usize, usize) -> f32>(
+    w: usize,
+    h: usize,
+    stride: usize,
+    backend: F,
+  ) {
+    let mut data = vec![0xCCu8; stride * h];
+    let mut rng = 0xDEAD_BEEFu32;
+    for y in 0..h {
+      for x in 0..w {
+        rng = rng.wrapping_mul(1664525).wrapping_add(1013904223);
+        let base = y * stride + x * 3;
+        data[base] = (rng >> 24) as u8;
+        rng = rng.wrapping_mul(1664525).wrapping_add(1013904223);
+        data[base + 1] = (rng >> 24) as u8;
+        rng = rng.wrapping_mul(1664525).wrapping_add(1013904223);
+        data[base + 2] = (rng >> 24) as u8;
+      }
+    }
+    let scalar_out = scalar::Scalar::colorfulness(&data, w, h, stride);
+    let simd_out = backend(&data, w, h, stride);
+    // The integer two-pass formulation `E[X²] - E[X]²` produces
+    // results that differ from Welford only by f64 rounding, well
+    // inside f32 precision for our value ranges.
+    let rel = (simd_out - scalar_out).abs() / scalar_out.abs().max(1.0);
+    assert!(
+      rel < 1e-4,
+      "SIMD colorfulness disagrees with scalar: simd={simd_out} scalar={scalar_out} rel={rel}"
+    );
+  }
+
+  #[cfg(target_arch = "aarch64")]
+  #[test]
+  fn neon_colorfulness_matches_scalar() {
+    // 16 wide = one vector iteration, zero tail.
+    assert_colorfulness_equiv(16, 12, 48, |bgr, w, h, s| unsafe {
+      neon::colorfulness(bgr, w, h, s)
+    });
+    // 17 wide → 1 chunk + 1 tail pixel.
+    assert_colorfulness_equiv(17, 12, 51, |bgr, w, h, s| unsafe {
+      neon::colorfulness(bgr, w, h, s)
+    });
+    // Stride-padded (sentinel 0xCC in padding must not leak).
+    assert_colorfulness_equiv(24, 9, 128, |bgr, w, h, s| unsafe {
+      neon::colorfulness(bgr, w, h, s)
+    });
+    // Larger frame — multiple chunks + tail per row.
+    assert_colorfulness_equiv(259, 17, 259 * 3, |bgr, w, h, s| unsafe {
+      neon::colorfulness(bgr, w, h, s)
+    });
+  }
+
+  #[cfg(all(any(target_arch = "x86", target_arch = "x86_64"), feature = "std"))]
+  #[test]
+  fn ssse3_colorfulness_matches_scalar() {
+    if !std::is_x86_feature_detected!("ssse3") {
+      return;
+    }
+    assert_colorfulness_equiv(16, 12, 48, |bgr, w, h, s| unsafe {
+      x86_ssse3::colorfulness(bgr, w, h, s)
+    });
+    assert_colorfulness_equiv(17, 12, 51, |bgr, w, h, s| unsafe {
+      x86_ssse3::colorfulness(bgr, w, h, s)
+    });
+    assert_colorfulness_equiv(24, 9, 128, |bgr, w, h, s| unsafe {
+      x86_ssse3::colorfulness(bgr, w, h, s)
+    });
+    assert_colorfulness_equiv(259, 17, 259 * 3, |bgr, w, h, s| unsafe {
+      x86_ssse3::colorfulness(bgr, w, h, s)
+    });
+  }
+
+  // ---- gradient_anisotropy --------------------------------------------------
+
+  /// Builds `(mag, dir)` planes with a fixed-seed pattern that
+  /// exercises every code path: ~25% negative `mag` (skipped), all
+  /// four direction bins, and a mix of magnitudes.
+  fn assert_anisotropy_equiv<F: FnOnce(&[i32], &[u8], usize, usize) -> f32>(
+    w: usize,
+    h: usize,
+    backend: F,
+  ) {
+    let mut mag = vec![0i32; w * h];
+    let mut dir = vec![0u8; w * h];
+    let mut rng = 0xFEED_FACEu32;
+    for v in mag.iter_mut() {
+      rng = rng.wrapping_mul(1664525).wrapping_add(1013904223);
+      // Span `i32::MIN/4..i32::MAX/4` so ~half the lanes hit the
+      // `mag <= 0` skip branch and the rest contribute large
+      // positive magnitudes.
+      *v = (rng as i32) / 4;
+    }
+    for v in dir.iter_mut() {
+      rng = rng.wrapping_mul(1664525).wrapping_add(1013904223);
+      *v = (rng >> 24) as u8;
+    }
+    let scalar_out = scalar::Scalar::gradient_anisotropy(&mag, &dir, w, h);
+    let simd_out = backend(&mag, &dir, w, h);
+    let rel = (simd_out - scalar_out).abs() / scalar_out.abs().max(1.0);
+    assert!(
+      rel < 1e-5,
+      "SIMD gradient_anisotropy disagrees with scalar: simd={simd_out} scalar={scalar_out} rel={rel}"
+    );
+  }
+
+  #[cfg(target_arch = "aarch64")]
+  #[test]
+  fn neon_gradient_anisotropy_matches_scalar() {
+    // 10 wide → interior 8 wide → one 8-lane vector iteration,
+    // zero tail.
+    assert_anisotropy_equiv(10, 10, |m, d, w, h| unsafe {
+      neon::gradient_anisotropy(m, d, w, h)
+    });
+    // 11 wide → interior 9 → one chunk + 1 tail pixel per row.
+    assert_anisotropy_equiv(11, 10, |m, d, w, h| unsafe {
+      neon::gradient_anisotropy(m, d, w, h)
+    });
+    // Larger frame — multiple chunks + tail.
+    assert_anisotropy_equiv(257, 31, |m, d, w, h| unsafe {
+      neon::gradient_anisotropy(m, d, w, h)
+    });
+  }
+
+  #[cfg(all(any(target_arch = "x86", target_arch = "x86_64"), feature = "std"))]
+  #[test]
+  fn ssse3_gradient_anisotropy_matches_scalar() {
+    if !std::is_x86_feature_detected!("ssse3") {
+      return;
+    }
+    // SSSE3 uses 4-pixel chunks.
+    assert_anisotropy_equiv(6, 6, |m, d, w, h| unsafe {
+      x86_ssse3::gradient_anisotropy(m, d, w, h)
+    });
+    assert_anisotropy_equiv(7, 6, |m, d, w, h| unsafe {
+      x86_ssse3::gradient_anisotropy(m, d, w, h)
+    });
+    assert_anisotropy_equiv(11, 10, |m, d, w, h| unsafe {
+      x86_ssse3::gradient_anisotropy(m, d, w, h)
+    });
+    assert_anisotropy_equiv(257, 31, |m, d, w, h| unsafe {
+      x86_ssse3::gradient_anisotropy(m, d, w, h)
+    });
+  }
+
+  #[test]
+  #[should_panic(expected = "mag.len()")]
+  fn gradient_anisotropy_dispatcher_panics_on_undersized_mag() {
+    // The SIMD backends use raw pointer loads — passing a `mag`
+    // slice shorter than `w*h` would be UB. The dispatcher MUST
+    // panic before dispatching to either path.
+    let mag = vec![0i32; 10]; // 10 < 8*8 = 64
+    let dir = vec![0u8; 64];
+    let _ = gradient_anisotropy(&mag, &dir, 8, 8, true);
+  }
+
+  #[test]
+  #[should_panic(expected = "dir.len()")]
+  fn gradient_anisotropy_dispatcher_panics_on_undersized_dir() {
+    let mag = vec![0i32; 64];
+    let dir = vec![0u8; 10];
+    let _ = gradient_anisotropy(&mag, &dir, 8, 8, true);
+  }
+
+  #[test]
+  #[should_panic(expected = "mag.len()")]
+  fn gradient_anisotropy_dispatcher_panics_even_on_scalar_path() {
+    // The bounds check fires before the `use_simd` branch so the
+    // scalar caller gets the same explicit diagnostic instead of
+    // an `index out of bounds` panic deep inside the kernel.
+    let mag = vec![0i32; 10];
+    let dir = vec![0u8; 64];
+    let _ = gradient_anisotropy(&mag, &dir, 8, 8, false);
   }
 
   // ---- plane_mean_variance --------------------------------------------------

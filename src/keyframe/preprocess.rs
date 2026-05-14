@@ -335,7 +335,14 @@ impl HsvConverter {
 
 // -----------------------------------------------------------------------------
 
-#[cfg(all(test, feature = "std"))]
+// Miri can't model the NEON / AVX intrinsics that `fast_image_resize`
+// uses internally on aarch64 / x86_64 hosts (e.g.
+// `llvm.aarch64.neon.st1x4.v4i32.p0` raises "unsupported foreign
+// function"). Every `Downscaler` test routes through that crate, so
+// gate the whole test module out under Miri rather than scattering
+// `cfg_attr(miri, ignore)` over each test. Regular `cargo test` runs
+// the suite as usual.
+#[cfg(all(test, feature = "std", not(miri)))]
 mod tests {
   use super::*;
   use crate::frame::{Timebase, Timestamp};

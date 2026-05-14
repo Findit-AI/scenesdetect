@@ -520,10 +520,10 @@ impl Detector {
     if sum == 0.0 {
       return Err(Error::ZeroWeights);
     }
-    if let Some(k) = options.kernel_size {
-      if k < 3 || k % 2 == 0 {
-        return Err(Error::InvalidKernelSize(k));
-      }
+    if let Some(k) = options.kernel_size
+      && (k < 3 || k.is_multiple_of(2))
+    {
+      return Err(Error::InvalidKernelSize(k));
     }
     let edges_enabled = options.weights.delta_edges != 0.0;
     let use_simd = options.simd;
@@ -1062,7 +1062,7 @@ fn copy_plane(dst: &mut [u8], src: &[u8], width: u32, height: u32, stride: u32) 
 fn auto_kernel_size(width: u32, height: u32) -> u32 {
   let d = round_64(sqrt_64(width as f64 * height as f64) / 192.0) as u32;
   let mut k = 4 + d;
-  if k % 2 == 0 {
+  if k.is_multiple_of(2) {
     k += 1;
   }
   k.max(3)

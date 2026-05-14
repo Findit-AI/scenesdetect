@@ -799,6 +799,487 @@ pub(super) unsafe fn tenengrad(luma: &[u8], w: usize, h: usize, s: usize) -> f32
   (((vec_sum + tail_acc) as f64) / (interior as f64)) as f32
 }
 
+/// SSSE3 Immerkaer noise estimator on a u8 luma plane.
+///
+/// Convolves with the 3×3 Laplacian-of-difference mask
+/// `[[1,-2,1],[-2,4,-2],[1,-2,1]]`, sums absolute responses over
+/// interior pixels, then scales by `√(π/2) / 6 / N_inner` to
+/// yield σₙ. Honours row stride.
+///
+/// Per 8-pixel chunk:
+/// - Load 9 `u8×8` neighborhoods (`tl, t, tr, l, c, r, bl, b, br`)
+///   via `_mm_loadl_epi64`.
+/// - Zero-extend each to `i16×8` (`_mm_unpacklo_epi8` against
+///   zero).
+/// - Compute `lap = 4·c - 2·(t+b+l+r) + (tl+tr+bl+br)` lanewise.
+///   Peak magnitude on 8-bit input is `16·255 = 4080`, well
+///   inside `i16` (max 32767).
+/// - `_mm_abs_epi16` gives the per-pixel absolute value.
+/// - `_mm_madd_epi16(abs, ones16)` pair-sums into `i32×4`
+///   (peak `2·4080 = 8160` per lane). Widen to `i64×2` via
+///   `_mm_unpacklo/hi_epi32` against zero (safe — values are
+///   non-negative) and accumulate.
+///
+/// At the end, horizontal-reduce the `i64×2` accumulator, add
+/// the scalar tail, and apply the `√(π/2)/6 · 1/N` scaling in
+/// `f64` before casting to `f32`.
+///
+/// # Safety
+///
+/// Caller must ensure SSSE3 is available.
+#[target_feature(enable = "ssse3")]
+#[allow(unused_unsafe)]
+pub(super) unsafe fn noise(luma: &[u8], w: usize, h: usize, s: usize) -> f32 {
+  if w < 3 || h < 3 {
+    return 0.0;
+  }
+  let interior = (w - 2) * (h - 2);
+  if interior == 0 {
+    return 0.0;
+  }
+
+  const LANES: usize = 8;
+  let x_vec_end = if w >= 2 + LANES {
+    1 + ((w - 2) / LANES) * LANES
+  } else {
+    1
+  };
+
+  let zero = unsafe { _mm_setzero_si128() };
+  let ones16 = unsafe { _mm_set1_epi16(1) };
+  let mut acc = unsafe { _mm_setzero_si128() }; // i64x2
+  let mut tail_acc: i64 = 0;
+
+  for y in 1..h - 1 {
+    let prev = &luma[(y - 1) * s..];
+    let curr = &luma[y * s..];
+    let next = &luma[(y + 1) * s..];
+
+    let mut x = 1;
+    while x < x_vec_end {
+      let load8 = |p: *const u8| -> __m128i { unsafe { _mm_loadl_epi64(p as *const __m128i) } };
+
+      let tl = load8(unsafe { prev.as_ptr().add(x - 1) });
+      let t = load8(unsafe { prev.as_ptr().add(x) });
+      let tr = load8(unsafe { prev.as_ptr().add(x + 1) });
+      let l = load8(unsafe { curr.as_ptr().add(x - 1) });
+      let c = load8(unsafe { curr.as_ptr().add(x) });
+      let r = load8(unsafe { curr.as_ptr().add(x + 1) });
+      let bl = load8(unsafe { next.as_ptr().add(x - 1) });
+      let b = load8(unsafe { next.as_ptr().add(x) });
+      let br = load8(unsafe { next.as_ptr().add(x + 1) });
+
+      // Zero-extend u8 → i16×8 (values fit; high bit unset).
+      let tl = unsafe { _mm_unpacklo_epi8(tl, zero) };
+      let t = unsafe { _mm_unpacklo_epi8(t, zero) };
+      let tr = unsafe { _mm_unpacklo_epi8(tr, zero) };
+      let l = unsafe { _mm_unpacklo_epi8(l, zero) };
+      let c = unsafe { _mm_unpacklo_epi8(c, zero) };
+      let r = unsafe { _mm_unpacklo_epi8(r, zero) };
+      let bl = unsafe { _mm_unpacklo_epi8(bl, zero) };
+      let b = unsafe { _mm_unpacklo_epi8(b, zero) };
+      let br = unsafe { _mm_unpacklo_epi8(br, zero) };
+
+      // lap = 4c - 2(t + b + l + r) + (tl + tr + bl + br)
+      let four_c = unsafe { _mm_slli_epi16::<2>(c) };
+      let tblr = unsafe { _mm_add_epi16(_mm_add_epi16(t, b), _mm_add_epi16(l, r)) };
+      let two_tblr = unsafe { _mm_slli_epi16::<1>(tblr) };
+      let corners = unsafe { _mm_add_epi16(_mm_add_epi16(tl, tr), _mm_add_epi16(bl, br)) };
+      let lap = unsafe { _mm_add_epi16(_mm_sub_epi16(four_c, two_tblr), corners) };
+      let abs_lap = unsafe { _mm_abs_epi16(lap) };
+
+      // Pair-sum: i16×8 absolutes → i32×4 (peak 2·4080 = 8160).
+      let i32_pairs = unsafe { _mm_madd_epi16(abs_lap, ones16) };
+
+      // Widen i32×4 → i64×2 × 2 (zero high half — values are
+      // non-negative).
+      let sum64_a = unsafe { _mm_unpacklo_epi32(i32_pairs, zero) };
+      let sum64_b = unsafe { _mm_unpackhi_epi32(i32_pairs, zero) };
+      acc = unsafe { _mm_add_epi64(acc, sum64_a) };
+      acc = unsafe { _mm_add_epi64(acc, sum64_b) };
+
+      x += LANES;
+    }
+
+    // Scalar tail (per-pixel) — matches the scalar reference.
+    while x < w - 1 {
+      let p = |dy: isize, dx: isize| -> i32 {
+        luma[((y as isize + dy) as usize) * s + ((x as isize + dx) as usize)] as i32
+      };
+      let tl = p(-1, -1);
+      let t = p(-1, 0);
+      let tr = p(-1, 1);
+      let l = p(0, -1);
+      let c = p(0, 0);
+      let r = p(0, 1);
+      let bl = p(1, -1);
+      let b = p(1, 0);
+      let br = p(1, 1);
+      let lap = 4 * c - 2 * (t + b + l + r) + (tl + tr + bl + br);
+      tail_acc += lap.unsigned_abs() as i64;
+      x += 1;
+    }
+  }
+
+  // Horizontal reduce i64×2 → i64.
+  let hi_half = unsafe { _mm_srli_si128::<8>(acc) };
+  let total = unsafe { _mm_add_epi64(acc, hi_half) };
+  #[cfg(target_arch = "x86_64")]
+  let vec_sum: i64 = unsafe { _mm_cvtsi128_si64(total) };
+  #[cfg(target_arch = "x86")]
+  let vec_sum: i64 = {
+    let mut tmp = 0i64;
+    unsafe { _mm_storel_epi64(&mut tmp as *mut i64 as *mut __m128i, total) };
+    tmp
+  };
+
+  // σₙ ≈ √(π/2) / 6 · (Σ|lap| / interior). Coefficient matches
+  // the scalar `COEFF` exactly so f32 equality is reachable.
+  const COEFF: f64 = 0.208_898_754_886_372_3;
+  (((vec_sum + tail_acc) as f64) * COEFF / (interior as f64)) as f32
+}
+
+/// SSSE3 Hasler-Süßstrunk colourfulness on packed 24-bit BGR.
+///
+/// The scalar reference uses Welford-streaming f64 moments. We
+/// trade that for an exact-integer two-pass formulation that's
+/// SIMD-friendly: track `Σ rg`, `Σ rg²`, `Σ u`, `Σ u²` over the
+/// entire frame in integer accumulators, then derive moments at
+/// the end with one f64 pass. Within f64 our value ranges
+/// (`|Σ rg| ≤ N·255`, `|Σ rg²| ≤ N·65025`, similar for `u =
+/// R+G-2B`) leave `E[X²] - E[X]²` numerically equivalent to
+/// Welford for any realistic frame size.
+///
+/// Substituting `u = R + G - 2B` for `yb = 0.5(R+G) - B` keeps
+/// every per-pixel value in `i16`; the moment derivation at the
+/// end recovers `yb` via `mean_yb = mean_u / 2`, `var_yb = var_u
+/// / 4`.
+///
+/// Per 16-pixel chunk:
+/// - 3 × 16-byte loads → 9 `pshufb` shuffles → `b`, `g`, `r` as
+///   `u8×16` (deinterleave table shared with `bgr_to_luma`).
+/// - Zero-extend each channel's low / high halves to `i16×8`.
+/// - Per half compute `rg = R-G` (`i16`, `[-255, 255]`) and
+///   `u = R+G - 2B` (`i16`, `[-510, 510]`).
+/// - `_mm_madd_epi16(rg, ones16)` pair-sums to `i32×4` for
+///   `Σ rg` (lane bound per chunk `[-510, 510]`). The combined
+///   low + high i32×4 is sign-extended to `i64×2 × 2` and
+///   accumulated into an `i64×2` SIMD accumulator — this keeps
+///   the running sum within `i64::MAX` for any imaginable frame
+///   size (a per-chunk lane contribution of `≤ ±4080` × even 64
+///   million chunks lands well below `2^63`), avoiding the
+///   `i32::MAX ≈ 2.1·10^9` ceiling that an `i32×4` accumulator
+///   would have crossed near 8K-resolution biased frames.
+/// - `_mm_madd_epi16(rg, rg)` gives `i32×4` pair-sums of squares
+///   (lane bound `2·65025 = 130050`). Widen `i32×4 → i64×2 × 2`
+///   (zero-extend, values non-negative) and accumulate into the
+///   `i64×2` squared-sum accumulator.
+///
+/// # Safety
+///
+/// Caller must ensure SSSE3 is available.
+#[target_feature(enable = "ssse3")]
+#[allow(unused_unsafe)]
+pub(super) unsafe fn colorfulness(bgr: &[u8], w: usize, h: usize, stride: usize) -> f32 {
+  let n = w.saturating_mul(h);
+  if n == 0 {
+    return 0.0;
+  }
+
+  const LANES: usize = 16;
+  let whole = w / LANES * LANES;
+
+  let m_b0 = unsafe { _mm_loadu_si128(BLK0_B.as_ptr() as *const __m128i) };
+  let m_g0 = unsafe { _mm_loadu_si128(BLK0_G.as_ptr() as *const __m128i) };
+  let m_r0 = unsafe { _mm_loadu_si128(BLK0_R.as_ptr() as *const __m128i) };
+  let m_b1 = unsafe { _mm_loadu_si128(BLK1_B.as_ptr() as *const __m128i) };
+  let m_g1 = unsafe { _mm_loadu_si128(BLK1_G.as_ptr() as *const __m128i) };
+  let m_r1 = unsafe { _mm_loadu_si128(BLK1_R.as_ptr() as *const __m128i) };
+  let m_b2 = unsafe { _mm_loadu_si128(BLK2_B.as_ptr() as *const __m128i) };
+  let m_g2 = unsafe { _mm_loadu_si128(BLK2_G.as_ptr() as *const __m128i) };
+  let m_r2 = unsafe { _mm_loadu_si128(BLK2_R.as_ptr() as *const __m128i) };
+  let zero = unsafe { _mm_setzero_si128() };
+  let ones16 = unsafe { _mm_set1_epi16(1) };
+
+  // SIMD accumulators. All four are i64×2; per-chunk i32×4
+  // partials are sign-extended (sums, possibly negative) or
+  // zero-extended (squares, non-negative) into the i64 lanes
+  // before adding, so no frame size can overflow the running
+  // accumulators.
+  let mut sum_rg = unsafe { _mm_setzero_si128() }; // i64×2 (signed)
+  let mut sum_u = unsafe { _mm_setzero_si128() }; // i64×2 (signed)
+  let mut sum_rg_sq = unsafe { _mm_setzero_si128() }; // i64×2 (non-negative)
+  let mut sum_u_sq = unsafe { _mm_setzero_si128() }; // i64×2 (non-negative)
+  // Scalar tail accumulators.
+  let mut tail_sum_rg: i64 = 0;
+  let mut tail_sum_u: i64 = 0;
+  let mut tail_sum_rg_sq: u64 = 0;
+  let mut tail_sum_u_sq: u64 = 0;
+
+  for y in 0..h {
+    let row_base = y * stride;
+
+    let mut x = 0;
+    while x < whole {
+      let p = unsafe { bgr.as_ptr().add(row_base + x * 3) };
+      let blk0 = unsafe { _mm_loadu_si128(p as *const __m128i) };
+      let blk1 = unsafe { _mm_loadu_si128(p.add(16) as *const __m128i) };
+      let blk2 = unsafe { _mm_loadu_si128(p.add(32) as *const __m128i) };
+
+      let b = unsafe {
+        _mm_or_si128(
+          _mm_or_si128(_mm_shuffle_epi8(blk0, m_b0), _mm_shuffle_epi8(blk1, m_b1)),
+          _mm_shuffle_epi8(blk2, m_b2),
+        )
+      };
+      let g = unsafe {
+        _mm_or_si128(
+          _mm_or_si128(_mm_shuffle_epi8(blk0, m_g0), _mm_shuffle_epi8(blk1, m_g1)),
+          _mm_shuffle_epi8(blk2, m_g2),
+        )
+      };
+      let r = unsafe {
+        _mm_or_si128(
+          _mm_or_si128(_mm_shuffle_epi8(blk0, m_r0), _mm_shuffle_epi8(blk1, m_r1)),
+          _mm_shuffle_epi8(blk2, m_r2),
+        )
+      };
+
+      // Low 8 lanes → i16×8.
+      let b_lo = unsafe { _mm_unpacklo_epi8(b, zero) };
+      let g_lo = unsafe { _mm_unpacklo_epi8(g, zero) };
+      let r_lo = unsafe { _mm_unpacklo_epi8(r, zero) };
+      let rg_lo = unsafe { _mm_sub_epi16(r_lo, g_lo) };
+      let rpg_lo = unsafe { _mm_add_epi16(r_lo, g_lo) };
+      let two_b_lo = unsafe { _mm_slli_epi16::<1>(b_lo) };
+      let u_lo = unsafe { _mm_sub_epi16(rpg_lo, two_b_lo) };
+
+      // High 8 lanes.
+      let b_hi = unsafe { _mm_unpackhi_epi8(b, zero) };
+      let g_hi = unsafe { _mm_unpackhi_epi8(g, zero) };
+      let r_hi = unsafe { _mm_unpackhi_epi8(r, zero) };
+      let rg_hi = unsafe { _mm_sub_epi16(r_hi, g_hi) };
+      let rpg_hi = unsafe { _mm_add_epi16(r_hi, g_hi) };
+      let two_b_hi = unsafe { _mm_slli_epi16::<1>(b_hi) };
+      let u_hi = unsafe { _mm_sub_epi16(rpg_hi, two_b_hi) };
+
+      // Σ rg, Σ u: pair-sum via madd-with-ones, then add halves
+      // and sign-extend each `i32×4` lane into the running
+      // `i64×2` accumulator. Sign extension is via
+      // `_mm_srai_epi32::<31>` to produce the high words.
+      let rg_pairs_lo = unsafe { _mm_madd_epi16(rg_lo, ones16) };
+      let rg_pairs_hi = unsafe { _mm_madd_epi16(rg_hi, ones16) };
+      let rg_pairs = unsafe { _mm_add_epi32(rg_pairs_lo, rg_pairs_hi) };
+      let rg_sign = unsafe { _mm_srai_epi32::<31>(rg_pairs) };
+      sum_rg = unsafe { _mm_add_epi64(sum_rg, _mm_unpacklo_epi32(rg_pairs, rg_sign)) };
+      sum_rg = unsafe { _mm_add_epi64(sum_rg, _mm_unpackhi_epi32(rg_pairs, rg_sign)) };
+      let u_pairs_lo = unsafe { _mm_madd_epi16(u_lo, ones16) };
+      let u_pairs_hi = unsafe { _mm_madd_epi16(u_hi, ones16) };
+      let u_pairs = unsafe { _mm_add_epi32(u_pairs_lo, u_pairs_hi) };
+      let u_sign = unsafe { _mm_srai_epi32::<31>(u_pairs) };
+      sum_u = unsafe { _mm_add_epi64(sum_u, _mm_unpacklo_epi32(u_pairs, u_sign)) };
+      sum_u = unsafe { _mm_add_epi64(sum_u, _mm_unpackhi_epi32(u_pairs, u_sign)) };
+
+      // Σ rg², Σ u²: madd-with-self for pair-sum-of-squares, then
+      // sum the two halves and widen to i64×2 × 2.
+      let rg_sq_lo = unsafe { _mm_madd_epi16(rg_lo, rg_lo) };
+      let rg_sq_hi = unsafe { _mm_madd_epi16(rg_hi, rg_hi) };
+      let rg_sq_i32 = unsafe { _mm_add_epi32(rg_sq_lo, rg_sq_hi) };
+      let rg_sq_lo64 = unsafe { _mm_unpacklo_epi32(rg_sq_i32, zero) };
+      let rg_sq_hi64 = unsafe { _mm_unpackhi_epi32(rg_sq_i32, zero) };
+      sum_rg_sq = unsafe { _mm_add_epi64(sum_rg_sq, rg_sq_lo64) };
+      sum_rg_sq = unsafe { _mm_add_epi64(sum_rg_sq, rg_sq_hi64) };
+
+      let u_sq_lo = unsafe { _mm_madd_epi16(u_lo, u_lo) };
+      let u_sq_hi = unsafe { _mm_madd_epi16(u_hi, u_hi) };
+      let u_sq_i32 = unsafe { _mm_add_epi32(u_sq_lo, u_sq_hi) };
+      let u_sq_lo64 = unsafe { _mm_unpacklo_epi32(u_sq_i32, zero) };
+      let u_sq_hi64 = unsafe { _mm_unpackhi_epi32(u_sq_i32, zero) };
+      sum_u_sq = unsafe { _mm_add_epi64(sum_u_sq, u_sq_lo64) };
+      sum_u_sq = unsafe { _mm_add_epi64(sum_u_sq, u_sq_hi64) };
+
+      x += LANES;
+    }
+
+    // Scalar tail.
+    while x < w {
+      let b = bgr[row_base + x * 3] as i32;
+      let g = bgr[row_base + x * 3 + 1] as i32;
+      let r = bgr[row_base + x * 3 + 2] as i32;
+      let rg = r - g;
+      let u = r + g - 2 * b;
+      tail_sum_rg += rg as i64;
+      tail_sum_u += u as i64;
+      tail_sum_rg_sq += (rg * rg) as u64;
+      tail_sum_u_sq += (u * u) as u64;
+      x += 1;
+    }
+  }
+
+  // Horizontal reduce i64×2 (lane 0 + lane 1). Signed for the
+  // sum vectors, unsigned for the squared-sum vectors.
+  let reduce_signed = |v: __m128i| -> i64 {
+    let mut lanes = [0i64; 2];
+    unsafe { _mm_storeu_si128(lanes.as_mut_ptr() as *mut __m128i, v) };
+    lanes[0].wrapping_add(lanes[1])
+  };
+  let reduce_unsigned = |v: __m128i| -> u64 {
+    let mut lanes = [0i64; 2];
+    unsafe { _mm_storeu_si128(lanes.as_mut_ptr() as *mut __m128i, v) };
+    (lanes[0] as u64).wrapping_add(lanes[1] as u64)
+  };
+
+  let total_sum_rg = reduce_signed(sum_rg).wrapping_add(tail_sum_rg);
+  let total_sum_u = reduce_signed(sum_u).wrapping_add(tail_sum_u);
+  let total_sum_rg_sq = reduce_unsigned(sum_rg_sq).wrapping_add(tail_sum_rg_sq);
+  let total_sum_u_sq = reduce_unsigned(sum_u_sq).wrapping_add(tail_sum_u_sq);
+
+  let n_f = n as f64;
+  let mean_rg = (total_sum_rg as f64) / n_f;
+  let mean_u = (total_sum_u as f64) / n_f;
+  let mean_yb = mean_u * 0.5;
+
+  let var_rg = ((total_sum_rg_sq as f64) / n_f - mean_rg * mean_rg).max(0.0);
+  let var_u = ((total_sum_u_sq as f64) / n_f - mean_u * mean_u).max(0.0);
+  let var_yb = var_u * 0.25;
+
+  let sigma_rgyb = crate::sqrt_64(var_rg + var_yb);
+  let mu_rgyb = crate::sqrt_64(mean_rg * mean_rg + mean_yb * mean_yb);
+  (sigma_rgyb + 0.3 * mu_rgyb) as f32
+}
+
+/// SSSE3 single-pass `(mean, variance)` on a u8 plane.
+///
+/// SSSE3 magnitude-weighted gradient-direction anisotropy.
+///
+/// Builds `hist[k] = Σ mag[p] where dir[p] & 3 == k` over the
+/// interior `(1..h-1) × (1..w-1)`, treating `mag[p] <= 0` as
+/// contributing nothing. Returns the normalized concentration
+/// `((max(hist)/total) - 0.25).max(0) / 0.75` (with `total == 0`
+/// short-circuiting to 0).
+///
+/// 4-pixel chunks. Per chunk:
+/// - Load 4 `i32` mag values (`_mm_loadu_si128`) and 4 `u8` dir
+///   bytes (`u32` read + `_mm_cvtsi32_si128`).
+/// - `pshufb` zero-extends the 4 dir bytes into i32×4 lanes; AND
+///   with `3` keeps only the bin index.
+/// - `_mm_cmpgt_epi32(mag4, 0)` produces an all-ones / all-zeros
+///   mask per lane for the `mag > 0` predicate. ANDing with
+///   `mag4` zeroes out non-positive lanes.
+/// - For each bin `b ∈ {0,1,2,3}`, `_mm_cmpeq_epi32(bins, b)`
+///   yields a per-lane bin mask. AND with the gated mag values
+///   selects the per-bin contributions; widen `i32×4 → i64×2 ×
+///   2` (zero-extend, values non-negative) and accumulate into
+///   the bin's `i64×2` accumulator.
+///
+/// Bin accumulator overflow: `mag` is `i32` (peak `≈ 2.1·10⁹`).
+/// Even on a 4K×2K interior (`~8·10⁶` pixels), a single bin can
+/// hold at most `~1.7·10¹⁶`, well inside `i64::MAX ≈ 9.2·10¹⁸`,
+/// so we drop the scalar's defensive `saturating_add` in favour
+/// of wrapping ops with no behavioural change for any realistic
+/// input. The tail loop matches the scalar reference exactly so
+/// SIMD / scalar agreement is bitwise-determined by the hist
+/// values.
+///
+/// # Safety
+///
+/// Caller must ensure SSSE3 is available.
+#[target_feature(enable = "ssse3")]
+#[allow(unused_unsafe)]
+pub(super) unsafe fn gradient_anisotropy(mag: &[i32], dir: &[u8], w: usize, h: usize) -> f32 {
+  if w < 3 || h < 3 {
+    return 0.0;
+  }
+
+  const LANES: usize = 4;
+  let x_vec_end = if w >= 2 + LANES {
+    1 + ((w - 2) / LANES) * LANES
+  } else {
+    1
+  };
+
+  let zero = unsafe { _mm_setzero_si128() };
+  let mask3 = unsafe { _mm_set1_epi32(0b11) };
+  // pshufb table: byte i → i32 lane i (zero-extended). Negative
+  // indices set the output byte to 0.
+  let zext_shuf =
+    unsafe { _mm_setr_epi8(0, -1, -1, -1, 1, -1, -1, -1, 2, -1, -1, -1, 3, -1, -1, -1) };
+  let bin_consts = [
+    unsafe { _mm_setzero_si128() },
+    unsafe { _mm_set1_epi32(1) },
+    unsafe { _mm_set1_epi32(2) },
+    unsafe { _mm_set1_epi32(3) },
+  ];
+
+  let mut acc: [__m128i; 4] = [unsafe { _mm_setzero_si128() }; 4];
+  let mut tail: [u64; 4] = [0; 4];
+
+  for y in 1..h - 1 {
+    let row_off = y * w;
+
+    let mut x = 1;
+    while x < x_vec_end {
+      let idx = row_off + x;
+      let mag4 = unsafe { _mm_loadu_si128(mag.as_ptr().add(idx) as *const __m128i) };
+
+      // Read 4 dir bytes as a u32, lift into the low 4 bytes of
+      // a 128-bit register, then `pshufb` to splay byte i into
+      // i32 lane i.
+      let dir4_raw = unsafe { (dir.as_ptr().add(idx) as *const u32).read_unaligned() };
+      let dir4_v = unsafe { _mm_cvtsi32_si128(dir4_raw as i32) };
+      let dir_i32 = unsafe { _mm_shuffle_epi8(dir4_v, zext_shuf) };
+      let bins_v = unsafe { _mm_and_si128(dir_i32, mask3) };
+
+      // mag > 0 mask; AND zeros out non-positive lanes.
+      let pos_mask = unsafe { _mm_cmpgt_epi32(mag4, zero) };
+      let pos_mag = unsafe { _mm_and_si128(mag4, pos_mask) };
+
+      for bin_val in 0..4usize {
+        let bin_eq = unsafe { _mm_cmpeq_epi32(bins_v, bin_consts[bin_val]) };
+        let masked = unsafe { _mm_and_si128(pos_mag, bin_eq) };
+        // Widen i32×4 → i64×2 × 2 (zero-extend; values non-negative).
+        let lo64 = unsafe { _mm_unpacklo_epi32(masked, zero) };
+        let hi64 = unsafe { _mm_unpackhi_epi32(masked, zero) };
+        acc[bin_val] = unsafe { _mm_add_epi64(acc[bin_val], lo64) };
+        acc[bin_val] = unsafe { _mm_add_epi64(acc[bin_val], hi64) };
+      }
+
+      x += LANES;
+    }
+
+    // Scalar tail — matches the scalar reference exactly.
+    while x < w - 1 {
+      let idx = row_off + x;
+      let m = mag[idx];
+      if m > 0 {
+        let d = dir[idx] as usize & 0b11;
+        tail[d] = tail[d].saturating_add(m as u64);
+      }
+      x += 1;
+    }
+  }
+
+  // Horizontal-reduce each i64×2 accumulator into the per-bin
+  // total and fold in the scalar tail.
+  let mut hist = tail;
+  for bin_val in 0..4 {
+    let mut lanes = [0i64; 2];
+    unsafe { _mm_storeu_si128(lanes.as_mut_ptr() as *mut __m128i, acc[bin_val]) };
+    hist[bin_val] = hist[bin_val]
+      .wrapping_add(lanes[0] as u64)
+      .wrapping_add(lanes[1] as u64);
+  }
+
+  let total: u64 = hist.iter().sum();
+  if total == 0 {
+    return 0.0;
+  }
+  let max_bin = *hist.iter().max().expect("4 bins") as f64;
+  let total_f = total as f64;
+  let frac = max_bin / total_f;
+  ((frac - 0.25).max(0.0) / 0.75) as f32
+}
+
 /// SSSE3 single-pass `(mean, variance)` on a u8 plane.
 ///
 /// Per 16-byte chunk:

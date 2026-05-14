@@ -1057,10 +1057,10 @@ impl Detector {
     }
 
     // Flush the last active bucket.
-    if bucket_idx < n {
-      if let Some((t, _)) = best_strict.or(best_any) {
-        emits.push(t);
-      }
+    if bucket_idx < n
+      && let Some((t, _)) = best_strict.or(best_any)
+    {
+      emits.push(t);
     }
 
     emits

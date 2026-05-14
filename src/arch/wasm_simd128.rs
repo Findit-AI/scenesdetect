@@ -696,6 +696,407 @@ pub(super) unsafe fn tenengrad(luma: &[u8], w: usize, h: usize, s: usize) -> f32
   (((vec_sum + tail_acc) as f64) / (interior as f64)) as f32
 }
 
+/// wasm SIMD128 Immerkaer noise estimator on a u8 luma plane.
+///
+/// Mirrors [`tenengrad`]'s row-load + i64x2 accumulator
+/// scaffolding, swapping the Sobel-squared kernel for the
+/// Laplacian-of-difference `[1,-2,1;-2,4,-2;1,-2,1]`.
+///
+/// Per 8-pixel chunk:
+/// - Load 9 `u8×8` neighborhoods via `v128_load64_zero`.
+/// - Zero-extend low half to `i16×8` via
+///   `u16x8_extend_low_u8x16`.
+/// - Compute `lap = 4·c - 2·(t+b+l+r) + (tl+tr+bl+br)`
+///   lanewise. Peak magnitude `16·255 = 4080` fits in `i16`.
+/// - `i16x8_abs` produces per-pixel absolutes.
+/// - `i32x4_extadd_pairwise_i16x8` pair-sums to `i32×4`
+///   (peak `2·4080 = 8160`).
+/// - Widen `i32×4 → i64×2 × 2` (low/high) and accumulate into
+///   the `i64×2` accumulator.
+///
+/// At the end, horizontal-reduce `i64×2 → i64`, add the scalar
+/// tail, and apply the `√(π/2)/6 / N_inner` scaling.
+///
+/// # Safety
+///
+/// Caller must ensure `simd128` target feature is enabled.
+#[target_feature(enable = "simd128")]
+#[allow(unused_unsafe)]
+pub(super) unsafe fn noise(luma: &[u8], w: usize, h: usize, s: usize) -> f32 {
+  if w < 3 || h < 3 {
+    return 0.0;
+  }
+  let interior = (w - 2) * (h - 2);
+  if interior == 0 {
+    return 0.0;
+  }
+
+  const LANES: usize = 8;
+  let x_vec_end = if w >= 2 + LANES {
+    1 + ((w - 2) / LANES) * LANES
+  } else {
+    1
+  };
+
+  let mut acc = i64x2_splat(0);
+  let mut tail_acc: i64 = 0;
+
+  for y in 1..h - 1 {
+    let prev = &luma[(y - 1) * s..];
+    let curr = &luma[y * s..];
+    let next = &luma[(y + 1) * s..];
+
+    let mut x = 1;
+    while x < x_vec_end {
+      let load8 = |p: *const u8| -> v128 { unsafe { v128_load64_zero(p as *const u64) } };
+
+      let tl = load8(unsafe { prev.as_ptr().add(x - 1) });
+      let t = load8(unsafe { prev.as_ptr().add(x) });
+      let tr = load8(unsafe { prev.as_ptr().add(x + 1) });
+      let l = load8(unsafe { curr.as_ptr().add(x - 1) });
+      let c = load8(unsafe { curr.as_ptr().add(x) });
+      let r = load8(unsafe { curr.as_ptr().add(x + 1) });
+      let bl = load8(unsafe { next.as_ptr().add(x - 1) });
+      let b = load8(unsafe { next.as_ptr().add(x) });
+      let br = load8(unsafe { next.as_ptr().add(x + 1) });
+
+      let tl = u16x8_extend_low_u8x16(tl);
+      let t = u16x8_extend_low_u8x16(t);
+      let tr = u16x8_extend_low_u8x16(tr);
+      let l = u16x8_extend_low_u8x16(l);
+      let c = u16x8_extend_low_u8x16(c);
+      let r = u16x8_extend_low_u8x16(r);
+      let bl = u16x8_extend_low_u8x16(bl);
+      let b = u16x8_extend_low_u8x16(b);
+      let br = u16x8_extend_low_u8x16(br);
+
+      // lap = 4c - 2(t + b + l + r) + (tl + tr + bl + br)
+      let four_c = i16x8_shl(c, 2);
+      let tblr = i16x8_add(i16x8_add(t, b), i16x8_add(l, r));
+      let two_tblr = i16x8_shl(tblr, 1);
+      let corners = i16x8_add(i16x8_add(tl, tr), i16x8_add(bl, br));
+      let lap = i16x8_add(i16x8_sub(four_c, two_tblr), corners);
+      let abs_lap = i16x8_abs(lap);
+
+      // Pair-sum i16×8 → i32×4 (values are non-negative).
+      let pairs = i32x4_extadd_pairwise_i16x8(abs_lap);
+
+      // Widen i32×4 → two i64×2.
+      let sum64_a = i64x2_extend_low_i32x4(pairs);
+      let sum64_b = i64x2_extend_high_i32x4(pairs);
+      acc = i64x2_add(acc, sum64_a);
+      acc = i64x2_add(acc, sum64_b);
+
+      x += LANES;
+    }
+
+    while x < w - 1 {
+      let p = |dy: isize, dx: isize| -> i32 {
+        luma[((y as isize + dy) as usize) * s + ((x as isize + dx) as usize)] as i32
+      };
+      let tl = p(-1, -1);
+      let t = p(-1, 0);
+      let tr = p(-1, 1);
+      let l = p(0, -1);
+      let c = p(0, 0);
+      let r = p(0, 1);
+      let bl = p(1, -1);
+      let b = p(1, 0);
+      let br = p(1, 1);
+      let lap = 4 * c - 2 * (t + b + l + r) + (tl + tr + bl + br);
+      tail_acc += lap.unsigned_abs() as i64;
+      x += 1;
+    }
+  }
+
+  let vec_sum = i64x2_extract_lane::<0>(acc) + i64x2_extract_lane::<1>(acc);
+  // σₙ ≈ √(π/2) / 6 · (Σ|lap| / interior).
+  const COEFF: f64 = 0.208_898_754_886_372_3;
+  (((vec_sum + tail_acc) as f64) * COEFF / (interior as f64)) as f32
+}
+
+/// wasm SIMD128 Hasler-Süßstrunk colourfulness on packed BGR.
+///
+/// Algorithm matches the SSSE3 / NEON backends: per-pixel
+/// `rg = R-G` and `u = R+G-2B`, tracking exact-integer
+/// `Σ rg`, `Σ rg²`, `Σ u`, `Σ u²`. The final f64 pass derives
+/// the moments and combines them.
+///
+/// Per 16-pixel chunk:
+/// - 3 × `v128_load` (48 bytes) → `b`, `g`, `r` via 9
+///   `u8x16_swizzle` shuffles + `v128_or` (same deinterleave
+///   pattern as `bgr_to_luma`).
+/// - Zero-extend each channel's low / high u8 halves to i16×8
+///   (`u16x8_extend_low_u8x16` / `u16x8_extend_high_u8x16`).
+/// - Per half: `rg = R-G`, `u = R+G-2B`.
+/// - `i32x4_extadd_pairwise_i16x8` pair-sums `i16×8 → i32×4`
+///   for `Σ rg` / `Σ u`.
+/// - `i32x4_dot_i16x8(v, v)` gives `i32×4` of pair-sums of
+///   squares — mirrors `_mm_madd_epi16(v, v)`. Widen to i64×2
+///   and accumulate.
+///
+/// # Safety
+///
+/// Caller must ensure `simd128` target feature is enabled.
+#[target_feature(enable = "simd128")]
+#[allow(unused_unsafe)]
+pub(super) unsafe fn colorfulness(bgr: &[u8], w: usize, h: usize, stride: usize) -> f32 {
+  let n = w.saturating_mul(h);
+  if n == 0 {
+    return 0.0;
+  }
+
+  const LANES: usize = 16;
+  let whole = w / LANES * LANES;
+
+  let m_b0 = unsafe { v128_load(BLK0_B.as_ptr() as *const v128) };
+  let m_g0 = unsafe { v128_load(BLK0_G.as_ptr() as *const v128) };
+  let m_r0 = unsafe { v128_load(BLK0_R.as_ptr() as *const v128) };
+  let m_b1 = unsafe { v128_load(BLK1_B.as_ptr() as *const v128) };
+  let m_g1 = unsafe { v128_load(BLK1_G.as_ptr() as *const v128) };
+  let m_r1 = unsafe { v128_load(BLK1_R.as_ptr() as *const v128) };
+  let m_b2 = unsafe { v128_load(BLK2_B.as_ptr() as *const v128) };
+  let m_g2 = unsafe { v128_load(BLK2_G.as_ptr() as *const v128) };
+  let m_r2 = unsafe { v128_load(BLK2_R.as_ptr() as *const v128) };
+
+  // All four accumulators are i64×2; biased 8K+ frames pushed
+  // an i32×4 lane past `i32::MAX` and caused mean_rg/mean_yb to
+  // diverge from scalar.
+  let mut sum_rg = i64x2_splat(0);
+  let mut sum_u = i64x2_splat(0);
+  let mut sum_rg_sq = i64x2_splat(0);
+  let mut sum_u_sq = i64x2_splat(0);
+  let mut tail_sum_rg: i64 = 0;
+  let mut tail_sum_u: i64 = 0;
+  let mut tail_sum_rg_sq: u64 = 0;
+  let mut tail_sum_u_sq: u64 = 0;
+
+  for y in 0..h {
+    let row_base = y * stride;
+
+    let mut x = 0;
+    while x < whole {
+      let p = unsafe { bgr.as_ptr().add(row_base + x * 3) };
+      let blk0 = unsafe { v128_load(p as *const v128) };
+      let blk1 = unsafe { v128_load(p.add(16) as *const v128) };
+      let blk2 = unsafe { v128_load(p.add(32) as *const v128) };
+
+      let b = v128_or(
+        v128_or(u8x16_swizzle(blk0, m_b0), u8x16_swizzle(blk1, m_b1)),
+        u8x16_swizzle(blk2, m_b2),
+      );
+      let g = v128_or(
+        v128_or(u8x16_swizzle(blk0, m_g0), u8x16_swizzle(blk1, m_g1)),
+        u8x16_swizzle(blk2, m_g2),
+      );
+      let r = v128_or(
+        v128_or(u8x16_swizzle(blk0, m_r0), u8x16_swizzle(blk1, m_r1)),
+        u8x16_swizzle(blk2, m_r2),
+      );
+
+      // Low / high halves widened to i16×8 (zero-extend; high bit unset).
+      let b_lo = u16x8_extend_low_u8x16(b);
+      let g_lo = u16x8_extend_low_u8x16(g);
+      let r_lo = u16x8_extend_low_u8x16(r);
+      let rg_lo = i16x8_sub(r_lo, g_lo);
+      let rpg_lo = i16x8_add(r_lo, g_lo);
+      let two_b_lo = i16x8_shl(b_lo, 1);
+      let u_lo = i16x8_sub(rpg_lo, two_b_lo);
+
+      let b_hi = u16x8_extend_high_u8x16(b);
+      let g_hi = u16x8_extend_high_u8x16(g);
+      let r_hi = u16x8_extend_high_u8x16(r);
+      let rg_hi = i16x8_sub(r_hi, g_hi);
+      let rpg_hi = i16x8_add(r_hi, g_hi);
+      let two_b_hi = i16x8_shl(b_hi, 1);
+      let u_hi = i16x8_sub(rpg_hi, two_b_hi);
+
+      // Σ rg / Σ u via pairwise i16×8 → i32×4 (per-half), add
+      // the two halves, then sign-extend i32×4 → i64×2 × 2
+      // before accumulating so any frame size stays well inside
+      // the i64×2 accumulators.
+      let rg_pairs_lo = i32x4_extadd_pairwise_i16x8(rg_lo);
+      let rg_pairs_hi = i32x4_extadd_pairwise_i16x8(rg_hi);
+      let rg_pairs = i32x4_add(rg_pairs_lo, rg_pairs_hi);
+      sum_rg = i64x2_add(sum_rg, i64x2_extend_low_i32x4(rg_pairs));
+      sum_rg = i64x2_add(sum_rg, i64x2_extend_high_i32x4(rg_pairs));
+      let u_pairs_lo = i32x4_extadd_pairwise_i16x8(u_lo);
+      let u_pairs_hi = i32x4_extadd_pairwise_i16x8(u_hi);
+      let u_pairs = i32x4_add(u_pairs_lo, u_pairs_hi);
+      sum_u = i64x2_add(sum_u, i64x2_extend_low_i32x4(u_pairs));
+      sum_u = i64x2_add(sum_u, i64x2_extend_high_i32x4(u_pairs));
+
+      // Σ rg² / Σ u² via i32x4_dot_i16x8 (= madd-with-self).
+      let rg_sq_lo = i32x4_dot_i16x8(rg_lo, rg_lo);
+      let rg_sq_hi = i32x4_dot_i16x8(rg_hi, rg_hi);
+      let rg_sq_i32 = i32x4_add(rg_sq_lo, rg_sq_hi);
+      let rg_sq_lo64 = i64x2_extend_low_i32x4(rg_sq_i32);
+      let rg_sq_hi64 = i64x2_extend_high_i32x4(rg_sq_i32);
+      sum_rg_sq = i64x2_add(sum_rg_sq, rg_sq_lo64);
+      sum_rg_sq = i64x2_add(sum_rg_sq, rg_sq_hi64);
+
+      let u_sq_lo = i32x4_dot_i16x8(u_lo, u_lo);
+      let u_sq_hi = i32x4_dot_i16x8(u_hi, u_hi);
+      let u_sq_i32 = i32x4_add(u_sq_lo, u_sq_hi);
+      let u_sq_lo64 = i64x2_extend_low_i32x4(u_sq_i32);
+      let u_sq_hi64 = i64x2_extend_high_i32x4(u_sq_i32);
+      sum_u_sq = i64x2_add(sum_u_sq, u_sq_lo64);
+      sum_u_sq = i64x2_add(sum_u_sq, u_sq_hi64);
+
+      x += LANES;
+    }
+
+    while x < w {
+      let b = bgr[row_base + x * 3] as i32;
+      let g = bgr[row_base + x * 3 + 1] as i32;
+      let r = bgr[row_base + x * 3 + 2] as i32;
+      let rg = r - g;
+      let u = r + g - 2 * b;
+      tail_sum_rg += rg as i64;
+      tail_sum_u += u as i64;
+      tail_sum_rg_sq += (rg * rg) as u64;
+      tail_sum_u_sq += (u * u) as u64;
+      x += 1;
+    }
+  }
+
+  // Reduce i32×4 / i64×2 accumulators to scalars.
+  let total_sum_rg = i64x2_extract_lane::<0>(sum_rg)
+    .wrapping_add(i64x2_extract_lane::<1>(sum_rg))
+    .wrapping_add(tail_sum_rg);
+  let total_sum_u = i64x2_extract_lane::<0>(sum_u)
+    .wrapping_add(i64x2_extract_lane::<1>(sum_u))
+    .wrapping_add(tail_sum_u);
+  let total_sum_rg_sq = (i64x2_extract_lane::<0>(sum_rg_sq) as u64)
+    .wrapping_add(i64x2_extract_lane::<1>(sum_rg_sq) as u64)
+    .wrapping_add(tail_sum_rg_sq);
+  let total_sum_u_sq = (i64x2_extract_lane::<0>(sum_u_sq) as u64)
+    .wrapping_add(i64x2_extract_lane::<1>(sum_u_sq) as u64)
+    .wrapping_add(tail_sum_u_sq);
+
+  let n_f = n as f64;
+  let mean_rg = (total_sum_rg as f64) / n_f;
+  let mean_u = (total_sum_u as f64) / n_f;
+  let mean_yb = mean_u * 0.5;
+  let var_rg = ((total_sum_rg_sq as f64) / n_f - mean_rg * mean_rg).max(0.0);
+  let var_u = ((total_sum_u_sq as f64) / n_f - mean_u * mean_u).max(0.0);
+  let var_yb = var_u * 0.25;
+
+  let sigma_rgyb = crate::sqrt_64(var_rg + var_yb);
+  let mu_rgyb = crate::sqrt_64(mean_rg * mean_rg + mean_yb * mean_yb);
+  (sigma_rgyb + 0.3 * mu_rgyb) as f32
+}
+
+/// wasm SIMD128 magnitude-weighted gradient-direction
+/// anisotropy.
+///
+/// Builds `hist[k] = Σ mag[p] where dir[p] & 3 == k` over the
+/// interior, treating `mag[p] <= 0` as contributing nothing.
+/// Returns the normalized concentration
+/// `((max(hist)/total) - 0.25).max(0) / 0.75`.
+///
+/// 8-pixel chunks. Per chunk:
+/// - `v128_load64_zero` reads 8 dir bytes into the low half;
+///   `v128_and` masks to the bin index.
+/// - `u16x8_extend_low_u8x16` widens to u16×8, then
+///   `u32x4_extend_low_u16x8` / `u32x4_extend_high_u16x8` split
+///   into two i32×4 of lane indices.
+/// - `v128_load × 2` reads 8 i32 mag values.
+/// - `i32x4_gt(mag, 0)` produces the `mag > 0` mask; AND with
+///   `mag` zeroes non-positive lanes.
+/// - For each bin `b ∈ {0,1,2,3}`, `i32x4_eq(bins, b)` yields a
+///   per-lane bin mask. AND with the gated mag values, widen
+///   `i32×4 → i64×2 × 2` via `i64x2_extend_low_i32x4` /
+///   `i64x2_extend_high_i32x4` and accumulate.
+///
+/// # Safety
+///
+/// Caller must ensure `simd128` target feature is enabled.
+#[target_feature(enable = "simd128")]
+#[allow(unused_unsafe)]
+pub(super) unsafe fn gradient_anisotropy(mag: &[i32], dir: &[u8], w: usize, h: usize) -> f32 {
+  if w < 3 || h < 3 {
+    return 0.0;
+  }
+
+  const LANES: usize = 8;
+  let x_vec_end = if w >= 2 + LANES {
+    1 + ((w - 2) / LANES) * LANES
+  } else {
+    1
+  };
+
+  let mask3_u8 = u8x16_splat(0b11);
+  let zero32 = i32x4_splat(0);
+
+  let mut acc: [v128; 4] = [i64x2_splat(0); 4];
+  let mut tail: [u64; 4] = [0; 4];
+
+  for y in 1..h - 1 {
+    let row_off = y * w;
+
+    let mut x = 1;
+    while x < x_vec_end {
+      let idx = row_off + x;
+
+      let dir_v = unsafe { v128_load64_zero(dir.as_ptr().add(idx) as *const u64) };
+      let bins_u8 = v128_and(dir_v, mask3_u8);
+      let bins_u16 = u16x8_extend_low_u8x16(bins_u8);
+      // u16 → u32; values 0–3, so reinterpret-as-i32 is safe.
+      let bins_lo = u32x4_extend_low_u16x8(bins_u16);
+      let bins_hi = u32x4_extend_high_u16x8(bins_u16);
+
+      let mag_lo = unsafe { v128_load(mag.as_ptr().add(idx) as *const v128) };
+      let mag_hi = unsafe { v128_load(mag.as_ptr().add(idx + 4) as *const v128) };
+
+      let pos_lo = i32x4_gt(mag_lo, zero32);
+      let pos_hi = i32x4_gt(mag_hi, zero32);
+      let pos_mag_lo = v128_and(mag_lo, pos_lo);
+      let pos_mag_hi = v128_and(mag_hi, pos_hi);
+
+      for b in 0..4i32 {
+        let b_v = i32x4_splat(b);
+        let eq_lo = i32x4_eq(bins_lo, b_v);
+        let eq_hi = i32x4_eq(bins_hi, b_v);
+        let masked_lo = v128_and(pos_mag_lo, eq_lo);
+        let masked_hi = v128_and(pos_mag_hi, eq_hi);
+        let bin_idx = b as usize;
+        acc[bin_idx] = i64x2_add(acc[bin_idx], i64x2_extend_low_i32x4(masked_lo));
+        acc[bin_idx] = i64x2_add(acc[bin_idx], i64x2_extend_high_i32x4(masked_lo));
+        acc[bin_idx] = i64x2_add(acc[bin_idx], i64x2_extend_low_i32x4(masked_hi));
+        acc[bin_idx] = i64x2_add(acc[bin_idx], i64x2_extend_high_i32x4(masked_hi));
+      }
+
+      x += LANES;
+    }
+
+    while x < w - 1 {
+      let idx = row_off + x;
+      let m = mag[idx];
+      if m > 0 {
+        let d = dir[idx] as usize & 0b11;
+        tail[d] = tail[d].saturating_add(m as u64);
+      }
+      x += 1;
+    }
+  }
+
+  let mut hist = tail;
+  for bin_idx in 0..4 {
+    let bin_sum = i64x2_extract_lane::<0>(acc[bin_idx]) + i64x2_extract_lane::<1>(acc[bin_idx]);
+    hist[bin_idx] = hist[bin_idx].wrapping_add(bin_sum as u64);
+  }
+
+  let total: u64 = hist.iter().sum();
+  if total == 0 {
+    return 0.0;
+  }
+  let max_bin = *hist.iter().max().expect("4 bins") as f64;
+  let total_f = total as f64;
+  let frac = max_bin / total_f;
+  ((frac - 0.25).max(0.0) / 0.75) as f32
+}
+
 /// wasm single-pass `(mean, variance)` on a u8 plane.
 /// Per iter: u8 horizontal sum via `u16x8_extadd_pairwise_u8x16` ×
 /// several stages into i64 lanes. Squared sum: widen u8×16 → u16×8
