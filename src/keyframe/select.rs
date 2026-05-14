@@ -923,8 +923,11 @@ impl Detector {
   /// (they belonged to an earlier shot that was never finalized, or
   /// were observed before the first shot began).
   ///
-  /// A degenerate or reversed `range` (duration ≤ 0) yields an empty
-  /// result and still drops stale entries.
+  /// A degenerate (instant) `range` (`start == end`, i.e. zero
+  /// duration) yields an empty result and still drops stale
+  /// entries. Reversed ranges are impossible: [`TimeRange::new`]
+  /// panics on `end < start`, and [`TimeRange::try_new`] returns
+  /// `None`.
   ///
   /// Returns an owned `Vec<Timestamp>` rather than a borrowing iterator.
   /// Size is bounded by
@@ -941,11 +944,16 @@ impl Detector {
       }
     }
 
-    // 2. Degenerate range (zero or negative duration) → nothing to emit.
-    let duration = match range.duration() {
-      Some(d) if !d.is_zero() => d,
-      _ => return Vec::new(),
-    };
+    // 2. Degenerate range (zero duration) → nothing to emit.
+    //
+    // mediatime 0.1.5+ enforces `start <= end` at construction, so
+    // `range.duration()` is infallible and cannot be negative; an
+    // instant range (`start == end`) is the only case we must
+    // short-circuit here.
+    let duration = range.duration();
+    if duration.is_zero() {
+      return Vec::new();
+    }
 
     // 3. Compute bucket count and precompute per-bucket effective
     //    [start, end) timestamps (with first-/last-bucket margin shrink).

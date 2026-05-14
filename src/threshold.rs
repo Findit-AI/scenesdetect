@@ -773,7 +773,7 @@ mod tests {
     assert_eq!(range.end_pts(), 400);
     assert_eq!(range.timebase(), tb());
     // Duration = 200 ms.
-    assert_eq!(range.duration(), Some(Duration::from_millis(200)));
+    assert_eq!(range.duration(), Duration::from_millis(200));
     // Interpolate midpoint matches the emitted cut.
     assert_eq!(range.interpolate(0.5).pts(), 300);
   }
