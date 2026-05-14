@@ -737,9 +737,8 @@ pub(super) unsafe fn noise(luma: &[u8], w: usize, h: usize, s: usize) -> f32 {
   let hi = unsafe { vgetq_lane_s64::<1>(acc) };
   let total = lo + hi + tail_acc;
 
-  // σₙ ≈ √(π/2) / 6 · (Σ|lap| / interior).
-  const COEFF: f64 = 0.208_898_754_886_372_3;
-  ((total as f64) * COEFF / (interior as f64)) as f32
+  // σₙ ≈ √(π/2) / 6 · (Σ|lap| / interior). Shared coefficient.
+  ((total as f64) * super::NOISE_COEFF / (interior as f64)) as f32
 }
 
 /// NEON Hasler-Süßstrunk colourfulness on packed 24-bit BGR.

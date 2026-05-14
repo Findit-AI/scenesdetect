@@ -1086,6 +1086,14 @@ pub(crate) fn plane_mean_variance(
   scalar::Scalar::plane_mean_variance(plane, width, height, stride)
 }
 
+/// Immerkaer noise-estimator scaling coefficient: `√(π/2) / 6`. Used
+/// by every `noise` backend (scalar, SSSE3, SSE4.1, AVX2, NEON, wasm)
+/// in the final `(Σ|lap| / interior) × COEFF` formula. Centralised here
+/// so the constant cannot drift between backends — equal coefficients
+/// are load-bearing for the scalar-vs-SIMD parity tests, since the
+/// f64 product is the only post-reduction arithmetic.
+pub(crate) const NOISE_COEFF: f64 = 0.208_898_754_886_372_3;
+
 /// Shared final-reduce for `gradient_anisotropy` histograms. Every
 /// backend builds a `[u64; 4]` direction histogram with per-pixel
 /// `saturating_add`, so each bin is in `[0, u64::MAX]`. The four-bin
@@ -1399,10 +1407,9 @@ mod scalar {
         }
       }
 
-      // σₙ ≈ √(π/2) / 6 · (Σ|lap| / interior)
-      // √(π/2) / 6 ≈ 0.2088987...
-      const COEFF: f64 = 0.208_898_754_886_372_3;
-      ((acc as f64) * COEFF / (interior as f64)) as f32
+      // σₙ ≈ √(π/2) / 6 · (Σ|lap| / interior). The coefficient is
+      // shared with every SIMD backend via `super::NOISE_COEFF`.
+      ((acc as f64) * super::NOISE_COEFF / (interior as f64)) as f32
     }
 
     /// Magnitude-weighted gradient-direction concentration.

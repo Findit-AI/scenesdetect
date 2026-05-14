@@ -13,9 +13,9 @@
 //! - [`Detector::observe_hsv`]: caller already has HSV planes. No
 //!   conversion work.
 //! - [`Detector::observe_rgb`]: convenience that internally runs
-//!   [`crate::frame::convert::bgr_to_hsv_planes`] and then takes the
-//!   S-plane variance. Owns three scratch buffers (H, S, V) that grow
-//!   monotonically.
+//!   [`crate::frame::convert::bgr_to_hsv_planes_with_order`] (honouring
+//!   [`Options::channel_order`]) and then takes the S-plane variance.
+//!   Owns three scratch buffers (H, S, V) that grow monotonically.
 //!
 //! # Example
 //!
@@ -176,7 +176,7 @@ impl Detector {
   }
 
   /// Convenience: internally converts `rgb` to HSV via
-  /// [`bgr_to_hsv_planes`](crate::frame::convert::bgr_to_hsv_planes)
+  /// [`bgr_to_hsv_planes_with_order`](crate::frame::convert::bgr_to_hsv_planes_with_order)
   /// (honouring [`Options::channel_order`]), then returns the
   /// S-plane variance.
   pub fn observe_rgb(&mut self, rgb: RgbFrame<'_>) -> f32 {

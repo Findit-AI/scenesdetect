@@ -383,8 +383,7 @@ pub(super) unsafe fn noise(luma: &[u8], w: usize, h: usize, s: usize) -> f32 {
   unsafe { _mm256_storeu_si256(lanes.as_mut_ptr() as *mut __m256i, acc) };
   let vec_sum: i64 = lanes.iter().sum();
 
-  const COEFF: f64 = 0.208_898_754_886_372_3;
-  (((vec_sum + tail_acc) as f64) * COEFF / (interior as f64)) as f32
+  (((vec_sum + tail_acc) as f64) * super::NOISE_COEFF / (interior as f64)) as f32
 }
 
 /// AVX2 Hasler-Süßstrunk colourfulness on packed 24-bit BGR.

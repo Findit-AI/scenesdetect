@@ -149,8 +149,7 @@ pub(super) unsafe fn noise(luma: &[u8], w: usize, h: usize, s: usize) -> f32 {
     tmp
   };
 
-  const COEFF: f64 = 0.208_898_754_886_372_3;
-  (((vec_sum + tail_acc) as f64) * COEFF / (interior as f64)) as f32
+  (((vec_sum + tail_acc) as f64) * super::NOISE_COEFF / (interior as f64)) as f32
 }
 
 /// SSE4.1 Hasler-Süßstrunk colourfulness on packed 24-bit BGR.

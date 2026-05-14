@@ -994,10 +994,9 @@ pub(super) unsafe fn noise(luma: &[u8], w: usize, h: usize, s: usize) -> f32 {
     tmp
   };
 
-  // σₙ ≈ √(π/2) / 6 · (Σ|lap| / interior). Coefficient matches
-  // the scalar `COEFF` exactly so f32 equality is reachable.
-  const COEFF: f64 = 0.208_898_754_886_372_3;
-  (((vec_sum + tail_acc) as f64) * COEFF / (interior as f64)) as f32
+  // σₙ ≈ √(π/2) / 6 · (Σ|lap| / interior). Shared coefficient so the
+  // f32 product matches the scalar reference exactly.
+  (((vec_sum + tail_acc) as f64) * super::NOISE_COEFF / (interior as f64)) as f32
 }
 
 /// SSSE3 Hasler-Süßstrunk colourfulness on packed 24-bit BGR.

@@ -196,7 +196,8 @@ fn compute_resize_dims(w: u32, h: u32, target: u32) -> (u32, u32) {
 // ---- LumaConverter ----------------------------------------------------------
 
 /// Converts a packed 24-bit BGR / RGB frame to a single-plane 8-bit BT.601 luma
-/// buffer ([`crate::frame::convert::bgr_to_luma`]).
+/// buffer ([`crate::frame::convert::bgr_to_luma_with_order`]), reading channel
+/// positions according to the configured [`ChannelOrder`].
 ///
 /// Owns a single `Vec<u8>` scratch that grows to the largest frame it has
 /// seen. The returned [`LumaFrame`] borrows from this scratch.
@@ -275,7 +276,8 @@ impl LumaConverter {
 // ---- HsvConverter -----------------------------------------------------------
 
 /// Converts a packed 24-bit BGR / RGB frame to three planar 8-bit HSV buffers
-/// ([`crate::frame::convert::bgr_to_hsv_planes`]).
+/// ([`crate::frame::convert::bgr_to_hsv_planes_with_order`]), reading channel
+/// positions according to the configured [`ChannelOrder`].
 ///
 /// Owns three `Vec<u8>` scratches — one per plane — that grow to the
 /// largest frame seen. The returned [`HsvFrame`] borrows from them.

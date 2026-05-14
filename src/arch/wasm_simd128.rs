@@ -863,9 +863,8 @@ pub(super) unsafe fn noise(luma: &[u8], w: usize, h: usize, s: usize) -> f32 {
   }
 
   let vec_sum = i64x2_extract_lane::<0>(acc) + i64x2_extract_lane::<1>(acc);
-  // σₙ ≈ √(π/2) / 6 · (Σ|lap| / interior).
-  const COEFF: f64 = 0.208_898_754_886_372_3;
-  (((vec_sum + tail_acc) as f64) * COEFF / (interior as f64)) as f32
+  // σₙ ≈ √(π/2) / 6 · (Σ|lap| / interior). Shared coefficient.
+  (((vec_sum + tail_acc) as f64) * super::NOISE_COEFF / (interior as f64)) as f32
 }
 
 /// wasm SIMD128 Hasler-Süßstrunk colourfulness on packed BGR.
