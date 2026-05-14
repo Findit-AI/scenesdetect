@@ -29,10 +29,11 @@
 //!
 //! # Byte order
 //!
-//! All functions treat the packed input as **BGR** (`B, G, R` per pixel).
-//! Callers holding RGB buffers must swizzle the red and blue channels
-//! before feeding data in. See [`crate::frame::convert`] for the
-//! underlying conversion kernels.
+//! [`LumaConverter`] and [`HsvConverter`] each carry an explicit
+//! [`ChannelOrder`](crate::frame::ChannelOrder) selecting `BGR` (the
+//! default, matching OpenCV / the `content` detector) or `RGB`.
+//! [`Downscaler`] is byte-order-agnostic — it operates per-channel and
+//! preserves whichever order was passed in.
 
 use core::num::NonZeroU32;
 
@@ -43,7 +44,7 @@ use fast_image_resize::{
 
 use std::vec::Vec;
 
-use crate::frame::{HsvFrame, LumaFrame, RgbFrame};
+use crate::frame::{ChannelOrder, HsvFrame, LumaFrame, RgbFrame};
 
 // ---- Downscaler -------------------------------------------------------------
 
@@ -194,14 +195,16 @@ fn compute_resize_dims(w: u32, h: u32, target: u32) -> (u32, u32) {
 
 // ---- LumaConverter ----------------------------------------------------------
 
-/// Converts a packed 24-bit BGR frame to a single-plane 8-bit BT.601 luma
-/// buffer ([`crate::frame::convert::bgr_to_luma`]).
+/// Converts a packed 24-bit BGR / RGB frame to a single-plane 8-bit BT.601 luma
+/// buffer ([`crate::frame::convert::bgr_to_luma_with_order`]), reading channel
+/// positions according to the configured [`ChannelOrder`].
 ///
 /// Owns a single `Vec<u8>` scratch that grows to the largest frame it has
 /// seen. The returned [`LumaFrame`] borrows from this scratch.
 pub struct LumaConverter {
   scratch: Vec<u8>,
   use_simd: bool,
+  channel_order: ChannelOrder,
 }
 
 impl Default for LumaConverter {
@@ -211,12 +214,12 @@ impl Default for LumaConverter {
 }
 
 impl LumaConverter {
-  /// Creates a new converter with SIMD enabled (reserved for future use —
-  /// the current luma kernel is scalar).
+  /// Creates a new converter with SIMD enabled and BGR byte order.
   pub const fn new() -> Self {
     Self {
       scratch: Vec::new(),
       use_simd: true,
+      channel_order: ChannelOrder::Bgr,
     }
   }
 
@@ -227,11 +230,27 @@ impl LumaConverter {
     self
   }
 
-  /// Converts `bgr` to luma and returns a [`LumaFrame`] borrowing from
-  /// this converter's scratch.
-  pub fn run<'a>(&'a mut self, bgr: RgbFrame<'_>) -> LumaFrame<'a> {
-    let w = bgr.width();
-    let h = bgr.height();
+  /// Sets the byte order of the packed input. Defaults to
+  /// [`ChannelOrder::Bgr`].
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub fn with_channel_order(mut self, order: ChannelOrder) -> Self {
+    self.channel_order = order;
+    self
+  }
+
+  /// Returns the byte order this converter will interpret.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn channel_order(&self) -> ChannelOrder {
+    self.channel_order
+  }
+
+  /// Converts the packed-pixel input to luma and returns a
+  /// [`LumaFrame`] borrowing from this converter's scratch. Reads
+  /// channel positions according to [`Self::channel_order`] — `src`
+  /// may carry either BGR or RGB byte order.
+  pub fn run<'a>(&'a mut self, src: RgbFrame<'_>) -> LumaFrame<'a> {
+    let w = src.width();
+    let h = src.height();
     let size = (w as usize)
       .checked_mul(h as usize)
       .expect("luma plane size fits in usize");
@@ -240,23 +259,25 @@ impl LumaConverter {
       self.scratch.resize(size, 0);
     }
 
-    crate::frame::convert::bgr_to_luma(
+    crate::frame::convert::bgr_to_luma_with_order(
       &mut self.scratch[..size],
-      bgr.data(),
+      src.data(),
       w,
       h,
-      bgr.stride(),
+      src.stride(),
+      self.channel_order,
       self.use_simd,
     );
 
-    LumaFrame::new(&self.scratch[..size], w, h, w, bgr.timestamp())
+    LumaFrame::new(&self.scratch[..size], w, h, w, src.timestamp())
   }
 }
 
 // ---- HsvConverter -----------------------------------------------------------
 
-/// Converts a packed 24-bit BGR frame to three planar 8-bit HSV buffers
-/// ([`crate::frame::convert::bgr_to_hsv_planes`]).
+/// Converts a packed 24-bit BGR / RGB frame to three planar 8-bit HSV buffers
+/// ([`crate::frame::convert::bgr_to_hsv_planes_with_order`]), reading channel
+/// positions according to the configured [`ChannelOrder`].
 ///
 /// Owns three `Vec<u8>` scratches — one per plane — that grow to the
 /// largest frame seen. The returned [`HsvFrame`] borrows from them.
@@ -265,6 +286,7 @@ pub struct HsvConverter {
   s: Vec<u8>,
   v: Vec<u8>,
   use_simd: bool,
+  channel_order: ChannelOrder,
 }
 
 impl Default for HsvConverter {
@@ -274,13 +296,14 @@ impl Default for HsvConverter {
 }
 
 impl HsvConverter {
-  /// Creates a new converter with SIMD enabled.
+  /// Creates a new converter with SIMD enabled and BGR byte order.
   pub const fn new() -> Self {
     Self {
       h: Vec::new(),
       s: Vec::new(),
       v: Vec::new(),
       use_simd: true,
+      channel_order: ChannelOrder::Bgr,
     }
   }
 
@@ -291,11 +314,27 @@ impl HsvConverter {
     self
   }
 
-  /// Converts `bgr` to planar HSV and returns an [`HsvFrame`] borrowing
-  /// from this converter's scratch.
-  pub fn run<'a>(&'a mut self, bgr: RgbFrame<'_>) -> HsvFrame<'a> {
-    let w = bgr.width();
-    let h = bgr.height();
+  /// Sets the byte order of the packed input. Defaults to
+  /// [`ChannelOrder::Bgr`].
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub fn with_channel_order(mut self, order: ChannelOrder) -> Self {
+    self.channel_order = order;
+    self
+  }
+
+  /// Returns the byte order this converter will interpret.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn channel_order(&self) -> ChannelOrder {
+    self.channel_order
+  }
+
+  /// Converts the packed-pixel input to planar HSV and returns an
+  /// [`HsvFrame`] borrowing from this converter's scratch. Reads
+  /// channel positions according to [`Self::channel_order`] — `src`
+  /// may carry either BGR or RGB byte order.
+  pub fn run<'a>(&'a mut self, src: RgbFrame<'_>) -> HsvFrame<'a> {
+    let w = src.width();
+    let h = src.height();
     let size = (w as usize)
       .checked_mul(h as usize)
       .expect("HSV plane size fits in usize");
@@ -310,14 +349,15 @@ impl HsvConverter {
       self.v.resize(size, 0);
     }
 
-    crate::frame::convert::bgr_to_hsv_planes(
+    crate::frame::convert::bgr_to_hsv_planes_with_order(
       &mut self.h[..size],
       &mut self.s[..size],
       &mut self.v[..size],
-      bgr.data(),
+      src.data(),
       w,
       h,
-      bgr.stride(),
+      src.stride(),
+      self.channel_order,
       self.use_simd,
     );
 
@@ -328,14 +368,21 @@ impl HsvConverter {
       w,
       h,
       w,
-      bgr.timestamp(),
+      src.timestamp(),
     )
   }
 }
 
 // -----------------------------------------------------------------------------
 
-#[cfg(all(test, feature = "std"))]
+// Miri can't model the NEON / AVX intrinsics that `fast_image_resize`
+// uses internally on aarch64 / x86_64 hosts (e.g.
+// `llvm.aarch64.neon.st1x4.v4i32.p0` raises "unsupported foreign
+// function"). Every `Downscaler` test routes through that crate, so
+// gate the whole test module out under Miri rather than scattering
+// `cfg_attr(miri, ignore)` over each test. Regular `cargo test` runs
+// the suite as usual.
+#[cfg(all(test, feature = "std", not(miri)))]
 mod tests {
   use super::*;
   use crate::frame::{Timebase, Timestamp};
@@ -502,12 +549,13 @@ mod tests {
     let out = lc.run(frame);
 
     let mut reference = vec![0u8; w * h];
-    crate::frame::convert::bgr_to_luma(
+    crate::frame::convert::bgr_to_luma_with_order(
       &mut reference,
       &src,
       w as u32,
       h as u32,
       (w * 3) as u32,
+      ChannelOrder::Bgr,
       false,
     );
 
@@ -549,7 +597,7 @@ mod tests {
     let mut rh = vec![0u8; w * h];
     let mut rs = vec![0u8; w * h];
     let mut rv = vec![0u8; w * h];
-    crate::frame::convert::bgr_to_hsv_planes(
+    crate::frame::convert::bgr_to_hsv_planes_with_order(
       &mut rh,
       &mut rs,
       &mut rv,
@@ -557,11 +605,73 @@ mod tests {
       w as u32,
       h as u32,
       (w * 3) as u32,
+      ChannelOrder::Bgr,
       false,
     );
 
     assert_eq!(out.hue(), &rh[..]);
     assert_eq!(out.saturation(), &rs[..]);
     assert_eq!(out.value(), &rv[..]);
+  }
+
+  #[test]
+  fn luma_converter_with_rgb_order_matches_swapped_bgr() {
+    let (w, h) = (32usize, 16usize);
+    let bgr = make_bgr(w, h, 0x123_4567);
+    let mut rgb = bgr.clone();
+    for chunk in rgb.chunks_exact_mut(3) {
+      chunk.swap(0, 2);
+    }
+    let bgr_frame = RgbFrame::new(&bgr, w as u32, h as u32, (w * 3) as u32, timestamp());
+    let rgb_frame = RgbFrame::new(&rgb, w as u32, h as u32, (w * 3) as u32, timestamp());
+
+    let mut lc_bgr = LumaConverter::new().with_simd(false);
+    let mut lc_rgb = LumaConverter::new()
+      .with_simd(false)
+      .with_channel_order(ChannelOrder::Rgb);
+    let out_bgr = lc_bgr.run(bgr_frame).data().to_vec();
+    let out_rgb = lc_rgb.run(rgb_frame).data().to_vec();
+    assert_eq!(out_bgr, out_rgb);
+  }
+
+  #[test]
+  fn hsv_converter_with_rgb_order_matches_swapped_bgr() {
+    let (w, h) = (32usize, 16usize);
+    let bgr = make_bgr(w, h, 0xFEED_FACE);
+    let mut rgb = bgr.clone();
+    for chunk in rgb.chunks_exact_mut(3) {
+      chunk.swap(0, 2);
+    }
+    let bgr_frame = RgbFrame::new(&bgr, w as u32, h as u32, (w * 3) as u32, timestamp());
+    let rgb_frame = RgbFrame::new(&rgb, w as u32, h as u32, (w * 3) as u32, timestamp());
+
+    let mut hc_bgr = HsvConverter::new().with_simd(false);
+    let mut hc_rgb = HsvConverter::new()
+      .with_simd(false)
+      .with_channel_order(ChannelOrder::Rgb);
+    let (h_b, s_b, v_b) = {
+      let out_bgr = hc_bgr.run(bgr_frame);
+      (
+        out_bgr.hue().to_vec(),
+        out_bgr.saturation().to_vec(),
+        out_bgr.value().to_vec(),
+      )
+    };
+    let out_rgb = hc_rgb.run(rgb_frame);
+    assert_eq!(out_rgb.hue(), &h_b[..]);
+    assert_eq!(out_rgb.saturation(), &s_b[..]);
+    assert_eq!(out_rgb.value(), &v_b[..]);
+  }
+
+  #[test]
+  fn luma_converter_default_channel_order_is_bgr() {
+    let lc = LumaConverter::new();
+    assert_eq!(lc.channel_order(), ChannelOrder::Bgr);
+  }
+
+  #[test]
+  fn hsv_converter_default_channel_order_is_bgr() {
+    let hc = HsvConverter::new();
+    assert_eq!(hc.channel_order(), ChannelOrder::Bgr);
   }
 }
