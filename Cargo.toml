@@ -71,7 +71,7 @@ libm = { version = "0.2", optional = true, default-features = false }
 fast_image_resize = { version = "6", default-features = false, optional = true }
 
 half = { version = "2", optional = true, default-features = false }
-videoframe = { version = "0.2", optional = true, default-features = false }
+videoframe = { version = "0.3", optional = true, default-features = false }
 
 serde = { version = "1", default-features = false, features = [
   "derive",
