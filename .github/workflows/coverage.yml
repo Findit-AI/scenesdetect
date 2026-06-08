@@ -111,7 +111,7 @@ jobs:
 
       - name: Upload macOS aarch64 report
         if: always()
-        uses: codecov/codecov-action@v6
+        uses: codecov/codecov-action@v7
         with:
           files: reports/coverage-macos-aarch64/cobertura.xml
           flags: macos-aarch64
@@ -121,7 +121,7 @@ jobs:
 
       - name: Upload Linux x86_64 report
         if: always()
-        uses: codecov/codecov-action@v6
+        uses: codecov/codecov-action@v7
         with:
           files: reports/coverage-linux-x86_64/cobertura.xml
           flags: linux-x86_64
@@ -131,7 +131,7 @@ jobs:
 
       - name: Upload Windows x86_64 report
         if: always()
-        uses: codecov/codecov-action@v6
+        uses: codecov/codecov-action@v7
         with:
           files: reports/coverage-windows-x86_64/cobertura.xml
           flags: windows-x86_64
