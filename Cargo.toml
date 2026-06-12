@@ -39,7 +39,7 @@ default = ["std"]
 alloc = ["libm", "dep:fast_image_resize", "fast_image_resize/no_std"]
 std = ["thiserror/default", "dep:fast_image_resize", "fast_image_resize/std"]
 
-serde = ["dep:serde", "dep:humantime-serde"]
+serde = ["dep:serde", "dep:humantime-serde", "bitflags/serde"]
 videoframe = [
   "alloc",
   "dep:half",
@@ -77,6 +77,7 @@ serde = { version = "1", default-features = false, features = [
   "derive",
 ], optional = true }
 humantime-serde = { version = "1", default-features = false, optional = true }
+bitflags = { version = "2", default-features = false }
 
 [dev-dependencies]
 criterion = "0.8"

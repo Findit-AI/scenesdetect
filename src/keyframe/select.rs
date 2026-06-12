@@ -839,6 +839,37 @@ pub enum ObserveError {
   OutOfOrder,
 }
 
+/// One selected keyframe: its timestamp, the metrics that won it, and
+/// whether it passed the strict quality gates (`true`) or is a
+/// fallback pick (`false`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Selected {
+  ts: Timestamp,
+  metrics: FrameMetrics,
+  strict: bool,
+}
+
+impl Selected {
+  /// The selected frame's presentation timestamp.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn timestamp(&self) -> Timestamp {
+    self.ts
+  }
+
+  /// The metrics of the frame that won its bucket.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn metrics(&self) -> FrameMetrics {
+    self.metrics
+  }
+
+  /// `true` when the winner passed every strict quality gate; `false`
+  /// when it is a fallback (least-bad) pick.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn is_strict(&self) -> bool {
+    self.strict
+  }
+}
+
 /// The keyframe selection state machine.
 #[derive(Debug, Clone)]
 pub struct Detector {
@@ -917,7 +948,9 @@ impl Detector {
 
   /// A shot boundary has been confirmed. Drains every buffered entry
   /// whose timestamp lies in `[range.start(), range.end())`, buckets
-  /// them, and returns the winning timestamp per bucket in PTS order.
+  /// them, and returns the winning [`Selected`] per bucket in PTS
+  /// order — each carrying its timestamp, the metrics that won it,
+  /// and whether it passed the strict gates.
   ///
   /// Entries strictly older than `range.start()` are silently discarded
   /// (they belonged to an earlier shot that was never finalized, or
@@ -929,12 +962,12 @@ impl Detector {
   /// panics on `end < start`, and [`TimeRange::try_new`] returns
   /// `None`.
   ///
-  /// Returns an owned `Vec<Timestamp>` rather than a borrowing iterator.
+  /// Returns an owned `Vec<Selected>` rather than a borrowing iterator.
   /// Size is bounded by
   /// [`Options::max_frames_per_shot`](Options::with_max_frames_per_shot) —
   /// typically ≤ 16 entries, so the allocation is small. Caller may hold
   /// the result across subsequent detector calls.
-  pub fn finalize_shot(&mut self, range: TimeRange) -> Vec<Timestamp> {
+  pub fn finalize_shot(&mut self, range: TimeRange) -> Vec<Selected> {
     // 1. Drop stale entries (before the shot starts).
     while let Some((ts, _)) = self.buffer.front() {
       if ts.cmp_semantic(&range.start()) == Ordering::Less {
@@ -952,7 +985,7 @@ impl Detector {
     // short-circuit here.
     let duration = range.duration();
     if duration.is_zero() {
-      return Vec::new();
+      return Vec::<Selected>::new();
     }
 
     // 3. Compute bucket count and precompute per-bucket effective
@@ -978,10 +1011,10 @@ impl Detector {
     // 4. Single linear walk across the in-range entries. Entries inside
     //    the first-bucket's pre-margin or last-bucket's post-margin zones
     //    are skipped. Track strict + fallback running argmaxes per bucket.
-    let mut emits: Vec<Timestamp> = Vec::with_capacity(n);
+    let mut emits: Vec<Selected> = Vec::with_capacity(n);
     let mut bucket_idx = 0usize;
-    let mut best_strict: Option<(Timestamp, f32)> = None;
-    let mut best_any: Option<(Timestamp, f32)> = None;
+    let mut best_strict: Option<(Timestamp, f32, FrameMetrics)> = None;
+    let mut best_any: Option<(Timestamp, f32, FrameMetrics)> = None;
 
     // Snapshot opts locally to avoid borrowing self while draining the
     // buffer.
@@ -996,8 +1029,8 @@ impl Detector {
       // bucket's effective end. Each advance emits the previous
       // bucket's winner.
       while bucket_idx < n && ts.cmp_semantic(&bucket_ranges[bucket_idx].1) != Ordering::Less {
-        if let Some((t, _)) = best_strict.or(best_any) {
-          emits.push(t);
+        if let Some(sel) = flush_bucket(best_strict, best_any) {
+          emits.push(sel);
         }
         best_strict = None;
         best_any = None;
@@ -1034,8 +1067,8 @@ impl Detector {
       // degradation for a fully-corrupt bucket.
       if metrics_in_domain(&metrics) {
         let s_now = metrics.sharpness();
-        if best_any.is_none_or(|(_, s)| sharper(s_now, s)) {
-          best_any = Some((ts, s_now));
+        if best_any.is_none_or(|(_, s, _)| sharper(s_now, s)) {
+          best_any = Some((ts, s_now, metrics));
         }
       }
       // Strict path: composite-quality ranking among gate-passing
@@ -1050,17 +1083,17 @@ impl Detector {
       // needs.
       if !hard_gate(&metrics, &opts) && metrics.sharpness() >= effective_min_sharpness {
         let q = composite_quality(&metrics, opts.composite_weights());
-        if q.is_finite() && best_strict.is_none_or(|(_, s)| sharper(q, s)) {
-          best_strict = Some((ts, q));
+        if q.is_finite() && best_strict.is_none_or(|(_, s, _)| sharper(q, s)) {
+          best_strict = Some((ts, q, metrics));
         }
       }
     }
 
     // Flush the last active bucket.
     if bucket_idx < n
-      && let Some((t, _)) = best_strict.or(best_any)
+      && let Some(sel) = flush_bucket(best_strict, best_any)
     {
-      emits.push(t);
+      emits.push(sel);
     }
 
     emits
@@ -1077,9 +1110,9 @@ impl Detector {
   /// Callers that track the previous-cut timestamp themselves can
   /// equivalently call [`Self::finalize_shot`] directly with a range
   /// they construct.
-  pub fn finalize_remaining(&mut self, eos: Timestamp) -> Vec<Timestamp> {
+  pub fn finalize_remaining(&mut self, eos: Timestamp) -> Vec<Selected> {
     let Some(&(first_ts, _)) = self.buffer.front() else {
-      return Vec::new();
+      return Vec::<Selected>::new();
     };
     // Re-express the start timestamp in eos's timebase so the TimeRange
     // constructor (which takes raw pts + a single timebase) sees a
@@ -1088,7 +1121,7 @@ impl Detector {
     let start_pts = first_ts.rescale_to(tb).pts();
     let end_pts = eos.pts();
     if end_pts <= start_pts {
-      return Vec::new();
+      return Vec::<Selected>::new();
     }
     self.finalize_shot(TimeRange::new(start_pts, end_pts, tb))
   }
@@ -1258,14 +1291,15 @@ fn compute_effective_floor(
 }
 
 /// Weighted composite of [`FrameMetrics`] used as the strict-pass
-/// argmax key inside [`Detector::finalize_shot`].
+/// argmax key inside [`Detector::finalize_shot`] — public so the
+/// fallback path and any external ranking share one formula.
 ///
 /// Higher is better. `sharpness` and `colorfulness` contribute
 /// positively; `noise`, `clipping`, and `motion_blur` contribute
 /// negatively. The fallback path inside `finalize_shot` still ranks
 /// by raw `sharpness` — see the module docs.
 #[cfg_attr(not(tarpaulin), inline(always))]
-fn composite_quality(m: &FrameMetrics, w: &CompositeWeights) -> f32 {
+pub fn composite_quality(m: &FrameMetrics, w: &CompositeWeights) -> f32 {
   let s = w.sharpness() * (m.sharpness() / w.sharpness_norm());
   let n = w.noise() * (m.noise() / w.noise_norm());
   let c = w.colorfulness() * (m.colorfulness() / w.colorfulness_norm());
@@ -1281,6 +1315,30 @@ fn composite_quality(m: &FrameMetrics, w: &CompositeWeights) -> f32 {
 #[cfg_attr(not(tarpaulin), inline(always))]
 fn sharper(a: f32, b: f32) -> bool {
   a.partial_cmp(&b).unwrap_or(Ordering::Equal) == Ordering::Greater
+}
+
+/// Resolves a bucket's two running argmaxes into the emitted
+/// [`Selected`]: the strict winner when present (flagged
+/// [`Selected::is_strict`] `true`), otherwise the fallback winner
+/// (flagged `false`), otherwise `None` for an empty bucket.
+#[inline]
+fn flush_bucket(
+  best_strict: Option<(Timestamp, f32, FrameMetrics)>,
+  best_any: Option<(Timestamp, f32, FrameMetrics)>,
+) -> Option<Selected> {
+  if let Some((ts, _, metrics)) = best_strict {
+    Some(Selected {
+      ts,
+      metrics,
+      strict: true,
+    })
+  } else {
+    best_any.map(|(ts, _, metrics)| Selected {
+      ts,
+      metrics,
+      strict: false,
+    })
+  }
 }
 
 /// Returns `true` when every field of `m` is finite and inside its
@@ -1342,7 +1400,7 @@ fn metrics_in_domain(m: &FrameMetrics) -> bool {
 /// Trips when [`metrics_in_domain`] is `false` (corrupt / non-finite
 /// metric input) OR when any of the configured threshold gates
 /// fires (dark, bright, flat, over-clipped, or motion-blurred).
-fn hard_gate(m: &FrameMetrics, opts: &Options) -> bool {
+pub fn hard_gate(m: &FrameMetrics, opts: &Options) -> bool {
   if !metrics_in_domain(m) {
     return true;
   }
@@ -1396,6 +1454,13 @@ mod tests {
       .with_luma_variance(200.0)
       .with_saturation_variance(100.0)
       .with_clipping(0.0)
+  }
+
+  /// The winning timestamps of a finalize result, in emission order —
+  /// the old `Vec<Timestamp>` shape the bucket-selection assertions
+  /// expect, now projected off the richer [`Selected`] return.
+  fn tss(selected: &[Selected]) -> Vec<Timestamp> {
+    selected.iter().map(|s| s.timestamp()).collect()
   }
 
   // ----- Options -------------------------------------------------------------
@@ -1727,7 +1792,7 @@ mod tests {
     // fallback would accept). But strict still selects the clean
     // frame. We assert the WINNER is the clean frame at
     // ts(1_500_000), not the malformed at ts(500_000).
-    assert_eq!(out, vec![ts(1_500_000)]);
+    assert_eq!(tss(&out), vec![ts(1_500_000)]);
   }
 
   #[test]
@@ -1754,7 +1819,7 @@ mod tests {
     let out = det.finalize_shot(tr(0, 2_000_000));
     // Fallback selects `valid` (sharpness=50, in-domain), not
     // `corrupt` (sharpness=-100, filtered).
-    assert_eq!(out, vec![ts(1_500_000)]);
+    assert_eq!(tss(&out), vec![ts(1_500_000)]);
   }
 
   #[test]
@@ -1819,7 +1884,7 @@ mod tests {
     det.observe(ts(500_000), impossible).unwrap();
     det.observe(ts(1_500_000), valid).unwrap();
     let out = det.finalize_shot(tr(0, 2_000_000));
-    assert_eq!(out, vec![ts(1_500_000)]);
+    assert_eq!(tss(&out), vec![ts(1_500_000)]);
   }
 
   #[test]
@@ -1846,7 +1911,7 @@ mod tests {
     det.observe(ts(500_000), above_phys).unwrap();
     det.observe(ts(1_500_000), valid).unwrap();
     let out = det.finalize_shot(tr(0, 2_000_000));
-    assert_eq!(out, vec![ts(1_500_000)]);
+    assert_eq!(tss(&out), vec![ts(1_500_000)]);
   }
 
   #[test]
@@ -1872,7 +1937,7 @@ mod tests {
     det.observe(ts(500_000), above_phys).unwrap();
     det.observe(ts(1_500_000), valid).unwrap();
     let out = det.finalize_shot(tr(0, 2_000_000));
-    assert_eq!(out, vec![ts(1_500_000)]);
+    assert_eq!(tss(&out), vec![ts(1_500_000)]);
   }
 
   #[test]
@@ -1908,7 +1973,7 @@ mod tests {
     let out = det.finalize_shot(tr(0, 2_000_000));
     // Post-fix: `corrupt` is filtered from fallback (out-of-domain
     // noise), so `valid` wins despite lower sharpness.
-    assert_eq!(out, vec![ts(1_500_000)]);
+    assert_eq!(tss(&out), vec![ts(1_500_000)]);
   }
 
   #[test]
@@ -1990,7 +2055,7 @@ mod tests {
     // Low frame fails the strict floor (now 100.0) → fallback emits
     // the single candidate. The important property is that the
     // builder didn't silently lower the floor to -Inf.
-    assert_eq!(out, vec![ts(500_000)]);
+    assert_eq!(tss(&out), vec![ts(500_000)]);
     // Sanity-check the clamp itself: the floor is the default value.
     assert_eq!(det.options().min_sharpness(), 100.0);
   }
@@ -2038,7 +2103,7 @@ mod tests {
     assert_eq!(out.len(), 1, "expected one strict winner");
     // The strict winner must be a finite-sharpness frame, NOT one
     // of the corrupt -Inf frames at ts >= 2_100_000.
-    let winner_ts = out[0].pts();
+    let winner_ts = out[0].timestamp().pts();
     assert!(
       winner_ts < 2_100_000,
       "strict winner pts {winner_ts} should be in the finite-sample range (<2_100_000)"
@@ -2084,7 +2149,7 @@ mod tests {
     // clears the floor; the strict path emits one. None of the
     // corrupt frames can win (both ranking paths reject them).
     assert_eq!(out.len(), 1, "expected exactly one winner");
-    let winner_ts = out[0].pts();
+    let winner_ts = out[0].timestamp().pts();
     assert!(
       winner_ts >= 2_100_000,
       "winner pts {winner_ts} should be one of the valid frames (>= 2_100_000)"
@@ -2125,7 +2190,7 @@ mod tests {
     // Post-fix: pre-margin frame excluded from the floor pool,
     // adaptive floor recovers a strict winner among the interior
     // frames. The sharpest (sharpness=60, ts=5s) wins.
-    assert_eq!(out, vec![ts(5_000_000)]);
+    assert_eq!(tss(&out), vec![ts(5_000_000)]);
   }
 
   #[test]
@@ -2200,7 +2265,7 @@ mod tests {
     // Winner is in the dim half — its sharpness is 50 (well above
     // the lowered floor) and the sharp half also passes the floor.
     // The sharp half wins because composite ranks them higher.
-    let winner_pts = out[0].pts();
+    let winner_pts = out[0].timestamp().pts();
     assert!(
       (0..4_000_000).contains(&winner_pts),
       "winner pts {winner_pts} should be a sharp frame from the first half (0..4_000_000)"
@@ -2259,7 +2324,7 @@ mod tests {
     }
     let out = det.finalize_shot(tr(0, 5_000_000));
     assert_eq!(out.len(), 1);
-    let winner_pts = out[0].pts();
+    let winner_pts = out[0].timestamp().pts();
     assert_eq!(
       winner_pts % 2000,
       1000,
@@ -2329,7 +2394,7 @@ mod tests {
     }
     let out = det.finalize_shot(tr(0, 200_000));
     assert_eq!(out.len(), 1);
-    let winner_pts = out[0].pts();
+    let winner_pts = out[0].timestamp().pts();
     assert!(
       (101_000..=109_000).contains(&winner_pts),
       "winner pts {winner_pts} must be one of the high-sharp \
@@ -2476,7 +2541,7 @@ mod tests {
     let out = probe.finalize_shot(tr(0, total + 1));
     assert_eq!(out.len(), 1);
     assert_eq!(
-      out[0].pts(),
+      out[0].timestamp().pts(),
       0,
       "ts=0 (first observation) must still be in the buffer; \
        a drop-old eviction policy would have removed it"
@@ -2538,7 +2603,7 @@ mod tests {
     det.observe(ts(1_500_000), good_metrics(200.0)).unwrap();
 
     let out = det.finalize_shot(tr(0, 2_000_000));
-    assert_eq!(out, vec![ts(500_000)]);
+    assert_eq!(tss(&out), vec![ts(500_000)]);
     assert_eq!(det.buffered(), 0, "in-range entries should be drained");
   }
 
@@ -2562,7 +2627,10 @@ mod tests {
     det.observe(ts(11_500_000), good_metrics(200.0)).unwrap();
 
     let out = det.finalize_shot(tr(0, 12_000_000));
-    assert_eq!(out, vec![ts(1_000_000), ts(5_000_000), ts(10_000_000)]);
+    assert_eq!(
+      tss(&out),
+      vec![ts(1_000_000), ts(5_000_000), ts(10_000_000)]
+    );
   }
 
   #[test]
@@ -2584,7 +2652,7 @@ mod tests {
     det.observe(ts(3_000_000), bad(200.0)).unwrap();
 
     let out = det.finalize_shot(tr(0, 4_000_000));
-    assert_eq!(out, vec![ts(1_000_000)]);
+    assert_eq!(tss(&out), vec![ts(1_000_000)]);
   }
 
   #[test]
@@ -2597,7 +2665,7 @@ mod tests {
     det.observe(ts(9_000_000), good_metrics(400.0)).unwrap();
 
     let out = det.finalize_shot(tr(0, 12_000_000));
-    assert_eq!(out, vec![ts(1_000_000), ts(9_000_000)]);
+    assert_eq!(tss(&out), vec![ts(1_000_000), ts(9_000_000)]);
   }
 
   #[test]
@@ -2608,7 +2676,7 @@ mod tests {
     det.observe(ts(500_000), good_metrics(200.0)).unwrap();
 
     let out = det.finalize_shot(tr(200_000, 2_000_000));
-    assert_eq!(out, vec![ts(500_000)]);
+    assert_eq!(tss(&out), vec![ts(500_000)]);
     assert_eq!(det.buffered(), 0);
   }
 
@@ -2620,10 +2688,10 @@ mod tests {
     det.observe(ts(5_000_000), good_metrics(900.0)).unwrap(); // belongs to next shot
 
     let out = det.finalize_shot(tr(0, 2_000_000));
-    assert_eq!(out, vec![ts(500_000)]);
+    assert_eq!(tss(&out), vec![ts(500_000)]);
     assert_eq!(det.buffered(), 1, "future entries preserved");
     let out2 = det.finalize_shot(tr(2_000_000, 6_000_000));
-    assert_eq!(out2, vec![ts(5_000_000)]);
+    assert_eq!(tss(&out2), vec![ts(5_000_000)]);
   }
 
   #[test]
@@ -2653,7 +2721,7 @@ mod tests {
     det.observe(ts(9_500_000), good_metrics(800.0)).unwrap(); // post-margin
 
     let out = det.finalize_shot(tr(0, 10_000_000));
-    assert_eq!(out, vec![ts(5_000_000)]);
+    assert_eq!(tss(&out), vec![ts(5_000_000)]);
   }
 
   #[test]
@@ -2670,7 +2738,7 @@ mod tests {
     let mut det = Detector::new(opts);
     det.observe(ts(0), good_metrics(500.0)).unwrap();
     let out = det.finalize_shot(tr(0, 1));
-    assert_eq!(out, vec![ts(0)]);
+    assert_eq!(tss(&out), vec![ts(0)]);
   }
 
   #[test]
@@ -2686,7 +2754,7 @@ mod tests {
     let out = det.finalize_shot(tr(0, 2));
     // The shrunk bucket [0, 1) catches `ts(0)`; `ts(1)` is in the
     // post-margin zone and is dropped.
-    assert_eq!(out, vec![ts(0)]);
+    assert_eq!(tss(&out), vec![ts(0)]);
   }
 
   #[test]
@@ -2697,7 +2765,11 @@ mod tests {
     det.observe(ts(5_000_000), good_metrics(100.0)).unwrap();
     det.observe(ts(9_000_000), good_metrics(100.0)).unwrap();
     let out = det.finalize_shot(tr(0, 12_000_000));
-    assert!(out.windows(2).all(|w| w[0].pts() < w[1].pts()));
+    assert!(
+      out
+        .windows(2)
+        .all(|w| w[0].timestamp().pts() < w[1].timestamp().pts())
+    );
   }
 
   #[test]
@@ -2724,7 +2796,7 @@ mod tests {
     det.observe(ts(4_500_000), good_metrics(400.0)).unwrap();
 
     let out = det.finalize_remaining(ts(6_000_000));
-    assert_eq!(out, vec![ts(4_500_000)]);
+    assert_eq!(tss(&out), vec![ts(4_500_000)]);
     assert_eq!(det.buffered(), 0);
   }
 
@@ -3043,7 +3115,7 @@ mod tests {
     det.observe(ts(2_000_000), b).unwrap();
 
     let out = det.finalize_shot(tr(0, 4_000_000));
-    assert_eq!(out, vec![ts(2_000_000)]);
+    assert_eq!(tss(&out), vec![ts(2_000_000)]);
   }
 
   #[test]
@@ -3066,7 +3138,7 @@ mod tests {
     det.observe(ts(1_500_000), good_metrics(200.0)).unwrap();
 
     let out = det.finalize_shot(tr(0, 2_000_000));
-    assert_eq!(out, vec![ts(500_000)]);
+    assert_eq!(tss(&out), vec![ts(500_000)]);
   }
 
   #[test]
@@ -3090,7 +3162,7 @@ mod tests {
     // composite wins. Since brightness/clipping/noise/etc are
     // identical, the highest-sharpness frame wins.
     let out = det.finalize_shot(tr(0, 30_000_000));
-    assert_eq!(out, vec![ts(24_000_000)]); // last frame, sharpness 80
+    assert_eq!(tss(&out), vec![ts(24_000_000)]); // last frame, sharpness 80
   }
 
   #[test]
@@ -3121,7 +3193,7 @@ mod tests {
     }
     det.observe(ts(24_000_000), sharpest_with_noise).unwrap();
     let out = det.finalize_shot(tr(0, 30_000_000));
-    assert_eq!(out, vec![ts(24_000_000)]);
+    assert_eq!(tss(&out), vec![ts(24_000_000)]);
   }
 
   #[test]
@@ -3177,7 +3249,7 @@ mod tests {
       .with_motion_blur(0.9);
     det.observe(ts(500_000), m).unwrap();
     let out = det.finalize_shot(tr(0, 2_000_000));
-    assert_eq!(out, vec![ts(500_000)]);
+    assert_eq!(tss(&out), vec![ts(500_000)]);
   }
 
   #[test]
@@ -3208,7 +3280,7 @@ mod tests {
     det.observe(ts(1_500_000), good).unwrap();
     let out = det.finalize_shot(tr(0, 2_000_000));
     // Strict path: `good` wins (bad rejected by motion-blur gate).
-    assert_eq!(out, vec![ts(1_500_000)]);
+    assert_eq!(tss(&out), vec![ts(1_500_000)]);
   }
 
   // ---- Normalisation / range guard regressions -----------------------------
@@ -3375,7 +3447,7 @@ mod tests {
     let out = det.finalize_shot(tr(0, 2_000_000));
     // The non-finite-composite frame is skipped from strict; the
     // normal frame wins.
-    assert_eq!(out, vec![ts(1_500_000)]);
+    assert_eq!(tss(&out), vec![ts(1_500_000)]);
   }
 
   #[test]
@@ -3423,7 +3495,7 @@ mod tests {
     det.observe(ts(500_000), poisoned).unwrap();
     det.observe(ts(1_500_000), fallback_only).unwrap();
     let out = det.finalize_shot(tr(0, 2_000_000));
-    assert_eq!(out, vec![ts(1_500_000)]);
+    assert_eq!(tss(&out), vec![ts(1_500_000)]);
   }
 
   #[test]

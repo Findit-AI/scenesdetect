@@ -89,7 +89,7 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cross-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-cross-${{ hashFiles('**/Cargo.toml') }}
           restore-keys: |
             ${{ runner.os }}-cross-
       - name: Install Rust
@@ -117,7 +117,7 @@ jobs:
           ~/.cargo/registry
           ~/.cargo/git
           target
-        key: ${{ runner.os }}-build-${{ hashFiles('**/Cargo.lock') }}
+        key: ${{ runner.os }}-build-${{ hashFiles('**/Cargo.toml') }}
         restore-keys: |
           ${{ runner.os }}-build-
     - name: Install Rust
@@ -146,7 +146,7 @@ jobs:
           ~/.cargo/registry
           ~/.cargo/git
           target
-        key: ${{ runner.os }}-test-${{ hashFiles('**/Cargo.lock') }}
+        key: ${{ runner.os }}-test-${{ hashFiles('**/Cargo.toml') }}
         restore-keys: |
           ${{ runner.os }}-test-
     - name: Install Rust
@@ -169,7 +169,7 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-sanitizer-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-sanitizer-${{ hashFiles('**/Cargo.toml') }}
           restore-keys: |
             ${{ runner.os }}-sanitizer-
       - name: Install Rust
@@ -208,7 +208,7 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-miri-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-miri-${{ hashFiles('**/Cargo.toml') }}
           restore-keys: |
             ${{ runner.os }}-miri-
       - name: Miri
@@ -244,7 +244,7 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-miri-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-miri-${{ hashFiles('**/Cargo.toml') }}
           restore-keys: |
             ${{ runner.os }}-miri-
       - name: Miri
