@@ -1492,7 +1492,7 @@ fn sparse_one_frame_windows_still_emit() {
   // One frame per window: with the selector's first/last-bucket
   // margins disabled for cascade windows, the lone frame in each
   // window is scored and emitted — a non-empty window never silently
-  // drops its only frame (the R36 sparse-window fix).
+  // drops its only frame.
   let options = Options::new()
     .with_detectors(Detectors::CONTENT)
     .with_select(select::Options::new().with_target_interval(Duration::from_secs(1)));
@@ -1521,8 +1521,8 @@ fn lag_holdback_keeps_post_cut_frames_for_the_new_scene() {
   // straddling the not-yet-confirmed cut, losing them — the new
   // scene's first keyframe then slips a full window past the cut. The
   // hold-back retains those frames until the cut confirms, so the new
-  // scene is sampled from its own first frame (the R36 lagged-drain
-  // fix; without it `first_new` is one window later).
+  // scene is sampled from its own first frame; without the hold-back
+  // `first_new` would be one window later.
   let options = Options::new()
     .with_detectors(Detectors::ADAPTIVE)
     .with_adaptive(adaptive::Options::new().with_window_width(8))
