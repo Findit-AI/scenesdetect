@@ -19,7 +19,7 @@ A Rust port of [PySceneDetect](https://github.com/Breakthrough/PySceneDetect) �
 
 ## Overview
 
-`scenesdetect` is a from-scratch Rust port of [PySceneDetect](https://github.com/Breakthrough/PySceneDetect). It is deliberately **Sans-I/O**: the crate never opens a file, decodes a packet, or spawns a thread. Callers hand frames in one by one, and each detector returns an `Option<Timestamp>` identifying the cut point — or nothing. Composing those point cuts into scene ranges is the caller's responsibility, which keeps this crate independent of any particular decoding pipeline.
+`scenesdetect` is a from-scratch Rust port of [PySceneDetect](https://github.com/Breakthrough/PySceneDetect). It is deliberately **Sans-I/O**: the crate never opens a file, decodes a packet, or spawns a thread. Callers hand frames in one by one. Each standalone detector returns an `Option<Timestamp>` identifying the cut point — or nothing — and composing those point cuts into scene ranges is the caller's responsibility, which keeps this crate independent of any particular decoding pipeline. The [`cascade`] module is the integrated exception: it runs every enabled detector warm per frame and itself composes the results into a stream of scene ranges and per-shot keyframes.
 
 Timestamps are represented as raw integer `pts + Timebase` (matching FFmpeg's `AVRational`) rather than floating-point seconds, so all arithmetic is exact and cross-stream comparisons are unambiguous.
 
@@ -32,12 +32,14 @@ Timestamps are represented as raw integer `pts + Timebase` (matching FFmpeg's `A
 | [`threshold`] | Mean-brightness state machine | Fade-to-black / fade-in transitions |
 | [`content`] | HSV-space delta + optional Canny edge delta | Motion/composition changes — the default PySceneDetect algorithm |
 | [`adaptive`] | Rolling-average wrapper over `content` | Suppresses false positives on sustained fast motion |
+| [`cascade`] | All enabled detectors running warm per frame (earliest admissible cut wins), plus per-shot keyframe selection | Scenes *and* keyframes from one sans-I/O `push` loop (requires `alloc`) |
 
 [`histogram`]: https://docs.rs/scenesdetect/latest/scenesdetect/histogram/
 [`phash`]: https://docs.rs/scenesdetect/latest/scenesdetect/phash/
 [`threshold`]: https://docs.rs/scenesdetect/latest/scenesdetect/threshold/
 [`content`]: https://docs.rs/scenesdetect/latest/scenesdetect/content/
 [`adaptive`]: https://docs.rs/scenesdetect/latest/scenesdetect/adaptive/
+[`cascade`]: https://docs.rs/scenesdetect/latest/scenesdetect/cascade/
 
 ## Keyframe selection
 

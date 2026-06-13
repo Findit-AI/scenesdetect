@@ -53,6 +53,13 @@ pub mod adaptive;
 #[cfg_attr(docsrs, doc(cfg(any(feature = "std", feature = "alloc"))))]
 pub mod keyframe;
 
+/// Integrated cascade detector: every enabled cut lane running warm on
+/// each frame (earliest admissible report wins), with online interval
+/// keyframe selection behind one sans-I/O state machine.
+#[cfg(any(feature = "std", feature = "alloc"))]
+#[cfg_attr(docsrs, doc(cfg(any(feature = "std", feature = "alloc"))))]
+pub mod cascade;
+
 /// Frame types for scene detection.
 pub mod frame;
 

@@ -320,6 +320,7 @@ pub struct Detector {
   buffer_sum: f64,
   last_cut_ts: Option<Timestamp>,
   last_adaptive_ratio: Option<f64>,
+  last_target_score: Option<f64>,
 }
 
 impl Detector {
@@ -359,6 +360,7 @@ impl Detector {
       buffer_sum: 0.0,
       last_cut_ts: None,
       last_adaptive_ratio: None,
+      last_target_score: None,
     })
   }
 
@@ -399,6 +401,18 @@ impl Detector {
     self.inner.last_score()
   }
 
+  /// Returns the TARGET frame's content score from the most recent
+  /// emission attempt — the score belonging to the timestamp a cut
+  /// would name — or `None` if fewer than `1 + 2 * window_width`
+  /// frames have been processed. Unlike [`Self::last_score`] (the
+  /// trailing frame), this is the value the adaptive test actually
+  /// judged: emissions lag by `window_width`, so at the moment a cut
+  /// is reported the trailing frame's score may be quiet.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn last_target_score(&self) -> Option<f64> {
+    self.last_target_score
+  }
+
   /// Resets streaming state.
   pub fn clear(&mut self) {
     self.inner.clear();
@@ -406,6 +420,7 @@ impl Detector {
     self.buffer_sum = 0.0;
     self.last_cut_ts = None;
     self.last_adaptive_ratio = None;
+    self.last_target_score = None;
   }
 
   /// Processes a luma-only frame.
@@ -469,6 +484,7 @@ impl Detector {
       (target_score / avg).min(255.0)
     };
     self.last_adaptive_ratio = Some(adaptive_ratio);
+    self.last_target_score = Some(target_score);
 
     // Seed cut-gating reference on first eligible target.
     if self.last_cut_ts.is_none() {
