@@ -57,6 +57,8 @@ use derive_more::{Display, IsVariant};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use mediatime::Rate;
+
 use crate::frame::{HsvFrame, LumaFrame, RgbFrame, Timebase, Timestamp};
 
 use std::vec::Vec;
@@ -325,14 +327,16 @@ impl Options {
   /// Set minimum scene length as a number of frames at a given frame rate.
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn with_min_frames(mut self, frames: u32, fps: Timebase) -> Self {
-    self.min_duration = fps.frames_to_duration(frames);
+    self.min_duration =
+      Rate::fps(fps.num(), fps.den()).saturating_frames_to_duration(frames as i64);
     self
   }
 
   /// In-place form of [`Self::with_min_frames`].
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn set_min_frames(&mut self, frames: u32, fps: Timebase) -> &mut Self {
-    self.min_duration = fps.frames_to_duration(frames);
+    self.min_duration =
+      Rate::fps(fps.num(), fps.den()).saturating_frames_to_duration(frames as i64);
     self
   }
 
@@ -1245,11 +1249,11 @@ fn window_max_column(src: &[u8], lo: usize, hi: usize, x: usize, w: usize) -> u8
 mod tests {
   use super::*;
   use crate::arch::bgr_to_hsv_pixel;
-  use core::num::NonZeroU32;
+  use core::num::NonZeroI32;
   use std::vec;
 
-  const fn nz32(n: u32) -> NonZeroU32 {
-    match NonZeroU32::new(n) {
+  const fn nz32(n: i32) -> NonZeroI32 {
+    match NonZeroI32::new(n) {
       Some(v) => v,
       None => panic!("zero"),
     }
@@ -1987,7 +1991,7 @@ mod tests {
     let mut det = Detector::new(opts);
     let a = vec![64u8; 32 * 32 * 3];
     let b = vec![200u8; 32 * 32 * 3];
-    let tb = Timebase::new(1, core::num::NonZeroU32::new(1000).unwrap());
+    let tb = Timebase::new(1, core::num::NonZeroI32::new(1000).unwrap());
     det.process_bgr(RgbFrame::new(&a, 32, 32, 96, Timestamp::new(0, tb)));
     det.process_bgr(RgbFrame::new(&b, 32, 32, 96, Timestamp::new(33, tb)));
     assert!(det.last_score().is_some());
@@ -2009,7 +2013,7 @@ mod tests {
     for (i, v) in b.iter_mut().enumerate() {
       *v = ((i * 13 + 100) % 256) as u8;
     }
-    let tb = Timebase::new(1, core::num::NonZeroU32::new(1000).unwrap());
+    let tb = Timebase::new(1, core::num::NonZeroI32::new(1000).unwrap());
     det.process_bgr(RgbFrame::new(&a, 16, 16, 48, Timestamp::new(0, tb)));
     det.process_bgr(RgbFrame::new(&b, 16, 16, 48, Timestamp::new(33, tb)));
     assert!(det.last_score().is_some());

@@ -552,10 +552,10 @@ pub enum LumaFrameError {
 #[cfg(all(test, feature = "std"))]
 mod tests {
   use super::*;
-  use core::num::NonZeroU32;
+  use core::num::NonZeroI32;
 
-  const fn nz(n: u32) -> NonZeroU32 {
-    match NonZeroU32::new(n) {
+  const fn nz(n: i32) -> NonZeroI32 {
+    match NonZeroI32::new(n) {
       Some(v) => v,
       None => panic!("zero"),
     }

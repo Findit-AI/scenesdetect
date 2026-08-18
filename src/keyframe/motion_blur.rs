@@ -175,11 +175,11 @@ impl Detector {
 mod tests {
   use super::*;
   use crate::frame::{LumaFrame, Timebase, Timestamp};
-  use core::num::NonZeroU32;
+  use core::num::NonZeroI32;
   use std::vec;
 
-  fn nz(n: u32) -> NonZeroU32 {
-    NonZeroU32::new(n).expect("non-zero")
+  fn nz(n: i32) -> NonZeroI32 {
+    NonZeroI32::new(n).expect("non-zero")
   }
 
   fn timestamp() -> Timestamp {

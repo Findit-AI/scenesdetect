@@ -7,7 +7,7 @@
 //! # Typical use
 //!
 //! ```no_run
-//! use core::num::NonZeroU32;
+//! use core::num::{NonZeroI32, NonZeroU32};
 //! use scenesdetect::frame::{RgbFrame, Timebase, Timestamp};
 //! use scenesdetect::keyframe::preprocess::{Downscaler, LumaConverter, HsvConverter};
 //!
@@ -16,7 +16,7 @@
 //! let mut hc = HsvConverter::new();
 //!
 //! # let bytes: Vec<u8> = vec![0; 1920 * 1080 * 3];
-//! # let tb = Timebase::new(1, NonZeroU32::new(1_000_000).unwrap());
+//! # let tb = Timebase::new(1, NonZeroI32::new(1_000_000).unwrap());
 //! # let frame = RgbFrame::new(&bytes, 1920, 1080, 1920 * 3, Timestamp::new(0, tb));
 //! let small_bgr = dn.run(frame);        // 256-px longest side
 //! let luma      = lc.run(small_bgr);    // BT.601 weighted sum
@@ -386,14 +386,21 @@ impl HsvConverter {
 mod tests {
   use super::*;
   use crate::frame::{Timebase, Timestamp};
+  use core::num::NonZeroI32;
   use std::vec;
 
   fn nz(n: u32) -> NonZeroU32 {
     NonZeroU32::new(n).expect("non-zero")
   }
 
+  // `Downscaler` counts pixels (`NonZeroU32`); a `Timebase` denominator is
+  // signed (`NonZeroI32`) — two different non-zero types, one per axis.
+  fn nzi(n: i32) -> NonZeroI32 {
+    NonZeroI32::new(n).expect("non-zero")
+  }
+
   fn timestamp() -> Timestamp {
-    Timestamp::new(42, Timebase::new(1, nz(1000)))
+    Timestamp::new(42, Timebase::new(1, nzi(1000)))
   }
 
   fn make_bgr(w: usize, h: usize, seed: u32) -> std::vec::Vec<u8> {

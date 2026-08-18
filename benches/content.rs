@@ -13,7 +13,7 @@
 //!
 //! Run with `cargo bench --bench content`.
 
-use core::num::NonZeroU32;
+use core::num::NonZeroI32;
 use std::hint::black_box;
 
 use criterion::{Criterion, criterion_group, criterion_main};
@@ -34,7 +34,7 @@ fn make_buf(n: usize) -> Vec<u8> {
 }
 
 fn bench_luma_only(c: &mut Criterion) {
-  let tb = Timebase::new(1, NonZeroU32::new(1000).unwrap());
+  let tb = Timebase::new(1, NonZeroI32::new(1000).unwrap());
   let mut group = c.benchmark_group("content::Detector::process_luma (luma-only weights)");
   for &(label, w, h) in &[
     ("720p", 1280u32, 720u32),
@@ -58,7 +58,7 @@ fn bench_luma_only(c: &mut Criterion) {
 }
 
 fn bench_bgr_no_edges(c: &mut Criterion) {
-  let tb = Timebase::new(1, NonZeroU32::new(1000).unwrap());
+  let tb = Timebase::new(1, NonZeroI32::new(1000).unwrap());
   let mut group = c.benchmark_group("content::Detector::process_bgr (default weights, no edges)");
   for &(label, w, h) in &[
     ("720p", 1280u32, 720u32),
@@ -82,7 +82,7 @@ fn bench_bgr_no_edges(c: &mut Criterion) {
 }
 
 fn bench_bgr_with_edges(c: &mut Criterion) {
-  let tb = Timebase::new(1, NonZeroU32::new(1000).unwrap());
+  let tb = Timebase::new(1, NonZeroI32::new(1000).unwrap());
   let mut group = c.benchmark_group("content::Detector::process_bgr (with edges)");
   for &(label, w, h) in &[
     ("720p", 1280u32, 720u32),
@@ -108,7 +108,7 @@ fn bench_bgr_with_edges(c: &mut Criterion) {
 }
 
 fn bench_luma_only_scalar(c: &mut Criterion) {
-  let tb = Timebase::new(1, NonZeroU32::new(1000).unwrap());
+  let tb = Timebase::new(1, NonZeroI32::new(1000).unwrap());
   let mut group = c.benchmark_group("content::Detector::process_luma (luma-only weights, scalar)");
   for &(label, w, h) in &[
     ("720p", 1280u32, 720u32),
@@ -134,7 +134,7 @@ fn bench_luma_only_scalar(c: &mut Criterion) {
 }
 
 fn bench_bgr_no_edges_scalar(c: &mut Criterion) {
-  let tb = Timebase::new(1, NonZeroU32::new(1000).unwrap());
+  let tb = Timebase::new(1, NonZeroI32::new(1000).unwrap());
   let mut group =
     c.benchmark_group("content::Detector::process_bgr (default weights, no edges, scalar)");
   for &(label, w, h) in &[
@@ -161,7 +161,7 @@ fn bench_bgr_no_edges_scalar(c: &mut Criterion) {
 }
 
 fn bench_bgr_with_edges_scalar(c: &mut Criterion) {
-  let tb = Timebase::new(1, NonZeroU32::new(1000).unwrap());
+  let tb = Timebase::new(1, NonZeroI32::new(1000).unwrap());
   let mut group = c.benchmark_group("content::Detector::process_bgr (with edges, scalar)");
   for &(label, w, h) in &[
     ("720p", 1280u32, 720u32),

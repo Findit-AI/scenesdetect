@@ -88,7 +88,7 @@ typical streaming case.
 
 ```toml
 [dependencies]
-scenesdetect = "0.2"
+scenesdetect = "0.3"
 ```
 
 ## Crate features

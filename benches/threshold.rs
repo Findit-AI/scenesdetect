@@ -6,7 +6,7 @@
 //!
 //! Run with `cargo bench --bench threshold`.
 
-use core::num::NonZeroU32;
+use core::num::NonZeroI32;
 use std::hint::black_box;
 
 use criterion::{Criterion, criterion_group, criterion_main};
@@ -27,7 +27,7 @@ fn make_buf(n: usize) -> Vec<u8> {
 }
 
 fn bench_process_luma(c: &mut Criterion) {
-  let tb = Timebase::new(1, NonZeroU32::new(1000).unwrap());
+  let tb = Timebase::new(1, NonZeroI32::new(1000).unwrap());
   let mut group = c.benchmark_group("threshold::Detector::process_luma");
   for &(label, w, h) in &[
     ("720p", 1280u32, 720u32),
@@ -50,7 +50,7 @@ fn bench_process_luma(c: &mut Criterion) {
 }
 
 fn bench_process_rgb(c: &mut Criterion) {
-  let tb = Timebase::new(1, NonZeroU32::new(1000).unwrap());
+  let tb = Timebase::new(1, NonZeroI32::new(1000).unwrap());
   let mut group = c.benchmark_group("threshold::Detector::process_rgb");
   for &(label, w, h) in &[
     ("720p", 1280u32, 720u32),

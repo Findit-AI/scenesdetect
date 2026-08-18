@@ -1376,7 +1376,11 @@ impl Detector {
           && let Some(lf) = self.last_finalize
         {
           // safe and lf share the canonical timebase post-normalization.
-          let window_pts = lf.timebase().duration_to_pts(window).max(1);
+          // The saturating rung clamps an absurd window at `i64::MAX` as
+          // the old bare `duration_to_pts` did, and panics only on a
+          // zero-numerator timebase — which `Frames::try_new` rejects at
+          // admission, so `lf` never carries one.
+          let window_pts = lf.timebase().saturating_duration_to_pts(window).max(1);
           let elapsed_pts = safe.pts().saturating_sub(lf.pts());
           if elapsed_pts >= window_pts {
             // The last whole-window boundary at or before `safe`: keeps

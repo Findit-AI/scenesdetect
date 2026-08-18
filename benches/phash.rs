@@ -9,7 +9,7 @@
 //!
 //! Run with `cargo bench --bench phash`.
 
-use core::num::NonZeroU32;
+use core::num::NonZeroI32;
 use std::hint::black_box;
 
 use criterion::{Criterion, criterion_group, criterion_main};
@@ -33,7 +33,7 @@ fn make_luma(width: u32, height: u32) -> Vec<u8> {
 }
 
 fn bench_process(c: &mut Criterion) {
-  let tb = Timebase::new(1, NonZeroU32::new(1000).unwrap());
+  let tb = Timebase::new(1, NonZeroI32::new(1000).unwrap());
   let mut group = c.benchmark_group("phash::Detector::process");
 
   for &(label, w, h) in &[
