@@ -20,7 +20,7 @@
 //! # Example
 //!
 //! ```no_run
-//! use core::num::NonZeroU32;
+//! use core::num::NonZeroI32;
 //! use scenesdetect::frame::{HsvFrame, Timebase, Timestamp};
 //! use scenesdetect::keyframe::saturation::{Detector, Options};
 //!
@@ -29,7 +29,7 @@
 //! # let h = vec![0u8; 256 * 144];
 //! # let s = vec![200u8; 256 * 144];
 //! # let v = vec![128u8; 256 * 144];
-//! # let tb = Timebase::new(1, NonZeroU32::new(1_000_000).unwrap());
+//! # let tb = Timebase::new(1, NonZeroI32::new(1_000_000).unwrap());
 //! # let hsv = HsvFrame::new(&h, &s, &v, 256, 144, 256, Timestamp::new(0, tb));
 //! let sat_var = det.observe_hsv(hsv);
 //! assert!(sat_var >= 0.0);
@@ -237,11 +237,11 @@ fn plane_variance_scalar(
 mod tests {
   use super::*;
   use crate::frame::{HsvFrame, RgbFrame, Timebase, Timestamp};
-  use core::num::NonZeroU32;
+  use core::num::NonZeroI32;
   use std::vec;
 
-  fn nz(n: u32) -> NonZeroU32 {
-    NonZeroU32::new(n).expect("non-zero")
+  fn nz(n: i32) -> NonZeroI32 {
+    NonZeroI32::new(n).expect("non-zero")
   }
 
   fn timestamp() -> Timestamp {

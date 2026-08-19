@@ -1,9 +1,9 @@
 [package]
 name = "scenesdetect"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
-repository = "https://github.com/findit-ai/scenesdetect"
-homepage = "https://github.com/findit-ai/scenesdetect"
+repository = "https://github.com/findit-studio/scenesdetect"
+homepage = "https://github.com/findit-studio/scenesdetect"
 documentation = "https://docs.rs/scenesdetect"
 description = "Scene/shot cut detection ported from PySceneDetect — Sans-I/O streaming API with SIMD-accelerated detectors for histogram, pHash, threshold, content, and adaptive algorithms."
 license = "MIT OR Apache-2.0"
@@ -59,7 +59,15 @@ thiserror = { version = "2", default-features = false }
 # `TimeRange::try_new` as the fallible variant). `Detector::
 # finalize_shot` now short-circuits on `duration.is_zero()`
 # instead of the old `None` arm.
-mediatime = { version = "0.1", default-features = false }
+#
+# 0.2 signed `Timebase`'s numerator and denominator (`u32`/`NonZeroU32`
+# → `i32`/`NonZeroI32`) to match ffmpeg's `AVRational`. 0.3 deleted the
+# bare-name arithmetic — `duration_to_pts` and `frames_to_duration` are
+# now `checked_`/`saturating_` rungs, the latter on the new `Rate` type
+# — and corrected the rounding to nearest-with-ties-away-from-zero
+# (`AV_ROUND_NEAR_INF`), which the truncating docs had claimed all
+# along.
+mediatime = { version = "0.3", default-features = false }
 
 libm = { version = "0.2", optional = true, default-features = false }
 
@@ -71,7 +79,7 @@ libm = { version = "0.2", optional = true, default-features = false }
 fast_image_resize = { version = "6", default-features = false, optional = true }
 
 half = { version = "2", optional = true, default-features = false }
-mediaframe = { version = "0.1", optional = true, default-features = false }
+mediaframe = { version = "0.4", optional = true, default-features = false }
 
 serde = { version = "1", default-features = false, features = [
   "derive",

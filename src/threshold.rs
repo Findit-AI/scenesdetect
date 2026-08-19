@@ -67,6 +67,8 @@
 
 use core::time::Duration;
 
+use mediatime::Rate;
+
 use crate::frame::{LumaFrame, RgbFrame, TimeRange, Timebase, Timestamp};
 
 use derive_more::{Display, IsVariant};
@@ -258,7 +260,8 @@ impl Options {
   /// In-place form of [`Self::with_min_frames`].
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn set_min_frames(&mut self, frames: u32, fps: Timebase) -> &mut Self {
-    self.min_duration = fps.frames_to_duration(frames);
+    self.min_duration =
+      Rate::fps(fps.num(), fps.den()).saturating_frames_to_duration(frames as i64);
     self
   }
 
@@ -575,10 +578,10 @@ fn interpolate_cut(f_out: Timestamp, f_in: Timestamp, bias: f64) -> Timestamp {
 #[cfg(all(test, feature = "std"))]
 mod tests {
   use super::*;
-  use core::num::NonZeroU32;
+  use core::num::NonZeroI32;
 
-  const fn nz32(n: u32) -> NonZeroU32 {
-    match NonZeroU32::new(n) {
+  const fn nz32(n: i32) -> NonZeroI32 {
+    match NonZeroI32::new(n) {
       Some(v) => v,
       None => panic!("zero"),
     }

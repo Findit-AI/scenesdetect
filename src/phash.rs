@@ -40,6 +40,8 @@ use core::{f32::consts::PI, time::Duration};
 use derive_more::IsVariant;
 use thiserror::Error;
 
+use mediatime::Rate;
+
 use crate::frame::{LumaFrame, Timebase, Timestamp};
 
 #[cfg(feature = "serde")]
@@ -165,7 +167,8 @@ impl Options {
   ///
   /// Convenience for users coming from frame-count APIs (e.g., PySceneDetect's
   /// `min_scene_len`). Internally this converts to [`Self::min_duration`] via
-  /// [`Timebase::frames_to_duration`]. On VFR content the duration stays fixed
+  /// [`Rate::saturating_frames_to_duration`], reading `fps` as the rate its
+  /// numerator and denominator spell. On VFR content the duration stays fixed
   /// while frame counts drift — that's the desired behavior.
   ///
   /// `fps` is interpreted as frames per second: 30 fps = `Timebase::new(30, 1)`,
@@ -183,7 +186,8 @@ impl Options {
   /// In-place form of [`Self::with_min_frames`].
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn set_min_frames(&mut self, frames: u32, fps: Timebase) -> &mut Self {
-    self.min_duration = fps.frames_to_duration(frames);
+    self.min_duration =
+      Rate::fps(fps.num(), fps.den()).saturating_frames_to_duration(frames as i64);
     self
   }
 
@@ -742,11 +746,11 @@ fn hamming_distance(a: &[u64], b: &[u64]) -> u32 {
 mod tests {
   use super::*;
   use crate::frame::Timebase;
-  use core::num::NonZeroU32;
+  use core::num::NonZeroI32;
   use std::{vec, vec::Vec};
 
-  const fn nz32(n: u32) -> NonZeroU32 {
-    match NonZeroU32::new(n) {
+  const fn nz32(n: i32) -> NonZeroI32 {
+    match NonZeroI32::new(n) {
       Some(v) => v,
       None => panic!("zero"),
     }

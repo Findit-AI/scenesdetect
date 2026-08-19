@@ -8,7 +8,7 @@
 //!
 //! Run with `cargo bench --bench adaptive`.
 
-use core::{num::NonZeroU32, time::Duration};
+use core::{num::NonZeroI32, time::Duration};
 use std::hint::black_box;
 
 use criterion::{Criterion, criterion_group, criterion_main};
@@ -30,7 +30,7 @@ fn make_buf(n: usize) -> Vec<u8> {
 }
 
 fn bench_luma_only(c: &mut Criterion) {
-  let tb = Timebase::new(1, NonZeroU32::new(1000).unwrap());
+  let tb = Timebase::new(1, NonZeroI32::new(1000).unwrap());
   let mut group = c.benchmark_group("adaptive::Detector::process_luma (luma-only weights)");
   for &(label, w, h) in &[
     ("720p", 1280u32, 720u32),
@@ -56,7 +56,7 @@ fn bench_luma_only(c: &mut Criterion) {
 }
 
 fn bench_bgr_no_edges(c: &mut Criterion) {
-  let tb = Timebase::new(1, NonZeroU32::new(1000).unwrap());
+  let tb = Timebase::new(1, NonZeroI32::new(1000).unwrap());
   let mut group = c.benchmark_group("adaptive::Detector::process_bgr (default weights, no edges)");
   for &(label, w, h) in &[
     ("720p", 1280u32, 720u32),
@@ -84,7 +84,7 @@ fn bench_bgr_no_edges(c: &mut Criterion) {
 fn bench_window_sizes(c: &mut Criterion) {
   // Isolates the cost of the adaptive layer itself: same luma-only scoring,
   // varying window_width so the ring-buffer sweep grows.
-  let tb = Timebase::new(1, NonZeroU32::new(1000).unwrap());
+  let tb = Timebase::new(1, NonZeroI32::new(1000).unwrap());
   let mut group = c.benchmark_group("adaptive::Detector::process_luma (1080p, varying window)");
   let (w, h) = (1920u32, 1080u32);
   let buf = make_buf((w * h) as usize);
@@ -108,7 +108,7 @@ fn bench_window_sizes(c: &mut Criterion) {
 }
 
 fn bench_luma_only_scalar(c: &mut Criterion) {
-  let tb = Timebase::new(1, NonZeroU32::new(1000).unwrap());
+  let tb = Timebase::new(1, NonZeroI32::new(1000).unwrap());
   let mut group = c.benchmark_group("adaptive::Detector::process_luma (luma-only weights, scalar)");
   for &(label, w, h) in &[
     ("720p", 1280u32, 720u32),
@@ -135,7 +135,7 @@ fn bench_luma_only_scalar(c: &mut Criterion) {
 }
 
 fn bench_bgr_no_edges_scalar(c: &mut Criterion) {
-  let tb = Timebase::new(1, NonZeroU32::new(1000).unwrap());
+  let tb = Timebase::new(1, NonZeroI32::new(1000).unwrap());
   let mut group =
     c.benchmark_group("adaptive::Detector::process_bgr (default weights, no edges, scalar)");
   for &(label, w, h) in &[

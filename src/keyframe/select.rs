@@ -1432,10 +1432,10 @@ pub fn hard_gate(m: &FrameMetrics, opts: &Options) -> bool {
 mod tests {
   use super::*;
   use crate::frame::{Timebase, Timestamp};
-  use core::num::NonZeroU32;
+  use core::num::NonZeroI32;
 
-  fn nz(n: u32) -> NonZeroU32 {
-    NonZeroU32::new(n).expect("non-zero")
+  fn nz(n: i32) -> NonZeroI32 {
+    NonZeroI32::new(n).expect("non-zero")
   }
 
   fn ts(pts: i64) -> Timestamp {

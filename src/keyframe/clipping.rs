@@ -19,13 +19,13 @@
 //! # Example
 //!
 //! ```no_run
-//! use core::num::NonZeroU32;
+//! use core::num::NonZeroI32;
 //! use scenesdetect::frame::{RgbFrame, Timebase, Timestamp};
 //! use scenesdetect::keyframe::clipping::{Detector, Options};
 //!
 //! let mut det = Detector::new(Options::default());
 //! # let bytes = vec![0u8; 256 * 144 * 3];
-//! # let tb = Timebase::new(1, NonZeroU32::new(1_000_000).unwrap());
+//! # let tb = Timebase::new(1, NonZeroI32::new(1_000_000).unwrap());
 //! # let f = RgbFrame::new(&bytes, 256, 144, 256 * 3, Timestamp::new(0, tb));
 //! let clipping = det.observe_rgb(f);
 //! assert!((0.0..=1.0).contains(&clipping));
@@ -130,11 +130,11 @@ impl Detector {
 mod tests {
   use super::*;
   use crate::frame::{RgbFrame, Timebase, Timestamp};
-  use core::num::NonZeroU32;
+  use core::num::NonZeroI32;
   use std::vec;
 
-  fn nz(n: u32) -> NonZeroU32 {
-    NonZeroU32::new(n).expect("non-zero")
+  fn nz(n: i32) -> NonZeroI32 {
+    NonZeroI32::new(n).expect("non-zero")
   }
 
   fn timestamp() -> Timestamp {

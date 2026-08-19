@@ -1,4 +1,4 @@
-use core::num::{NonZeroU32, NonZeroUsize};
+use core::num::{NonZeroI32, NonZeroUsize};
 
 use std::vec;
 
@@ -6,7 +6,7 @@ use super::*;
 use crate::frame::Timebase;
 
 fn tb() -> Timebase {
-  Timebase::new(1, NonZeroU32::new(1_000).expect("non-zero"))
+  Timebase::new(1, NonZeroI32::new(1_000).expect("non-zero"))
 }
 
 fn ts(ms: i64) -> Timestamp {
@@ -393,7 +393,7 @@ fn frames_reject_zero_numerator_timebases() {
   // boundary ranges would need a rescale that panics downstream, so
   // the bundle rejects it up front.
   let fix = Fixture::solid(100, 10, 50);
-  let degenerate = Timestamp::new(0, Timebase::new(0, NonZeroU32::new(1_000).expect("nz")));
+  let degenerate = Timestamp::new(0, Timebase::new(0, NonZeroI32::new(1_000).expect("nz")));
   let frames = Frames::try_new(
     RgbFrame::new(&fix.rgb, W, H, W * 3, degenerate),
     LumaFrame::new(&fix.luma, W, H, W, degenerate),
@@ -407,7 +407,7 @@ fn frames_reject_zero_numerator_timebases() {
   // A degenerate timebase hiding in a SIDE view must be caught too:
   // semantic equality would otherwise accept a zero-numerator luma or
   // HSV timestamp that compares equal at instant zero.
-  let healthy = Timestamp::new(0, Timebase::new(1, NonZeroU32::new(1_000).expect("nz")));
+  let healthy = Timestamp::new(0, Timebase::new(1, NonZeroI32::new(1_000).expect("nz")));
   let mixed = Frames::try_new(
     RgbFrame::new(&fix.rgb, W, H, W * 3, healthy),
     LumaFrame::new(&fix.luma, W, H, W, degenerate),
@@ -489,7 +489,7 @@ fn mixed_timebases_keep_scene_ranges_partitioned() {
   let fix = Fixture::striped(40, 220, 20, 180);
 
   let ms = tb();
-  let coarse = Timebase::new(1, NonZeroU32::new(1).expect("nz"));
+  let coarse = Timebase::new(1, NonZeroI32::new(1).expect("nz"));
   let mut outputs = Vec::new();
   // 800 ms of millisecond-timebase frames…
   for i in 0..20_i64 {
@@ -546,7 +546,7 @@ fn coarse_canonical_timebase_keeps_association_total() {
   let mut det = detector(options);
   let fix = Fixture::striped(40, 220, 20, 180);
 
-  let coarse = Timebase::new(1, NonZeroU32::new(1).expect("nz"));
+  let coarse = Timebase::new(1, NonZeroI32::new(1).expect("nz"));
   let mut outputs = Vec::new();
   if let Some(o) = det
     .push(fix.frames(Timestamp::new(0, coarse)))
@@ -1303,7 +1303,7 @@ fn max_scene_duration_is_honored_at_exact_cap_boundaries() {
     .with_select(select::Options::new().with_target_interval(Duration::from_secs(1)));
   let mut det = detector(options);
   let fix = Fixture::solid(120, 10, 10);
-  let coarse = Timebase::new(1, NonZeroU32::new(1).expect("nz"));
+  let coarse = Timebase::new(1, NonZeroI32::new(1).expect("nz"));
 
   let mut outputs = Vec::new();
   for s in 0..=15_i64 {
@@ -1411,8 +1411,8 @@ fn canonical_unrepresentable_close_is_rejected() {
     .with_select(select::Options::new().with_target_interval(Duration::from_millis(100)));
   let mut det = detector(options);
   let fix = Fixture::solid(120, 10, 10);
-  let micros = Timebase::new(1, NonZeroU32::new(1_000_000).expect("nz"));
-  let coarse = Timebase::new(1, NonZeroU32::new(1).expect("nz"));
+  let micros = Timebase::new(1, NonZeroI32::new(1_000_000).expect("nz"));
+  let coarse = Timebase::new(1, NonZeroI32::new(1).expect("nz"));
   let _ = det
     .push(fix.frames(Timestamp::new(0, micros)))
     .expect("first frame sets the canonical timebase");
@@ -1456,8 +1456,8 @@ fn lane_rescale_cannot_saturate_under_mixed_timebases() {
   let mut det = detector(options);
   let bright = Fixture::solid(160, 10, 10);
   let black = Fixture::solid(4, 10, 10);
-  let coarse = Timebase::new(1, NonZeroU32::new(1).expect("nz"));
-  let nanos = Timebase::new(1, NonZeroU32::new(1_000_000_000).expect("nz"));
+  let coarse = Timebase::new(1, NonZeroI32::new(1).expect("nz"));
+  let nanos = Timebase::new(1, NonZeroI32::new(1_000_000_000).expect("nz"));
 
   let mut outputs = Vec::new();
   for (fix, t) in [
@@ -1733,7 +1733,7 @@ fn sparse_timestamp_jump_keeps_push_bounded() {
   // a single bounded finalize (finalize_shot clamps the bucket count),
   // so this returns promptly with a bounded keyframe count rather than
   // spinning ~14 million iterations.
-  let ns = Timebase::new(1, NonZeroU32::new(1_000_000_000).expect("nz"));
+  let ns = Timebase::new(1, NonZeroI32::new(1_000_000_000).expect("nz"));
   let options = Options::new()
     .with_detectors(Detectors::CONTENT)
     .with_max_scene_duration(None)
