@@ -2479,6 +2479,10 @@ mod tests {
   }
 
   #[test]
+  #[cfg_attr(
+    miri,
+    ignore = "capacity semantics, not UB surface: 65_536 interpreted observe calls cost ~75 minutes under Miri, and the overflow path's UB face is covered by this module's small-count tests"
+  )]
   fn observe_refuses_at_buffer_cap_and_signals_overflow() {
     // Iter-22 regression: pre-fix, `observe` returned `()` and
     // either (a) accepted every frame unboundedly, OOMing the
