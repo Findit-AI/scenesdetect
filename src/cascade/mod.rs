@@ -1988,5 +1988,17 @@ fn rescale_ceil(ts: Timestamp, tb: Timebase) -> i64 {
   rescale_ceil_checked(ts, tb).unwrap_or(if ts.pts() < 0 { i64::MIN } else { i64::MAX })
 }
 
-#[cfg(test)]
+// These tests drive whole frame streams through every detector lane, which
+// makes them by far the heaviest interpreted workload in the crate. Miri
+// models a 32-bit target's 4 GiB address space, and it only recycles a freed
+// address for an allocation of exactly the same size, so a workload this
+// varied consumes that space monotonically and never gets it back: roughly
+// twenty of these tests exhaust it on their own ("resource exhaustion: there
+// are no more free addresses in the address space"), whichever subset runs.
+// Raising `-Zmiri-address-reuse-rate` does not move the limit — measured, the
+// run dies on the same test at 0.5 and at 1.0 — so the 32-bit lane skips the
+// module rather than scattering an identical `ignore` reason over 48 tests.
+// Every other target, including the 64-bit Miri lanes, and every ordinary
+// `cargo test` still run them.
+#[cfg(all(test, not(all(miri, target_pointer_width = "32"))))]
 mod tests;
