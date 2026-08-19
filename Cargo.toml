@@ -2,8 +2,8 @@
 name = "scenesdetect"
 version = "0.3.0"
 edition = "2024"
-repository = "https://github.com/findit-ai/scenesdetect"
-homepage = "https://github.com/findit-ai/scenesdetect"
+repository = "https://github.com/findit-studio/scenesdetect"
+homepage = "https://github.com/findit-studio/scenesdetect"
 documentation = "https://docs.rs/scenesdetect"
 description = "Scene/shot cut detection ported from PySceneDetect — Sans-I/O streaming API with SIMD-accelerated detectors for histogram, pHash, threshold, content, and adaptive algorithms."
 license = "MIT OR Apache-2.0"
@@ -79,7 +79,7 @@ libm = { version = "0.2", optional = true, default-features = false }
 fast_image_resize = { version = "6", default-features = false, optional = true }
 
 half = { version = "2", optional = true, default-features = false }
-mediaframe = { version = "0.3", optional = true, default-features = false }
+mediaframe = { version = "0.4", optional = true, default-features = false }
 
 serde = { version = "1", default-features = false, features = [
   "derive",
