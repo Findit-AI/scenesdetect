@@ -4,11 +4,11 @@ All notable changes to this crate are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and
 the project adheres to [Semantic Versioning](https://semver.org/).
 
-## 0.3.0 — unreleased
+## 0.3.0 — 2026-08-20
 
 ### Changed
 
-- **`mediatime` `0.1` → `0.3`** and **`mediaframe` `0.1` → `0.3`**. Both
+- **`mediatime` `0.1` → `0.3`** and **`mediaframe` `0.1` → `0.4`**. Both
   cross two majors; `mediatime` is a public dependency (this crate
   re-exports `Timebase`, `Timestamp` and `TimeRange` from
   [`frame`](src/frame.rs)), so its breakage is this crate's breakage.
