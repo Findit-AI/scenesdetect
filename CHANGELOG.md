@@ -4,6 +4,20 @@ All notable changes to this crate are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and
 the project adheres to [Semantic Versioning](https://semver.org/).
 
+## 0.3.1
+
+### Changed
+
+- **`mediaframe` `0.4` → `0.5`**, for graph coherence only — a patch,
+  not a minor, because nothing of it is visible from here. The
+  `mediaframe` feature still carries no code (`frame::mediaframe` is
+  still commented out) and no `mediaframe::` path exists anywhere in
+  the crate, so no mediaframe type reaches this crate's public API and
+  none of 0.5's three breaking counts — the `Infallible` parse split,
+  the opened `subtitle::TrackOrigin`, the removed
+  `subtitle::Format::PgsSub` — has anywhere to land. The pin stays at
+  the no-alloc tier (`rgb`, `rgb-float`, `rgb-legacy`).
+
 ## 0.3.0 — 2026-08-20
 
 ### Changed
