@@ -8,18 +8,32 @@ the project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
-- **`mediaframe` `0.5` → `0.6`**, for graph coherence only — a patch,
-  not a minor, because nothing of it is visible from here, same as the
-  bump below. The `mediaframe` feature still carries no code
-  (`frame::mediaframe` is still commented out) and no `mediaframe::`
-  path exists anywhere in the crate, so no mediaframe type reaches
-  this crate's public API and neither of 0.6's two breaking counts —
-  the `Ch`-prefixed rename of `audio::ChannelLayout`'s twelve numeric
-  variants, the human-readable `audio::BitRateMode` serde shape — has
-  anywhere to land. Both live in `mediaframe`'s `audio` module, gated
-  `#[cfg(any(feature = "std", feature = "alloc"))]` there, and this
-  crate's `mediaframe` feature never reaches that tier: the pin stays
-  at the no-alloc tier (`rgb`, `rgb-float`, `rgb-legacy`).
+- **`mediatime` `0.3` → `0.4`**, additive-only upstream: a new unsigned
+  `Duration` counterpart to `SignedDuration`, plus its
+  `core::time::Duration` and `SignedDuration` conversions. Upstream's own
+  changelog is `### Added` only for 0.4.0 — no `Changed`/`Removed` section
+  at all — and states plainly that `Timebase`'s public surface is
+  unchanged; `Timestamp` and `TimeRange`, the other two types this crate
+  re-exports from [`frame`](src/frame.rs), do not appear in the entry
+  either. `cargo check`/`clippy`/`test` across the feature lanes below all
+  pass with no source change required.
+- **`mediaframe` `0.5` → `0.7`**, for graph coherence only — still a
+  patch, not a minor, because nothing of either release is visible from
+  here. 0.6's two breaking counts — the `Ch`-prefixed rename of
+  `audio::ChannelLayout`'s twelve numeric variants, the human-readable
+  `audio::BitRateMode` serde shape — live in `mediaframe`'s `audio`
+  module, gated `#[cfg(any(feature = "std", feature = "alloc"))]` there,
+  a tier this crate's `mediaframe` feature never reaches (the pin stays
+  at the no-alloc tier: `rgb`, `rgb-float`, `rgb-legacy`). 0.7 is
+  breaking for a narrower reason — it is `mediaframe` re-bumping its own
+  `mediatime` pin `0.3` → `0.4` under the same 0.x-minor-is-the-boundary
+  policy as the entry above, not a source change of its own
+  (`mediaframe`'s 0.7.0 changelog reports zero fallout in its own source
+  either). Either way, the `mediaframe` feature still carries no code
+  (`frame::mediaframe` is still commented out) and no `mediaframe::` path
+  exists anywhere in this crate, so no `mediaframe` type — and no
+  `mediatime` type reached only through `mediaframe` — touches this
+  crate's public API.
 
 ## 0.3.1
 

@@ -67,7 +67,7 @@ thiserror = { version = "2", default-features = false }
 # — and corrected the rounding to nearest-with-ties-away-from-zero
 # (`AV_ROUND_NEAR_INF`), which the truncating docs had claimed all
 # along.
-mediatime = { version = "0.3", default-features = false }
+mediatime = { version = "0.4", default-features = false }
 
 libm = { version = "0.2", optional = true, default-features = false }
 
@@ -79,7 +79,7 @@ libm = { version = "0.2", optional = true, default-features = false }
 fast_image_resize = { version = "6", default-features = false, optional = true }
 
 half = { version = "2", optional = true, default-features = false }
-mediaframe = { version = "0.6", optional = true, default-features = false }
+mediaframe = { version = "0.7", optional = true, default-features = false }
 
 serde = { version = "1", default-features = false, features = [
   "derive",
