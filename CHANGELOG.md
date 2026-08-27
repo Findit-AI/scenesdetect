@@ -4,6 +4,23 @@ All notable changes to this crate are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and
 the project adheres to [Semantic Versioning](https://semver.org/).
 
+## 0.3.2
+
+### Changed
+
+- **`mediaframe` `0.5` → `0.6`**, for graph coherence only — a patch,
+  not a minor, because nothing of it is visible from here, same as the
+  bump below. The `mediaframe` feature still carries no code
+  (`frame::mediaframe` is still commented out) and no `mediaframe::`
+  path exists anywhere in the crate, so no mediaframe type reaches
+  this crate's public API and neither of 0.6's two breaking counts —
+  the `Ch`-prefixed rename of `audio::ChannelLayout`'s twelve numeric
+  variants, the human-readable `audio::BitRateMode` serde shape — has
+  anywhere to land. Both live in `mediaframe`'s `audio` module, gated
+  `#[cfg(any(feature = "std", feature = "alloc"))]` there, and this
+  crate's `mediaframe` feature never reaches that tier: the pin stays
+  at the no-alloc tier (`rgb`, `rgb-float`, `rgb-legacy`).
+
 ## 0.3.1
 
 ### Changed
