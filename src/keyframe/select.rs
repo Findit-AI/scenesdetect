@@ -2980,9 +2980,9 @@ mod tests {
     assert_eq!(o.min_sharpness(), 12.5);
     assert_eq!(o.black_mean_threshold(), 7);
     assert_eq!(o.bright_mean_threshold(), 250);
-    assert_eq!(o.adaptive_floor(), false);
+    assert!(!o.adaptive_floor());
     assert_eq!(o.adaptive_floor_min_samples(), 5);
-    assert_eq!(o.motion_blur_gate(), true);
+    assert!(o.motion_blur_gate());
   }
 
   #[cfg(feature = "serde")]

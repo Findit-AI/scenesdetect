@@ -456,8 +456,7 @@ impl Detector {
       let row_start = y * s;
       let row = &data[row_start..row_start + w];
 
-      let chunks = row.chunks_exact(N_ACCUM);
-      let remainder = chunks.remainder();
+      let (chunks, remainder) = row.as_chunks::<N_ACCUM>();
       for chunk in chunks {
         // Four independent accumulator updates — no loop-carried dependency.
         acc0[bin_of[chunk[0] as usize] as usize] += 1;

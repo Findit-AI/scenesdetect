@@ -48,8 +48,8 @@ mod tests {
   fn bimodal_matches_expected_variance() {
     // Half zeros, half 200 → mean = 100, var = 100² = 10_000.
     let mut data = vec![0u8; 16 * 16];
-    for i in (16 * 8)..(16 * 16) {
-      data[i] = 200;
+    for v in data.iter_mut().take(16 * 16).skip(16 * 8) {
+      *v = 200;
     }
     let (mean, var) = plane_mean_variance(&data, 16, 16, 16, true);
     assert!((mean - 100.0).abs() < 1e-3);
