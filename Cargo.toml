@@ -52,32 +52,9 @@ mediaframe = [
 [dependencies]
 derive_more = { version = "2", default-features = false, features = ["is_variant", "display"] }
 thiserror = { version = "2", default-features = false }
-
-# mediatime 0.1.5 dropped the `Option<Duration>` from
-# `TimeRange::duration` in favour of a bare `Duration`, with
-# `TimeRange::new` panicking on `end < start` (and
-# `TimeRange::try_new` as the fallible variant). `Detector::
-# finalize_shot` now short-circuits on `duration.is_zero()`
-# instead of the old `None` arm.
-#
-# 0.2 signed `Timebase`'s numerator and denominator (`u32`/`NonZeroU32`
-# → `i32`/`NonZeroI32`) to match ffmpeg's `AVRational`. 0.3 deleted the
-# bare-name arithmetic — `duration_to_pts` and `frames_to_duration` are
-# now `checked_`/`saturating_` rungs, the latter on the new `Rate` type
-# — and corrected the rounding to nearest-with-ties-away-from-zero
-# (`AV_ROUND_NEAR_INF`), which the truncating docs had claimed all
-# along.
 mediatime = { version = "0.4", default-features = false }
-
 libm = { version = "0.2", optional = true, default-features = false }
-
-# Gated on `alloc` or `std`: the only consumer is `keyframe::preprocess::Downscaler`,
-# which itself only compiles under `alloc`/`std` (see `lib.rs`). Pulling
-# `fast_image_resize` in unconditionally breaks `cargo check
-# --no-default-features` because the dependency's own build requires one of
-# its float feature flags.
 fast_image_resize = { version = "6", default-features = false, optional = true }
-
 half = { version = "2", optional = true, default-features = false }
 mediaframe = { version = "0.7", optional = true, default-features = false }
 
@@ -90,9 +67,6 @@ bitflags = { version = "2", default-features = false }
 [dev-dependencies]
 criterion = "0.8"
 tempfile = "3"
-# JSON form used in `#[cfg(feature = "serde")]` round-trip tests
-# (forward-compat checks for legacy payloads that predate newer
-# Options fields). Test-only — not pulled into library builds.
 serde_json = "1"
 
 [profile.bench]
