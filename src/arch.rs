@@ -3177,8 +3177,8 @@ mod tests {
   fn scalar_plane_mean_variance_bimodal() {
     // Half zeros, half 200 → mean 100, var 10 000.
     let mut data = vec![0u8; 16 * 16];
-    for i in (16 * 8)..(16 * 16) {
-      data[i] = 200;
+    for v in data.iter_mut().take(16 * 16).skip(16 * 8) {
+      *v = 200;
     }
     let (mean, var) = scalar::Scalar::plane_mean_variance(&data, 16, 16, 16);
     assert!((mean - 100.0).abs() < 1e-3);
