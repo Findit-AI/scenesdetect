@@ -56,7 +56,7 @@ mediatime = { version = "0.4", default-features = false }
 libm = { version = "0.2", optional = true, default-features = false }
 fast_image_resize = { version = "6", default-features = false, optional = true }
 half = { version = "2", optional = true, default-features = false }
-mediaframe = { version = "0.7", optional = true, default-features = false }
+mediaframe = { version = "0.8", optional = true, default-features = false }
 
 serde = { version = "1", default-features = false, features = [
   "derive",
