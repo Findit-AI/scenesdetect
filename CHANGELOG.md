@@ -4,6 +4,69 @@ All notable changes to this crate are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and
 the project adheres to [Semantic Versioning](https://semver.org/).
 
+## 0.4.0
+
+A minor, not a patch: nothing here breaks a build — the new variant
+lands on a `#[non_exhaustive]` enum and every signature is unchanged —
+but the `cascade` event stream itself is different. Each shot now
+carries one keyframe it did not carry before, so any consumer that
+counts keyframes, or that treated every keyframe as a quality verdict,
+sees new numbers. That is a feature addition with observable fallout,
+which is a minor under this crate's 0.x-minor-is-the-boundary policy.
+
+### Added
+
+- **The boundary keyframe.** Opening a shot now emits its first frame
+  as an [`Event::Keyframe`](src/cascade/mod.rs) carrying the new
+  `Provenance::Boundary(FrameMetrics)` — unconditionally. Being the cut
+  is that frame's qualification, so the quality gates never judge it;
+  they go on governing only the interval picks that follow. The law
+  holds at all three places a shot opens: the stream's first frame, the
+  immediate reopen at every confirmed cut, and the reopen a deferred or
+  end-of-stream fade cut performs inside `finalize`. It holds for a
+  shot whose windows select nothing at all, which is now the ordinary
+  shape of a very short shot rather than a shot with no coverage.
+
+  Two properties a consumer may lean on, and which the suite pins:
+  every emitted shot's first keyframe sits at exactly that shot's range
+  start (so the boundary is index 0 of every shot's keyframe list), and
+  no other keyframe ever shares its timestamp.
+
+  The payload is the opening frame's own `FrameMetrics` whenever the
+  boundary timestamp names a frame the selector still holds — the
+  ordinary case, and free, since those metrics were computed on that
+  frame's own push and are read back rather than recomputed (the new
+  crate-internal `select::Detector::metrics_at` does the read; nothing
+  is rescored). It reads all-zero, as `Provenance::Fallback`'s skipped
+  metrics already do, when the boundary names no such frame: an
+  interpolated fade cut lands *between* two frames and so names an
+  instant no frame occupies.
+
+  End of stream opens no shot and therefore owes no boundary keyframe:
+  `finalize` closes the trailing shot one tick past the last frame
+  without emitting anything at that instant, which would otherwise
+  strand a keyframe outside every emitted range.
+
+### Changed
+
+- **The frame at a cut is no longer selected twice.** It stays buffered
+  past its own cut (the finalize range is half-open) and so contends in
+  the new shot's first window, where it could win. It has already left
+  as that shot's boundary keyframe, so the interval lane now drops the
+  winner that matches it. No coverage is lost — the boundary *is* that
+  window's representative — but a stream whose window winners were
+  already the shot-opening frames emits the same *number* of keyframes
+  as before, with the first of each shot re-attributed from
+  `Provenance::Quality` / `Provenance::Fallback` to
+  `Provenance::Boundary`.
+- **Backlog shedding prefers interval picks.** Past
+  `MAX_PENDING_OUTPUTS` the oldest queued keyframe is still shed and
+  scenes are still never shed, but a boundary keyframe is now shed only
+  once no interval pick is left to shed instead. Boundary keyframes
+  enter at most once per push, exactly as scenes do, so the backlog
+  stays bounded on the same argument while the index-0 property
+  survives a slow drain.
+
 ## 0.3.2
 
 ### Changed
