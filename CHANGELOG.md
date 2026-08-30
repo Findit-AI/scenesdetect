@@ -66,6 +66,13 @@ which is a minor under this crate's 0.x-minor-is-the-boundary policy.
   enter at most once per push, exactly as scenes do, so the backlog
   stays bounded on the same argument while the index-0 property
   survives a slow drain.
+- **The `mediaframe` feature's version floor moves to `"0.9"`,** up
+  from `"0.8"`. The bump is free: the feature's own RGB-adapter module
+  (`frame::mediaframe`) does not exist in this crate — the declaration
+  is commented out in `src/frame.rs` — so enabling the feature compiles
+  `half` and three `mediaframe/rgb*` sub-features to reach no code of
+  this crate's own. No public API moves, because none of this crate's
+  public API is gated by the feature.
 
 ## 0.3.2
 
