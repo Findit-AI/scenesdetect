@@ -34,6 +34,13 @@
 //!    caches only a small bounded span of frames, and keyframes associate to
 //!    scenes by timestamp (a keyframe's scene is the [`Event::Scene`]
 //!    whose range contains its timestamp).
+//! 4. **The boundary keyframe** — opening a shot emits its first frame
+//!    as a [`Event::Keyframe`] carrying [`Provenance::Boundary`],
+//!    unconditionally. Being the cut is its qualification; the quality
+//!    gates of step 3 judge only the interval picks that follow it. It
+//!    is never selected twice — a boundary frame stays buffered past
+//!    its own cut and would otherwise win the new shot's first window
+//!    as well.
 //!
 //! Per-frame cost is every enabled lane's pass over the frame plus the
 //! cheap keyframe metrics; the expensive keyframe metrics run only for
@@ -65,6 +72,17 @@
 //!   shot's [`Event::Scene`]: the window up to a confirming cut is
 //!   finalized first, so its keyframes enter the queue ahead of the
 //!   scene. Keyframe timestamps are strictly increasing within a shot.
+//! - Every emitted shot has a FIRST keyframe: its
+//!   [`Provenance::Boundary`] pick, at exactly the shot range's start.
+//!   It is emitted the moment the shot opens — immediately after the
+//!   preceding shot's [`Event::Scene`], and ahead of every keyframe
+//!   the shot's own windows go on to select. It holds for a shot whose
+//!   windows select nothing at all, and for the trailing shot that
+//!   [`Detector::finalize`] closes. Two consequences a consumer may
+//!   lean on: the boundary keyframe is index 0 of every shot's
+//!   keyframe list, and no other keyframe ever shares its timestamp.
+//!   End of stream opens no shot and so owes no boundary keyframe —
+//!   nothing is ever emitted past the last frame.
 //! - Keyframes associate to scenes by timestamp alone: a keyframe's
 //!   scene is the [`Event::Scene`] whose half-open range contains its
 //!   timestamp. This stays total even around lagged boundaries, where
@@ -90,7 +108,9 @@
 //!   earlier frames, never the future.
 //! - The undelivered backlog is bounded: configurations that confirm
 //!   boundaries faster than one output per push shed their OLDEST
-//!   queued keyframes past a documented cap; scenes are never shed.
+//!   queued keyframes past a documented cap; scenes are never shed,
+//!   and boundary keyframes only once no interval pick is left to
+//!   shed instead.
 //! - Concurrent boundary sources (the fade, lane reports, deferred
 //!   survivors, the forced split) contend on timestamp each push: the
 //!   earliest admissible closes, strictly-later losers re-contend on
@@ -475,6 +495,21 @@ pub enum Provenance {
   MaxSpan(SpanScore),
   /// The shot was closed by [`Detector::finalize`] (end of stream).
   Finalized,
+  /// The shot-opening frame, emitted as a keyframe unconditionally the
+  /// moment a shot opens. Its qualification is *being the cut itself*,
+  /// so the quality gates never judge it — they govern only the
+  /// interval picks that follow. It is therefore always the FIRST
+  /// keyframe of its shot, at exactly that shot's range start, and it
+  /// is emitted even for a shot whose intervals yield no other
+  /// keyframe at all.
+  ///
+  /// The payload is the frame's own metrics whenever the boundary
+  /// timestamp names a frame the selector still holds — the ordinary
+  /// case, and free: those metrics were computed on that frame's own
+  /// push. It reads all-zero (as [`Provenance::Fallback`]'s skipped
+  /// metrics do) when the boundary names no such frame, which an
+  /// interpolated fade cut never does — it lands *between* two frames.
+  Boundary(FrameMetrics),
   /// A keyframe that passed every quality gate; the payload is its
   /// full computed metrics.
   Quality(FrameMetrics),
@@ -1048,6 +1083,14 @@ pub struct Detector {
   /// finalize. Anchored at the first frame, advanced past each closed
   /// window and re-anchored at every confirmed cut.
   last_finalize: Option<Timestamp>,
+  /// Timestamp of the open shot's [`Provenance::Boundary`] keyframe —
+  /// its opening frame, already emitted. The frame at a cut stays
+  /// buffered for the new shot (the finalize range is half-open), so
+  /// the very next window would otherwise re-select it and emit a
+  /// SECOND keyframe at the same instant; `finalize_window` drops the
+  /// winner that matches this. Coverage is not lost: the boundary
+  /// keyframe *is* that bucket's representative.
+  boundary_ts: Option<Timestamp>,
   /// Frames a confirmed cut can lag behind the current frame (the
   /// adaptive window's span; 0 with no adaptive lane). The periodic
   /// window finalize holds back this many recent frames so a late cut
@@ -1234,6 +1277,7 @@ impl Detector {
       last_ts: None,
       selector: select::Detector::new(select_opts),
       last_finalize: None,
+      boundary_ts: None,
       lag_frames,
       recent_ts: VecDeque::new(),
       pending: VecDeque::new(),
@@ -1313,7 +1357,12 @@ impl Detector {
     if self.stream_timebase.is_none() {
       self.stream_timebase = Some(ts.timebase());
     }
-    if self.shot_start.is_none() {
+    // The stream's first frame opens the first shot. Its BOUNDARY
+    // keyframe is emitted below, once this frame's metrics exist —
+    // the open is recorded here because `detect_boundary` gates on
+    // `shot_start`.
+    let opens_first_shot = self.shot_start.is_none();
+    if opens_first_shot {
       self.shot_start = Some(ts);
       // Anchor the first keyframe window at the first frame of the
       // stream so the selector finalizes from a real lower bound.
@@ -1347,6 +1396,13 @@ impl Detector {
       let safe = self.safe_horizon(ts).unwrap_or(ts);
       self.finalize_window(safe);
       let _ = self.selector.observe(ts, metrics);
+    }
+    if opens_first_shot {
+      // The first shot's opening frame, with the metrics just computed
+      // for it — no lookup, no recompute. No cut can precede it (a
+      // boundary at or before `shot_start` is inadmissible), so this
+      // is the stream's first output.
+      self.emit_boundary_keyframe(ts, metrics);
     }
 
     let window = self.options.select.target_interval();
@@ -1436,6 +1492,17 @@ impl Detector {
     // per `target_interval`.
     if let Some(range) = TimeRange::try_new(start.pts(), point.pts(), point.timebase()) {
       for sel in self.selector.finalize_shot(range) {
+        // The shot's opening frame stays buffered past its own cut
+        // (the finalize range is half-open) and so contends in the
+        // first window of the new shot. It already left as this shot's
+        // BOUNDARY keyframe, and winning here does not earn it a
+        // second one — the bucket keeps its coverage either way.
+        if self
+          .boundary_ts
+          .is_some_and(|at| at.cmp_semantic(&sel.timestamp()).is_eq())
+        {
+          continue;
+        }
         let provenance = if sel.is_strict() {
           Provenance::Quality(sel.metrics())
         } else {
@@ -1507,7 +1574,11 @@ impl Detector {
     if let (Some(_), Some(last)) = (self.shot_start, self.last_ts) {
       let end = Timestamp::new(last.pts().saturating_add(1), last.timebase());
       self.finalize_window(end);
-      self.close_shot_at(end, Provenance::Finalized);
+      // The scene ONLY — the stream is over, so no shot opens at `end`
+      // and no boundary keyframe is owed there. Emitting one would
+      // strand a keyframe one tick past the last frame, outside every
+      // emitted range.
+      self.emit_scene_at(end, Provenance::Finalized);
     }
     let outputs = self.pending.drain(..).collect();
     self.reset_all();
@@ -1815,21 +1886,32 @@ impl Detector {
 
   // --- shot lifecycle ---------------------------------------------------------
 
-  /// Closes the shot at `cut` (exclusive) and re-anchors the keyframe
-  /// window. The keyframes for `[shot_start, cut)` were already emitted
-  /// by `finalize_window(cut)` (called just before this in `push` /
-  /// `finalize`), so this only emits the scene and advances state.
-  fn close_shot_at(&mut self, cut: Timestamp, provenance: Provenance) {
+  /// Emits the open shot's scene for `[shot_start, cut)` — and nothing
+  /// else: no state advances and no shot opens. The keyframes for that
+  /// range were already emitted by `finalize_window(cut)` (called just
+  /// before this in `push` / `finalize`).
+  ///
+  /// Returns whether a shot was open at all. `false` means there was
+  /// nothing to close; a shot that collapses to an instant under the
+  /// canonical timebase was still open and returns `true` — it just
+  /// emits no scene (its keyframes parent to the neighboring range by
+  /// timestamp).
+  fn emit_scene_at(&mut self, cut: Timestamp, provenance: Provenance) -> bool {
     let Some(start) = self.shot_start else {
-      return;
+      return false;
     };
-    // A shot that collapses to an instant under the canonical timebase
-    // emits no scene (its keyframes parent to the neighboring range by
-    // timestamp).
     let tb = self.stream_timebase.unwrap_or_else(|| cut.timebase());
-    let range = shot_range(start, cut, tb);
-    if let Some(range) = range {
+    if let Some(range) = shot_range(start, cut, tb) {
       self.enqueue(Event::Scene(SceneEvent { range, provenance }));
+    }
+    true
+  }
+
+  /// Closes the shot at `cut` (exclusive), then opens the next one
+  /// there — emitting its [`Provenance::Boundary`] keyframe.
+  fn close_shot_at(&mut self, cut: Timestamp, provenance: Provenance) {
+    if !self.emit_scene_at(cut, provenance) {
+      return;
     }
     // Open the next shot at the boundary and restart the keyframe
     // window there: frames at or after the cut stayed buffered in the
@@ -1837,16 +1919,42 @@ impl Detector {
     self.shot_start = Some(cut);
     self.last_confirmed = Some(cut);
     self.last_finalize = Some(cut);
+    // The opening frame IS the cut, which is its whole qualification —
+    // no gate judges it. Its metrics are the ones already computed on
+    // its own push and still buffered (a cut landing on no frame at
+    // all — an interpolated fade — leaves them zero).
+    let metrics = self.selector.metrics_at(cut).unwrap_or_default();
+    self.emit_boundary_keyframe(cut, metrics);
+  }
+
+  /// Emits the shot-opening keyframe at `at` and records it as the one
+  /// the next window must not select twice.
+  fn emit_boundary_keyframe(&mut self, at: Timestamp, metrics: FrameMetrics) {
+    self.boundary_ts = Some(at);
+    self.enqueue(Event::Keyframe(KeyframeEvent {
+      ts: at,
+      provenance: Provenance::Boundary(metrics),
+    }));
   }
 
   /// Appends to the output backlog, shedding the oldest queued
   /// KEYFRAME once the backlog passes [`MAX_PENDING_OUTPUTS`]. Scenes
   /// are never shed: they enter at most once per push, so they cannot
   /// outgrow the one-per-push drain on their own.
+  ///
+  /// [`Provenance::Boundary`] keyframes are shed only once no other
+  /// keyframe is left to give: they are the shot-opening law, one per
+  /// shot, entering at most once per push exactly as scenes do — so
+  /// preferring the interval picks keeps the same bound while leaving
+  /// every shot its opening frame.
   fn enqueue(&mut self, output: Event) {
     self.pending.push_back(output);
     if self.pending.len() > MAX_PENDING_OUTPUTS
-      && let Some(idx) = self.pending.iter().position(|o| o.is_keyframe())
+      && let Some(idx) = self
+        .pending
+        .iter()
+        .position(|o| matches!(o, Event::Keyframe(k) if !k.provenance.is_boundary()))
+        .or_else(|| self.pending.iter().position(|o| o.is_keyframe()))
     {
       self.pending.remove(idx);
     }
@@ -1939,6 +2047,7 @@ impl Detector {
     self.last_confirmed = None;
     self.selector.clear();
     self.last_finalize = None;
+    self.boundary_ts = None;
     self.recent_ts.clear();
     self.deferred_direct.clear();
     self.pending.clear();
