@@ -899,6 +899,30 @@ impl Detector {
     self.buffer.len()
   }
 
+  /// The metrics already observed for the frame at `ts`, if that frame
+  /// is still buffered.
+  ///
+  /// A pure read: it neither drains nor rescores, so a caller that
+  /// wants a buffered frame's metrics pays nothing beyond the lookup —
+  /// the metrics were computed on that frame's own `observe`. The
+  /// buffer is non-decreasing in PTS (see [`Self::observe`]), so the
+  /// scan stops at the first entry past `ts`; the caller this exists
+  /// for — the cascade asking for a shot-opening frame right after
+  /// [`Self::finalize_shot`] drained everything before it — finds its
+  /// answer at the front.
+  ///
+  /// `None` when `ts` names no buffered frame: it was already drained,
+  /// it was lost to an overflow recovery, or it never was a frame at
+  /// all (a fade cut interpolated between two frames names an instant
+  /// no frame occupies).
+  pub(crate) fn metrics_at(&self, ts: Timestamp) -> Option<FrameMetrics> {
+    self
+      .buffer
+      .iter()
+      .take_while(|(at, _)| at.cmp_semantic(&ts) != Ordering::Greater)
+      .find_map(|(at, m)| (at.cmp_semantic(&ts) == Ordering::Equal).then_some(*m))
+  }
+
   /// Appends a scored frame to the buffer. Returns
   /// `Err(`[`ObserveError`]`)` when the frame cannot be accepted;
   /// in every error case the new frame is **not** added to the

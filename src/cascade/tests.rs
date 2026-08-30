@@ -813,8 +813,24 @@ fn gate_failing_intervals_surface_fallback_keyframes() {
   outputs.extend(det.finalize());
 
   let kfs = keyframes(&outputs);
-  assert!(!kfs.is_empty(), "flat content still yields coverage");
-  for k in &kfs {
+  let (opening, gated) = kfs
+    .split_first()
+    .expect("flat content still yields coverage");
+  // The shot opens on a flat frame like every other, but opening is
+  // its whole qualification — the gates never judged it.
+  let Provenance::Boundary(m) = opening.provenance_ref() else {
+    panic!(
+      "the opening keyframe is the boundary: {:?}",
+      opening.provenance_ref()
+    );
+  };
+  assert_eq!(m.sharpness(), 0.0, "expensive metrics were skipped");
+  assert!(
+    m.brightness() > 0.0,
+    "the boundary carries the frame's own cheap metrics, not zeros"
+  );
+  assert!(!gated.is_empty(), "the intervals still sample");
+  for k in gated {
     assert!(
       k.provenance_ref().is_fallback(),
       "flat frames can only be fallback picks: {:?}",
@@ -1754,4 +1770,188 @@ fn sparse_timestamp_jump_keeps_push_bounded() {
     "catch-up is bounded, not one finalize per empty window: {}",
     kfs.len()
   );
+}
+
+// --- the boundary keyframe law ----------------------------------------------
+
+/// The keyframes a consumer would parent to `scene`, recovered the way
+/// the contract says to: by timestamp containment alone.
+fn keyframes_of(kfs: &[KeyframeEvent], scene: &SceneEvent) -> Vec<KeyframeEvent> {
+  kfs
+    .iter()
+    .filter(|k| {
+      k.timestamp().cmp_semantic(&scene.range().start()).is_ge()
+        && k.timestamp().cmp_semantic(&scene.range().end()).is_lt()
+    })
+    .cloned()
+    .collect()
+}
+
+/// Three shots: two cuts plus the trailing close — so the assertions
+/// below cover a shot opened by the stream's first frame, shots opened
+/// by a confirmed cut, and the shot `finalize` closes.
+fn three_shot_stream() -> Vec<Event> {
+  let options = Options::new()
+    .with_detectors(Detectors::all())
+    .with_select(select::Options::new().with_target_interval(Duration::from_millis(100)));
+  let mut det = detector(options);
+  let red = Fixture::solid(60, 10, 200);
+  let blue = Fixture::solid(180, 120, 200);
+
+  let mut outputs = push_run(&mut det, &red, 0, 30, 40);
+  outputs.extend(push_run(&mut det, &blue, 30 * 40, 30, 40));
+  outputs.extend(push_run(&mut det, &red, 60 * 40, 30, 40));
+  outputs.extend(det.finalize());
+  outputs
+}
+
+#[test]
+fn every_shot_opens_with_a_boundary_keyframe() {
+  // The law: opening a shot emits its first frame as a keyframe
+  // unconditionally, because being the cut IS its qualification. So
+  // every emitted shot owns a keyframe at exactly its range start,
+  // that keyframe is the BOUNDARY pick, and it is index 0 of the
+  // shot's list — the property downstream indexes on.
+  let outputs = three_shot_stream();
+  let scenes = scenes(&outputs);
+  let kfs = keyframes(&outputs);
+  assert_eq!(scenes.len(), 3, "both cuts plus the trailing shot");
+
+  for scene in &scenes {
+    let mine = keyframes_of(&kfs, scene);
+    let opening = mine.first().expect("every emitted shot has a keyframe");
+    assert_eq!(
+      opening.timestamp().pts(),
+      scene.range().start().pts(),
+      "index 0 sits at the shot's range start: {scene:?}"
+    );
+    assert!(
+      opening.provenance_ref().is_boundary(),
+      "index 0 is the boundary pick: {:?}",
+      opening.provenance_ref()
+    );
+    assert_eq!(
+      mine
+        .iter()
+        .filter(|k| k.provenance_ref().is_boundary())
+        .count(),
+      1,
+      "exactly one boundary keyframe per shot: {mine:?}"
+    );
+  }
+  assert_eq!(
+    kfs
+      .iter()
+      .filter(|k| k.provenance_ref().is_boundary())
+      .count(),
+    scenes.len(),
+    "one boundary per emitted shot, and not one more"
+  );
+}
+
+#[test]
+fn the_boundary_frame_is_never_selected_twice() {
+  // The frame at a cut stays buffered for the NEW shot (the finalize
+  // range is half-open), so it contends in that shot's first window as
+  // well — and with the shot's other frames it can win. It already
+  // left as the boundary keyframe, so winning again must not emit a
+  // second keyframe at the same instant. Coverage is not lost: the
+  // boundary IS that window's representative.
+  let outputs = three_shot_stream();
+  let kfs = keyframes(&outputs);
+  let mut instants: Vec<i64> = kfs.iter().map(|k| k.timestamp().pts()).collect();
+  let total = instants.len();
+  instants.sort_unstable();
+  instants.dedup();
+  assert_eq!(
+    instants.len(),
+    total,
+    "no two keyframes share an instant: {kfs:?}"
+  );
+
+  for scene in &scenes(&outputs) {
+    let start = scene.range().start();
+    assert_eq!(
+      kfs
+        .iter()
+        .filter(|k| k.timestamp().cmp_semantic(&start).is_eq())
+        .count(),
+      1,
+      "the opening instant carries the boundary and nothing else: {scene:?}"
+    );
+  }
+}
+
+#[test]
+fn a_shot_whose_windows_select_nothing_still_emitted_its_boundary() {
+  // One frame, then end of stream. The shot's only window holds only
+  // the opening frame, which the boundary already represents — so the
+  // interval lane selects nothing at all and the boundary is the
+  // shot's ONLY keyframe. The law is unconditional: it is still
+  // emitted, still at the scene's range start.
+  let mut det = detector(fixture_options());
+  let fix = Fixture::striped(40, 220, 20, 180);
+  let mut outputs = push_run(&mut det, &fix, 0, 1, 33);
+  outputs.extend(det.finalize());
+
+  let scenes = scenes(&outputs);
+  assert_eq!(scenes.len(), 1, "one frame, one shot: {scenes:?}");
+  assert!(
+    scenes[0].provenance_ref().is_finalized(),
+    "closed by end of stream: {:?}",
+    scenes[0].provenance_ref()
+  );
+  let kfs = keyframes(&outputs);
+  assert_eq!(kfs.len(), 1, "the boundary is the only keyframe: {kfs:?}");
+  assert!(
+    kfs[0].provenance_ref().is_boundary(),
+    "and it is the boundary: {:?}",
+    kfs[0].provenance_ref()
+  );
+  assert_eq!(
+    kfs[0].timestamp().pts(),
+    scenes[0].range().start().pts(),
+    "at the shot's range start"
+  );
+}
+
+#[test]
+fn the_boundary_carries_the_opening_frame_s_own_metrics() {
+  // The opening frame's metrics were already computed on its own push
+  // and are still buffered, so carrying them costs nothing — the
+  // payload must be those, not a zero placeholder. Textured frames
+  // clear the cheap gates, so the expensive metrics ran too.
+  let outputs = three_shot_stream();
+  let boundaries: Vec<_> = keyframes(&outputs)
+    .into_iter()
+    .filter(|k| k.provenance_ref().is_boundary())
+    .collect();
+  assert!(!boundaries.is_empty(), "shots opened");
+  for k in &boundaries {
+    let Provenance::Boundary(m) = k.provenance_ref() else {
+      unreachable!("filtered to boundaries");
+    };
+    assert!(
+      m.brightness() > 0.0,
+      "the boundary frame's own metrics, not zeros: {m:?}"
+    );
+  }
+}
+
+#[test]
+fn end_of_stream_opens_no_shot_and_owes_no_boundary() {
+  // `finalize` closes the trailing shot ONE TICK past the last frame.
+  // No shot opens there — there is no frame to open one — so no
+  // boundary keyframe is emitted at that instant. One there would
+  // fall outside every emitted range and orphan itself.
+  let outputs = three_shot_stream();
+  let scenes = scenes(&outputs);
+  let kfs = keyframes(&outputs);
+  let end = scenes.last().expect("a trailing scene").range().end();
+  for k in &kfs {
+    assert!(
+      k.timestamp().cmp_semantic(&end).is_lt(),
+      "no keyframe at or past the stream's close: {k:?} vs {end:?}"
+    );
+  }
 }
